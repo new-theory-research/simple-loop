@@ -127,6 +127,10 @@ struct App {
     /// True when the Signals slot should show the Buzz hex grid instead of
     /// "From the Hive" learnings. Toggled by `b`. Alert signals override both.
     signals_show_buzz: bool,
+    /// True when the Signals slot should show the Run Cards view. Toggled by
+    /// `r`. Auto-promoted to true on startup when ≥1 run has status: running.
+    /// Alert signals and buzz (when active) both override runs.
+    signals_show_runs: bool,
     /// Loaded run cards from wiki/runs/*/index.md + heartbeats.jsonl.
     run_cards: Vec<state::RunCard>,
 }
@@ -156,6 +160,13 @@ impl App {
             last_learning_rotation: Instant::now(),
             config: config::HiveConfig::load(),
             signals_show_buzz: false,
+            signals_show_runs: {
+                let cards = state::load_run_cards(
+                    std::path::Path::new("wiki/runs"),
+                    std::path::Path::new(".loop/state/signals"),
+                );
+                cards.iter().any(|c| matches!(c.status, state::RunStatus::Running))
+            },
             run_cards: state::load_run_cards(
                 std::path::Path::new("wiki/runs"),
                 std::path::Path::new(".loop/state/signals"),
@@ -1069,7 +1080,6 @@ fn run_status_chrome(status: &state::RunStatus) -> (&'static str, &'static str, 
     }
 }
 
-#[allow(dead_code)]
 fn render_run_card(f: &mut ratatui::Frame, area: Rect, card: &state::RunCard) {
     let (icon, label, border_color) = run_status_chrome(&card.status);
     let title = Line::from(vec![
@@ -1170,7 +1180,6 @@ fn render_run_card(f: &mut ratatui::Frame, area: Rect, card: &state::RunCard) {
 
 /// Build one-liner rows for the Recent list (non-active runs sorted by completed_at desc).
 /// Returns (lines, overflow_count). Capped at 6 rows.
-#[allow(dead_code)]
 fn recent_run_lines(cards: &[state::RunCard]) -> (Vec<Line<'static>>, usize) {
     let mut historical: Vec<&state::RunCard> = cards
         .iter()
@@ -1233,8 +1242,7 @@ fn recent_run_lines(cards: &[state::RunCard]) -> (Vec<Line<'static>>, usize) {
 }
 
 /// Render the 2x2 active-run grid + Recent list into `area`.
-/// Called from the Signals slot when `signals_show_runs` is active (C4).
-#[allow(dead_code)]
+/// Called from the Signals slot when `signals_show_runs` is active.
 fn render_run_cards(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let (recent_lines, recent_overflow) = recent_run_lines(&app.run_cards);
 
@@ -1688,7 +1696,7 @@ fn render_help_modal<'a>() -> Text<'a> {
         Line::from(vec![key("  j / k"), sep(), desc("scroll panel, or move cursor in Signals")]),
         Line::from(vec![key("  enter"), sep(), desc("open signal detail (when Signals focused)")]),
         Line::from(vec![key("  esc"), sep(), desc("close modal")]),
-        Line::from(vec![key("  r"), sep(), desc("force refresh + re-enable dance floor auto-scroll")]),
+        Line::from(vec![key("  r"), sep(), desc("toggle Run Cards view in Signals slot (auto-promotes when runs are active)")]),
         Line::from(vec![key("  ?"), sep(), desc("toggle this help modal")]),
         blank(),
         section("  Color Legend"),
@@ -1781,15 +1789,16 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
         //   3. "From the Hive" learnings — calm default
         let signals_slot_calm = app.signals.signals.is_empty();
         let signals_slot_buzz = app.signals_show_buzz && signals_slot_calm;
+        let signals_slot_runs = app.signals_show_runs && signals_slot_calm && !signals_slot_buzz;
         let signals_text = if !signals_slot_calm {
             render_signals(
                 &app.signals,
                 app.signal_cursor,
                 app.focused == Panel::Signals,
             )
-        } else if signals_slot_buzz {
-            // Buzz is rendered directly inside the draw closure using the
-            // actual slot rect — Text::default() here is never displayed.
+        } else if signals_slot_buzz || signals_slot_runs {
+            // Buzz and Runs are rendered directly inside the draw closure using
+            // the actual slot rect — Text::default() here is never displayed.
             Text::default()
         } else {
             render_hive_learning(app.learnings.pick(app.learning_index))
@@ -1798,6 +1807,8 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
             Panel::Signals.label()
         } else if signals_slot_buzz {
             " Buzz "
+        } else if signals_slot_runs {
+            " Runs "
         } else {
             " From the Hive "
         };
@@ -1884,6 +1895,12 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                             legend_area,
                         );
                     }
+                } else if signals_slot_runs {
+                    // Render run cards panel (2x2 grid + Recent list) directly
+                    // inside the signals slot.
+                    let inner = signals_block.inner(top_row[1]);
+                    f.render_widget(signals_block, top_row[1]);
+                    render_run_cards(f, inner, &app);
                 } else {
                     f.render_widget(
                         Paragraph::new(signals_text)
@@ -1964,11 +1981,11 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                     Span::styled("·  tab ", Style::default().fg(GOLD)),
                     Span::styled("cycle  ", Style::default().fg(MUTED)),
                     Span::styled("·  b ", Style::default().fg(GOLD)),
-                    Span::styled("buzz toggle  ", Style::default().fg(MUTED)),
+                    Span::styled("buzz  ", Style::default().fg(MUTED)),
+                    Span::styled("·  r ", Style::default().fg(GOLD)),
+                    Span::styled("runs toggle  ", Style::default().fg(MUTED)),
                     Span::styled("·  c ", Style::default().fg(GOLD)),
                     Span::styled("cells  ", Style::default().fg(MUTED)),
-                    Span::styled("·  r ", Style::default().fg(GOLD)),
-                    Span::styled("refresh  ", Style::default().fg(MUTED)),
                     Span::styled("·  ? ", Style::default().fg(GOLD)),
                     Span::styled("help", Style::default().fg(MUTED)),
                 ])),
@@ -2102,14 +2119,20 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                                 app.open_signal_detail();
                             }
                             KeyCode::Char('j') => {
-                                if app.focused == Panel::Signals && !app.signals_show_buzz {
+                                if app.focused == Panel::Signals
+                                    && !app.signals_show_buzz
+                                    && !app.signals_show_runs
+                                {
                                     app.signal_cursor_down();
                                 } else {
                                     app.scroll_down();
                                 }
                             }
                             KeyCode::Char('k') => {
-                                if app.focused == Panel::Signals && !app.signals_show_buzz {
+                                if app.focused == Panel::Signals
+                                    && !app.signals_show_buzz
+                                    && !app.signals_show_runs
+                                {
                                     app.signal_cursor_up();
                                 } else {
                                     if app.focused == Panel::DanceFloor {
@@ -2118,10 +2141,13 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                                     app.scroll_up();
                                 }
                             }
+                            // r → toggle Run Cards view in Signals slot
                             KeyCode::Char('r') => {
+                                app.signals_show_runs = !app.signals_show_runs;
+                                if app.signals_show_runs {
+                                    app.focused = Panel::Signals;
+                                }
                                 app.dance_floor_auto_scroll = true;
-                                app.refresh_state();
-                                last_state_refresh = Instant::now();
                             }
                             KeyCode::Left
                                 if app.focused == Panel::Buzz
@@ -2637,5 +2663,81 @@ mod tests {
         let (lines, overflow) = recent_run_lines(&cards);
         assert!(lines.is_empty(), "no recent rows when all runs are active");
         assert_eq!(overflow, 0);
+    }
+
+    // ── signals_show_runs toggle (brief-125 C4) ───────────────────────────────
+
+    #[test]
+    fn signals_show_runs_defaults_false_when_no_active_runs() {
+        // In test env wiki/runs/ is absent or has no running cards → defaults false.
+        let app = App::new();
+        assert!(!app.signals_show_runs);
+    }
+
+    #[test]
+    fn signals_show_runs_toggle_focuses_signals_on_activation() {
+        let mut app = App::new();
+        app.focused = Panel::DanceFloor;
+        // Simulate pressing `r` (toggle ON)
+        app.signals_show_runs = !app.signals_show_runs;
+        if app.signals_show_runs {
+            app.focused = Panel::Signals;
+        }
+        assert!(app.signals_show_runs);
+        assert_eq!(app.focused, Panel::Signals);
+    }
+
+    #[test]
+    fn signals_show_runs_toggle_off_does_not_change_focus() {
+        let mut app = App::new();
+        app.signals_show_runs = true;
+        app.focused = Panel::Signals;
+        // Simulate pressing `r` again (toggle OFF)
+        app.signals_show_runs = !app.signals_show_runs;
+        assert!(!app.signals_show_runs);
+        assert_eq!(app.focused, Panel::Signals);
+    }
+
+    #[test]
+    fn signals_slot_runs_suppressed_when_alerts_present() {
+        let mut app = app_with_signals(1);
+        app.signals_show_runs = true;
+        let signals_slot_calm = app.signals.signals.is_empty();
+        let signals_slot_buzz = app.signals_show_buzz && signals_slot_calm;
+        let signals_slot_runs = app.signals_show_runs && signals_slot_calm && !signals_slot_buzz;
+        assert!(!signals_slot_runs, "alerts should override runs toggle");
+    }
+
+    #[test]
+    fn signals_slot_runs_suppressed_when_buzz_active() {
+        let mut app = App::new();
+        app.signals_show_buzz = true;
+        app.signals_show_runs = true;
+        let signals_slot_calm = app.signals.signals.is_empty();
+        let signals_slot_buzz = app.signals_show_buzz && signals_slot_calm;
+        let signals_slot_runs = app.signals_show_runs && signals_slot_calm && !signals_slot_buzz;
+        assert!(!signals_slot_runs, "buzz should override runs toggle");
+    }
+
+    #[test]
+    fn jk_guard_disabled_when_runs_view_active() {
+        let mut app = App::new();
+        app.focused = Panel::Signals;
+        app.signals_show_runs = true;
+        // j/k cursor nav requires: focused Signals AND NOT buzz AND NOT runs
+        let should_nav_cursor =
+            app.focused == Panel::Signals && !app.signals_show_buzz && !app.signals_show_runs;
+        assert!(!should_nav_cursor, "j/k cursor nav disabled when runs view is active");
+    }
+
+    #[test]
+    fn signals_slot_runs_active_when_calm_and_no_buzz() {
+        let mut app = App::new();
+        app.signals_show_runs = true;
+        app.signals_show_buzz = false;
+        let signals_slot_calm = app.signals.signals.is_empty();
+        let signals_slot_buzz = app.signals_show_buzz && signals_slot_calm;
+        let signals_slot_runs = app.signals_show_runs && signals_slot_calm && !signals_slot_buzz;
+        assert!(signals_slot_runs, "runs view active when calm and buzz off");
     }
 }
