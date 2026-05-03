@@ -1571,11 +1571,51 @@ def parse_cycle_wall_time_secs(paths):
         return True
 
 
+# ─── Progress reset (brief-124) ──────────────────────────────────────
+
+def ensure_progress_for_brief(progress_file: str, brief_id: str, brief_file: str) -> str:
+    """Write a fresh progress.json if missing or `brief` field doesn't match brief_id.
+
+    Called after each rebase in run_worker_iteration() to prevent inheriting a
+    different brief's progress.json from main (brief-124 Bug 1).
+
+    Returns:
+        'unchanged'          — file exists with correct brief; nothing written
+        'initialized'        — file was missing; written fresh
+        'reset:<old_brief>'  — file existed with wrong brief; reset to fresh
+    """
+    existing_brief = None
+    if os.path.exists(progress_file):
+        try:
+            with open(progress_file) as f:
+                existing_brief = json.load(f).get("brief", "")
+        except Exception:
+            pass
+
+    if existing_brief == brief_id:
+        return "unchanged"
+
+    os.makedirs(os.path.dirname(progress_file), exist_ok=True)
+    with open(progress_file, "w") as f:
+        json.dump({
+            "brief": brief_id,
+            "brief_file": brief_file,
+            "iteration": 0,
+            "status": "running",
+            "tasks_completed": [],
+            "tasks_remaining": [],
+            "learnings": [],
+        }, f, indent=2)
+        f.write("\n")
+
+    return "initialized" if existing_brief is None else f"reset:{existing_brief}"
+
+
 # ─── Main ─────────────────────────────────────────────────────────────
 
 def main():
     BRIEF_ACTIONS = ("move-to-eval", "move-to-pending-merges", "move-to-awaiting-review",
-                     "approve-brief", "reject-brief")
+                     "approve-brief", "reject-brief", "ensure-progress-for-brief")
 
     if len(sys.argv) < 3:
         print(f"Usage: {sys.argv[0]} <action> <project_dir> [args]", file=sys.stderr)
@@ -1638,6 +1678,14 @@ def main():
             success = check_depends_on_secrets(paths)
         elif action == "parse-cycle-wall-time-secs":
             success = parse_cycle_wall_time_secs(paths)
+        elif action == "ensure-progress-for-brief":
+            if len(extra) < 2:
+                print("ensure-progress-for-brief requires <brief_file> <progress_file>", file=sys.stderr)
+                sys.exit(1)
+            brief_file_arg, progress_file_arg = extra[0], extra[1]
+            result = ensure_progress_for_brief(progress_file_arg, brief_id, brief_file_arg)
+            print(result)
+            success = True
         else:
             print(f"Unknown action: {action}", file=sys.stderr)
             sys.exit(1)

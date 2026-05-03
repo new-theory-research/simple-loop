@@ -335,9 +335,15 @@ run_worker_iteration() {
     fi
     # ─────────────────────────────────────────────────────────────────────────
 
-    # Initialize progress.json if missing (in worktree)
+    # Reset progress.json if missing OR if it belongs to a different brief (brief-124 Bug 1).
+    # Rebase can pull in the last-merged brief's progress.json from main — always reset
+    # when the brief field doesn't match the dispatched brief.
     local PROGRESS_FILE="$WORKTREE_DIR/.loop/state/progress.json"
-    if [ ! -f "$PROGRESS_FILE" ]; then
+    local existing_brief=""
+    if [ -f "$PROGRESS_FILE" ]; then
+        existing_brief=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('brief',''))" 2>/dev/null || echo "")
+    fi
+    if [ ! -f "$PROGRESS_FILE" ] || [ "$existing_brief" != "$brief_id" ]; then
         local brief_file
         brief_file=$(python3 -c "
 import json
@@ -354,11 +360,18 @@ for b in rc.get('active', []):
             return 0
         fi
 
-        daemon_log "WORKER: initializing progress.json for $brief_id"
-        mkdir -p "$(dirname "$PROGRESS_FILE")"
-        echo "{\"brief\": \"$brief_id\", \"brief_file\": \"$brief_file\", \"iteration\": 0, \"status\": \"running\", \"tasks_completed\": [], \"tasks_remaining\": [], \"learnings\": []}" > "$PROGRESS_FILE"
+        RESET_RESULT=$(python3 "$DAEMON_LIB_DIR/actions.py" ensure-progress-for-brief \
+            "$brief_id" "$PROJECT_DIR" "$brief_file" "$PROGRESS_FILE" 2>/dev/null || echo "initialized")
+        case "$RESET_RESULT" in
+            initialized)
+                daemon_log "WORKER: initialized progress.json for $brief_id"
+                ;;
+            reset:*)
+                daemon_log "WORKER: reset progress.json for $brief_id (was: ${RESET_RESULT#reset:} — rebase inheritance)"
+                ;;
+        esac
         git -C "$WORKTREE_DIR" add ".loop/state/progress.json"
-        git -C "$WORKTREE_DIR" commit -m "Initialize progress for $brief_id" -q 2>/dev/null
+        git -C "$WORKTREE_DIR" commit -m "loop: reset progress.json for $brief_id (was: ${existing_brief:-missing})" -q 2>/dev/null
     fi
 
     # Safety: check iteration count
