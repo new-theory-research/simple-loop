@@ -2504,6 +2504,265 @@ impl SignalsState {
     }
 }
 
+// ── run cards ─────────────────────────────────────────────────────────────────
+
+/// How many tail heartbeat lines to load per run — enough for pace computation
+/// (last 5 heartbeats) + loss trend display, with headroom.
+#[allow(dead_code)]
+const HEARTBEAT_TAIL: usize = 10;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunStatus {
+    Pending,
+    Running,
+    Complete,
+    Failed,
+    Preempted,
+    Stale,
+    Unknown(String),
+}
+
+#[allow(dead_code)]
+impl RunStatus {
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pending" => RunStatus::Pending,
+            "running" => RunStatus::Running,
+            "complete" | "completed" => RunStatus::Complete,
+            "failed" => RunStatus::Failed,
+            "preempted" => RunStatus::Preempted,
+            "stale" => RunStatus::Stale,
+            other => RunStatus::Unknown(other.to_string()),
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            RunStatus::Pending => "pending",
+            RunStatus::Running => "running",
+            RunStatus::Complete => "complete",
+            RunStatus::Failed => "failed",
+            RunStatus::Preempted => "preempted",
+            RunStatus::Stale => "stale",
+            RunStatus::Unknown(s) => s.as_str(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RunHeartbeat {
+    pub ts: DateTime<Utc>,
+    pub last_step: Option<u64>,
+    pub last_loss: Option<f64>,
+    pub app_state: Option<String>,
+    pub alert: Option<String>,
+}
+
+#[allow(dead_code)]
+pub struct RunCard {
+    pub run_id: String,
+    pub policy: Option<String>,
+    pub dataset: Option<String>,
+    pub machine: Option<String>,
+    pub status: RunStatus,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    /// Last `HEARTBEAT_TAIL` heartbeats from `wiki/runs/<run-id>/heartbeats.jsonl`.
+    pub heartbeats: Vec<RunHeartbeat>,
+    /// True when `heartbeats.jsonl` exists for this run (even if currently empty).
+    /// False means the sidecar was never written — contract violation for running runs.
+    pub heartbeat_sidecar_present: bool,
+    /// Raw failure signal from `.loop/state/signals/training-{failed,preempted,stale}-<run-id>.json`.
+    pub failure_signal: Option<serde_json::Value>,
+}
+
+#[allow(dead_code)]
+impl RunCard {
+    pub fn latest_heartbeat(&self) -> Option<&RunHeartbeat> {
+        self.heartbeats.last()
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct HeartbeatRaw {
+    ts: Option<String>,
+    last_step: Option<serde_json::Value>,
+    last_loss: Option<serde_json::Value>,
+    app_state: Option<String>,
+    alert: Option<String>,
+}
+
+/// Parse a timestamp from run card frontmatter. Handles RFC3339 and the
+/// non-standard `"YYYY-MM-DDTHH:MM UTC"` form some scouts write.
+/// Returns None for "TBD", null, empty, or unparseable strings.
+#[allow(dead_code)]
+fn parse_run_ts(s: &str) -> Option<DateTime<Utc>> {
+    let s = s.trim().trim_matches('"');
+    if s.is_empty() || s == "TBD" || s == "null" {
+        return None;
+    }
+    if let Ok(ts) = s.parse::<DateTime<Utc>>() {
+        return Some(ts);
+    }
+    // Normalize "YYYY-MM-DDTHH:MM UTC" → "YYYY-MM-DDTHH:MM:00Z"
+    if let Ok(ts) = s.replace(" UTC", ":00Z").parse::<DateTime<Utc>>() {
+        return Some(ts);
+    }
+    None
+}
+
+/// Extract a field value from YAML frontmatter. Key comparison is
+/// case-insensitive; surrounding double-quotes are stripped from the value.
+#[allow(dead_code)]
+fn parse_yaml_front_field(lines: &[&str], key: &str) -> Option<String> {
+    if lines.first().map(|l| l.trim()) != Some("---") {
+        return None;
+    }
+    let key_prefix = format!("{}:", key.to_ascii_lowercase());
+    for line in lines.iter().skip(1) {
+        if line.trim() == "---" {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with(&key_prefix) {
+            let after = &line[key_prefix.len()..];
+            let val = after.trim().trim_matches('"');
+            if !val.is_empty() && val != "null" {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Read last `HEARTBEAT_TAIL` heartbeats from `<runs_dir>/<run_id>/heartbeats.jsonl`.
+/// Returns `(heartbeats, sidecar_present)`. `sidecar_present` is false only
+/// when the file is absent (present-but-empty returns `([], true)`).
+#[allow(dead_code)]
+fn read_run_heartbeats(runs_dir: &Path, run_id: &str) -> (Vec<RunHeartbeat>, bool) {
+    let path = runs_dir.join(run_id).join("heartbeats.jsonl");
+    let Ok(file) = fs::File::open(&path) else {
+        return (vec![], false);
+    };
+    let reader = BufReader::new(file);
+    let mut raw_lines: Vec<String> = Vec::new();
+    for line in reader.lines() {
+        let Ok(l) = line else { continue };
+        let trimmed = l.trim().to_string();
+        if !trimmed.is_empty() {
+            raw_lines.push(trimmed);
+        }
+    }
+    let tail_start = raw_lines.len().saturating_sub(HEARTBEAT_TAIL);
+    let heartbeats = raw_lines[tail_start..]
+        .iter()
+        .filter_map(|l| {
+            let raw: HeartbeatRaw = serde_json::from_str(l).ok()?;
+            let ts = raw.ts.as_deref().and_then(parse_run_ts)?;
+            let last_step = raw.last_step.as_ref().and_then(|v| v.as_u64());
+            let last_loss = raw.last_loss.as_ref().and_then(|v| v.as_f64());
+            Some(RunHeartbeat {
+                ts,
+                last_step,
+                last_loss,
+                app_state: raw.app_state,
+                alert: raw.alert,
+            })
+        })
+        .collect();
+    (heartbeats, true)
+}
+
+/// Check for a failure signal file for failed, preempted, or stale runs.
+#[allow(dead_code)]
+fn read_failure_signal(signals_dir: &Path, run_id: &str) -> Option<serde_json::Value> {
+    for kind in &["failed", "preempted", "stale"] {
+        let path = signals_dir.join(format!("training-{}-{}.json", kind, run_id));
+        if let Ok(body) = fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Glob `<runs_dir>/*/index.md`, parse YAML frontmatter, load heartbeats and
+/// failure signals. Returns all cards sorted by `started-at` desc (newest first).
+#[allow(dead_code)]
+pub fn load_run_cards(runs_dir: &Path, signals_dir: &Path) -> Vec<RunCard> {
+    let Ok(entries) = fs::read_dir(runs_dir) else {
+        return vec![];
+    };
+    let mut cards: Vec<RunCard> = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()) else {
+            continue;
+        };
+        if name.starts_with('.') || name == "_template" {
+            continue;
+        }
+        let index = dir.join("index.md");
+        let Ok(content) = fs::read_to_string(&index) else { continue };
+        let lines: Vec<&str> = content.lines().collect();
+
+        let run_id = parse_yaml_front_field(&lines, "run-id")
+            .unwrap_or_else(|| name.clone());
+        let policy = parse_yaml_front_field(&lines, "policy");
+        let dataset = parse_yaml_front_field(&lines, "dataset");
+        let machine = parse_yaml_front_field(&lines, "machine");
+        let status = RunStatus::from_str(
+            &parse_yaml_front_field(&lines, "status").unwrap_or_default(),
+        );
+        let started_at = parse_yaml_front_field(&lines, "started-at")
+            .as_deref()
+            .and_then(parse_run_ts);
+        let completed_at = parse_yaml_front_field(&lines, "completed-at")
+            .as_deref()
+            .and_then(parse_run_ts);
+
+        let (heartbeats, heartbeat_sidecar_present) = match &status {
+            RunStatus::Running | RunStatus::Stale => read_run_heartbeats(runs_dir, &run_id),
+            _ => (vec![], false),
+        };
+
+        let failure_signal = match &status {
+            RunStatus::Failed | RunStatus::Preempted | RunStatus::Stale => {
+                read_failure_signal(signals_dir, &run_id)
+            }
+            _ => None,
+        };
+
+        cards.push(RunCard {
+            run_id,
+            policy,
+            dataset,
+            machine,
+            status,
+            started_at,
+            completed_at,
+            heartbeats,
+            heartbeat_sidecar_present,
+            failure_signal,
+        });
+    }
+    // Newest started_at first; missing dates trail; ties broken by run_id desc
+    cards.sort_by(|a, b| match (b.started_at, a.started_at) {
+        (Some(bt), Some(at)) => bt.cmp(&at),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => b.run_id.cmp(&a.run_id),
+    });
+    cards
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -4441,7 +4700,7 @@ some non-bracket junk line
             .subsec_nanos()
     }
 
-    fn make_card(dir: &std::path::PathBuf, id: &str, status: &str, depends_on: Option<&str>) {
+    fn make_card(dir: &Path, id: &str, status: &str, depends_on: Option<&str>) {
         let card_dir = dir.join(id);
         std::fs::create_dir_all(&card_dir).unwrap();
         let dep_line = match depends_on {
@@ -4541,5 +4800,204 @@ some non-bracket junk line
         assert!(matches!(result[2].readiness, QueuedReadiness::Blocked { .. }), "index 2 must be blocked");
         assert!(matches!(result[3].readiness, QueuedReadiness::Blocked { .. }), "index 3 must be blocked");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── run cards tests (brief-125) ───────────────────────────────────────────
+
+    #[test]
+    fn parse_run_ts_rfc3339() {
+        assert!(parse_run_ts("2026-05-02T16:30:17Z").is_some());
+    }
+
+    #[test]
+    fn parse_run_ts_utc_space_format() {
+        let ts1 = parse_run_ts("2026-05-02T18:44 UTC").unwrap();
+        let ts2 = parse_run_ts("2026-05-02T18:44:00Z").unwrap();
+        assert_eq!(ts1.timestamp(), ts2.timestamp());
+    }
+
+    #[test]
+    fn parse_run_ts_tbd_and_empty_are_none() {
+        assert!(parse_run_ts("TBD").is_none());
+        assert!(parse_run_ts("").is_none());
+        assert!(parse_run_ts("null").is_none());
+    }
+
+    #[test]
+    fn parse_yaml_front_field_basic() {
+        let content = "---\nrun-id: my-run\npolicy: act\nstatus: running\n---\n";
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(parse_yaml_front_field(&lines, "run-id").as_deref(), Some("my-run"));
+        assert_eq!(parse_yaml_front_field(&lines, "policy").as_deref(), Some("act"));
+        assert_eq!(parse_yaml_front_field(&lines, "status").as_deref(), Some("running"));
+        assert!(parse_yaml_front_field(&lines, "missing").is_none());
+    }
+
+    #[test]
+    fn parse_yaml_front_field_strips_quotes() {
+        let content = "---\nstarted-at: \"2026-05-02T18:44 UTC\"\n---\n";
+        let lines: Vec<&str> = content.lines().collect();
+        let val = parse_yaml_front_field(&lines, "started-at").unwrap();
+        assert!(!val.starts_with('"'), "quotes should be stripped, got: {val:?}");
+        assert_eq!(val, "2026-05-02T18:44 UTC");
+    }
+
+    #[test]
+    fn load_run_cards_returns_running_cards() {
+        let dir = std::env::temp_dir().join(format!("hive_runcards_{}", nanos()));
+        let sig_dir = std::env::temp_dir().join(format!("hive_rcsig_{}", nanos()));
+        std::fs::create_dir_all(&sig_dir).unwrap();
+
+        let run1 = dir.join("2026-05-02-act-r1");
+        std::fs::create_dir_all(&run1).unwrap();
+        std::fs::write(run1.join("index.md"),
+            "---\nrun-id: 2026-05-02-act-r1\npolicy: act\ndataset: ds1\nmachine: modal:a10g\nstatus: running\nstarted-at: 2026-05-02T16:30:17Z\ncompleted-at: TBD\n---\n",
+        ).unwrap();
+
+        let run2 = dir.join("2026-05-02-smolvla-r1");
+        std::fs::create_dir_all(&run2).unwrap();
+        std::fs::write(run2.join("index.md"),
+            "---\nrun-id: 2026-05-02-smolvla-r1\npolicy: smolvla\ndataset: ds1\nmachine: modal:a10g\nstatus: running\nstarted-at: \"2026-05-02T18:44 UTC\"\ncompleted-at: TBD\n---\n",
+        ).unwrap();
+
+        let cards = load_run_cards(&dir, &sig_dir);
+        assert_eq!(cards.len(), 2);
+        let ids: Vec<&str> = cards.iter().map(|c| c.run_id.as_str()).collect();
+        assert!(ids.contains(&"2026-05-02-act-r1"), "missing act-r1");
+        assert!(ids.contains(&"2026-05-02-smolvla-r1"), "missing smolvla-r1");
+        for card in &cards {
+            assert_eq!(card.status, RunStatus::Running, "{} should be Running", card.run_id);
+            assert_eq!(card.policy.as_deref(), Some(if card.run_id.contains("act") { "act" } else { "smolvla" }));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sig_dir).ok();
+    }
+
+    #[test]
+    fn load_run_cards_reads_heartbeats_from_sidecar() {
+        let dir = std::env::temp_dir().join(format!("hive_hb_{}", nanos()));
+        let sig_dir = std::env::temp_dir().join(format!("hive_hbsig_{}", nanos()));
+        std::fs::create_dir_all(&sig_dir).unwrap();
+
+        let run_dir = dir.join("test-run-r1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("index.md"),
+            "---\nrun-id: test-run-r1\npolicy: act\nstatus: running\nstarted-at: 2026-05-02T10:00:00Z\ncompleted-at: TBD\n---\n",
+        ).unwrap();
+        std::fs::write(run_dir.join("heartbeats.jsonl"),
+            "{\"ts\":\"2026-05-02T10:30:00Z\",\"status\":\"running\",\"last_step\":500,\"last_loss\":1.23,\"log_mtime\":\"2026-05-02T10:30:00Z\",\"app_state\":\"running\"}\n\
+             {\"ts\":\"2026-05-02T11:00:00Z\",\"status\":\"running\",\"last_step\":1000,\"last_loss\":0.87,\"log_mtime\":\"2026-05-02T11:00:00Z\",\"app_state\":\"running\"}\n",
+        ).unwrap();
+
+        let cards = load_run_cards(&dir, &sig_dir);
+        assert_eq!(cards.len(), 1);
+        let card = &cards[0];
+        assert!(card.heartbeat_sidecar_present, "sidecar should be present");
+        assert_eq!(card.heartbeats.len(), 2);
+        let latest = card.latest_heartbeat().unwrap();
+        assert_eq!(latest.last_step, Some(1000));
+        assert!((latest.last_loss.unwrap() - 0.87).abs() < 0.001);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sig_dir).ok();
+    }
+
+    #[test]
+    fn load_run_cards_no_heartbeat_sidecar() {
+        let dir = std::env::temp_dir().join(format!("hive_nohb_{}", nanos()));
+        let sig_dir = std::env::temp_dir().join(format!("hive_nohbsig_{}", nanos()));
+        std::fs::create_dir_all(&sig_dir).unwrap();
+
+        let run_dir = dir.join("run-no-sidecar");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("index.md"),
+            "---\nrun-id: run-no-sidecar\npolicy: act\nstatus: running\nstarted-at: 2026-05-02T10:00:00Z\ncompleted-at: TBD\n---\n",
+        ).unwrap();
+
+        let cards = load_run_cards(&dir, &sig_dir);
+        assert_eq!(cards.len(), 1);
+        assert!(!cards[0].heartbeat_sidecar_present, "sidecar should be absent");
+        assert!(cards[0].heartbeats.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sig_dir).ok();
+    }
+
+    #[test]
+    fn load_run_cards_failed_reads_failure_signal() {
+        let dir = std::env::temp_dir().join(format!("hive_fail_{}", nanos()));
+        let sig_dir = std::env::temp_dir().join(format!("hive_failsig_{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&sig_dir).unwrap();
+
+        let run_dir = dir.join("2026-04-28-failed-r1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("index.md"),
+            "---\nrun-id: 2026-04-28-failed-r1\npolicy: act\nstatus: failed\nstarted-at: 2026-04-28T10:00:00Z\ncompleted-at: 2026-04-28T12:00:00Z\n---\n",
+        ).unwrap();
+        std::fs::write(
+            sig_dir.join("training-failed-2026-04-28-failed-r1.json"),
+            r#"{"run_id":"2026-04-28-failed-r1","reason":"OOM at step 2000"}"#,
+        ).unwrap();
+
+        let cards = load_run_cards(&dir, &sig_dir);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].status, RunStatus::Failed);
+        let sig = cards[0].failure_signal.as_ref().expect("failure_signal should be set");
+        assert_eq!(sig["reason"].as_str(), Some("OOM at step 2000"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sig_dir).ok();
+    }
+
+    #[test]
+    fn load_run_cards_sorted_newest_first() {
+        let dir = std::env::temp_dir().join(format!("hive_sort_rc_{}", nanos()));
+        let sig_dir = std::env::temp_dir().join(format!("hive_sort_rcsig_{}", nanos()));
+        std::fs::create_dir_all(&sig_dir).unwrap();
+
+        for (name, started) in &[
+            ("run-a", "2026-04-01T10:00:00Z"),
+            ("run-b", "2026-05-01T10:00:00Z"),
+            ("run-c", "2026-03-01T10:00:00Z"),
+        ] {
+            let run_dir = dir.join(name);
+            std::fs::create_dir_all(&run_dir).unwrap();
+            std::fs::write(run_dir.join("index.md"),
+                format!("---\nrun-id: {}\nstatus: complete\nstarted-at: {}\ncompleted-at: {}\n---\n", name, started, started),
+            ).unwrap();
+        }
+
+        let cards = load_run_cards(&dir, &sig_dir);
+        assert_eq!(cards.len(), 3);
+        assert_eq!(cards[0].run_id, "run-b");
+        assert_eq!(cards[1].run_id, "run-a");
+        assert_eq!(cards[2].run_id, "run-c");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sig_dir).ok();
+    }
+
+    #[test]
+    fn load_run_cards_skips_template_dir() {
+        let dir = std::env::temp_dir().join(format!("hive_tmpl_{}", nanos()));
+        let sig_dir = std::env::temp_dir().join(format!("hive_tmplsig_{}", nanos()));
+        std::fs::create_dir_all(&sig_dir).unwrap();
+
+        // Real run
+        let run_dir = dir.join("2026-05-02-real-r1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("index.md"),
+            "---\nrun-id: 2026-05-02-real-r1\nstatus: complete\nstarted-at: 2026-05-02T10:00:00Z\ncompleted-at: 2026-05-02T12:00:00Z\n---\n",
+        ).unwrap();
+
+        // _template dir — should be skipped
+        let tmpl_dir = dir.join("_template");
+        std::fs::create_dir_all(&tmpl_dir).unwrap();
+        std::fs::write(tmpl_dir.join("index.md"),
+            "---\nrun-id: _template\nstatus: pending\nstarted-at: TBD\ncompleted-at: TBD\n---\n",
+        ).unwrap();
+
+        let cards = load_run_cards(&dir, &sig_dir);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].run_id, "2026-05-02-real-r1");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sig_dir).ok();
     }
 }
