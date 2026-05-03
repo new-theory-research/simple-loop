@@ -127,6 +127,8 @@ struct App {
     /// True when the Signals slot should show the Buzz hex grid instead of
     /// "From the Hive" learnings. Toggled by `b`. Alert signals override both.
     signals_show_buzz: bool,
+    /// Loaded run cards from wiki/runs/*/index.md + heartbeats.jsonl.
+    run_cards: Vec<state::RunCard>,
 }
 
 const LEARNING_ROTATION_SECS: u64 = 60;
@@ -154,6 +156,10 @@ impl App {
             last_learning_rotation: Instant::now(),
             config: config::HiveConfig::load(),
             signals_show_buzz: false,
+            run_cards: state::load_run_cards(
+                std::path::Path::new("wiki/runs"),
+                std::path::Path::new(".loop/state/signals"),
+            ),
         }
     }
 
@@ -174,6 +180,10 @@ impl App {
         if self.signal_cursor > max {
             self.signal_cursor = max;
         }
+        self.run_cards = state::load_run_cards(
+            std::path::Path::new("wiki/runs"),
+            std::path::Path::new(".loop/state/signals"),
+        );
     }
 
     /// Advance the learning quote if it's been long enough since the last
@@ -1001,6 +1011,225 @@ fn render_hive_learning<'a>(learning: Option<&'a str>) -> Text<'a> {
             "The hive is quiet. No learnings yet — run a brief.",
             Style::default().fg(MUTED),
         ))),
+    }
+}
+
+// ── run cards render ─────────────────────────────────────────────────────────
+
+/// Compute step/s pace from the last `n` heartbeats (up to 5).
+/// Returns None when fewer than 2 usable data points exist.
+fn compute_pace(heartbeats: &[state::RunHeartbeat]) -> Option<f64> {
+    let useful: Vec<(chrono::DateTime<chrono::Utc>, u64)> = heartbeats
+        .iter()
+        .rev()
+        .take(5)
+        .filter_map(|hb| hb.last_step.map(|s| (hb.ts, s)))
+        .collect();
+    if useful.len() < 2 {
+        return None;
+    }
+    let (ts_newest, step_newest) = useful[0];
+    let (ts_oldest, step_oldest) = *useful.last().unwrap();
+    let delta_steps = step_newest.saturating_sub(step_oldest) as f64;
+    let delta_secs = (ts_newest - ts_oldest).num_seconds() as f64;
+    if delta_secs <= 0.0 || delta_steps <= 0.0 {
+        return None;
+    }
+    Some(delta_steps / delta_secs)
+}
+
+/// Returns 4 slots (2x2) for the active-run grid. Each slot is either a card
+/// index into `cards` or `None` (placeholder). Only Running and Stale cards
+/// appear in the grid; others live in the Recent list.
+fn run_card_slots(cards: &[state::RunCard]) -> [Option<usize>; 4] {
+    let indices: Vec<usize> = cards
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| matches!(c.status, state::RunStatus::Running | state::RunStatus::Stale))
+        .take(4)
+        .map(|(i, _)| i)
+        .collect();
+    [
+        indices.first().copied(),
+        indices.get(1).copied(),
+        indices.get(2).copied(),
+        indices.get(3).copied(),
+    ]
+}
+
+fn run_status_chrome(status: &state::RunStatus) -> (&'static str, &'static str, Color) {
+    match status {
+        state::RunStatus::Running    => ("🟢", "RUNNING",   STAMP_GREEN),
+        state::RunStatus::Stale      => ("⚠",  "STALE",     AMBER),
+        state::RunStatus::Preempted  => ("🟡", "PREEMPTED", AMBER),
+        state::RunStatus::Failed     => ("✗",  "FAILED",    CORAL),
+        state::RunStatus::Complete   => ("✓",  "COMPLETE",  MUTED),
+        state::RunStatus::Pending    => ("🔘", "PENDING",   MUTED),
+        state::RunStatus::Unknown(_) => ("?",  "UNKNOWN",   MUTED),
+    }
+}
+
+#[allow(dead_code)]
+fn render_run_card(f: &mut ratatui::Frame, area: Rect, card: &state::RunCard) {
+    let (icon, label, border_color) = run_status_chrome(&card.status);
+    let title = Line::from(vec![
+        Span::styled(
+            format!(" {} ", card.run_id),
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{} {} ", icon, label),
+            Style::default().fg(border_color),
+        ),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Meta row: policy · machine · dataset
+    let meta: Vec<&str> = [
+        card.policy.as_deref(),
+        card.machine.as_deref(),
+        card.dataset.as_deref(),
+    ]
+    .iter()
+    .flatten()
+    .copied()
+    .collect();
+    if !meta.is_empty() {
+        lines.push(Line::from(Span::styled(
+            meta.join(" · "),
+            Style::default().fg(MUTED),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    if let Some(hb) = card.latest_heartbeat() {
+        if let Some(step) = hb.last_step {
+            lines.push(Line::from(vec![
+                Span::styled("Step  ", Style::default().fg(MUTED)),
+                Span::styled(step.to_string(), Style::default().fg(Color::White)),
+            ]));
+        }
+
+        if let Some(loss) = hb.last_loss {
+            let mut loss_spans = vec![
+                Span::styled("Loss  ", Style::default().fg(MUTED)),
+                Span::styled(format!("{:.4}", loss), Style::default().fg(Color::White)),
+            ];
+            // Trend: compare against 2 heartbeats back (index len-3 from tail)
+            if card.heartbeats.len() >= 3 {
+                let prev_idx = card.heartbeats.len().saturating_sub(3);
+                if let Some(prev) = card.heartbeats[prev_idx].last_loss {
+                    let trend = if loss < prev { "↓" } else if loss > prev { "↑" } else { "→" };
+                    loss_spans.push(Span::styled(
+                        format!("  {} from {:.4}", trend, prev),
+                        Style::default().fg(MUTED),
+                    ));
+                }
+            }
+            lines.push(Line::from(loss_spans));
+        }
+
+        if let Some(pace) = compute_pace(&card.heartbeats) {
+            lines.push(Line::from(vec![
+                Span::styled("Pace  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    format!("{:.1} step/s", pace),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
+
+        let hb_age = state::relative_time(hb.ts);
+        let app_state_str = hb
+            .app_state
+            .as_deref()
+            .map(|s| truncate_chars(s, 12))
+            .unwrap_or_else(|| "—".to_string());
+        lines.push(Line::from(vec![
+            Span::styled("♥ ", Style::default().fg(CORAL)),
+            Span::styled(hb_age, Style::default().fg(MUTED)),
+            Span::styled(format!("  {}", app_state_str), Style::default().fg(MUTED)),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "No heartbeats yet",
+            Style::default().fg(MUTED),
+        )));
+    }
+
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// Render the 2x2 active-run grid into `area`.
+/// Called from the Signals slot when `signals_show_runs` is active (C4).
+#[allow(dead_code)]
+fn render_run_cards(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let active_count = app
+        .run_cards
+        .iter()
+        .filter(|c| matches!(c.status, state::RunStatus::Running | state::RunStatus::Stale))
+        .count();
+    let overflow = active_count.saturating_sub(4);
+
+    let row_constraints: Vec<Constraint> = if overflow > 0 {
+        vec![Constraint::Min(1), Constraint::Min(1), Constraint::Length(1)]
+    } else {
+        vec![Constraint::Percentage(50), Constraint::Percentage(50)]
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(row_constraints)
+        .split(area);
+
+    let slots = run_card_slots(&app.run_cards);
+    let row0 = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[0]);
+    let row1 = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+    let cell_rects = [row0[0], row0[1], row1[0], row1[1]];
+
+    for (i, cell_rect) in cell_rects.iter().enumerate() {
+        if let Some(card_idx) = slots[i] {
+            if let Some(card) = app.run_cards.get(card_idx) {
+                render_run_card(f, *cell_rect, card);
+            }
+        } else {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(DIM_BORDER));
+            let inner = block.inner(*cell_rect);
+            f.render_widget(block, *cell_rect);
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "(no active run)",
+                    Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+                )),
+                inner,
+            );
+        }
+    }
+
+    if overflow > 0 {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!("+{} more — see wiki/runs/", overflow),
+                Style::default().fg(MUTED),
+            )),
+            rows[2],
+        );
     }
 }
 
@@ -2124,5 +2353,113 @@ mod tests {
         let signals_slot_calm = app.signals.signals.is_empty();
         let signals_slot_buzz = app.signals_show_buzz && signals_slot_calm;
         assert!(!signals_slot_buzz, "alerts should override buzz toggle");
+    }
+
+    // ── run cards (brief-125 C2) ──────────────────────────────────────────────
+
+    fn make_run_card(run_id: &str, status: state::RunStatus) -> state::RunCard {
+        state::RunCard {
+            run_id: run_id.to_string(),
+            policy: Some("act".to_string()),
+            dataset: Some("test-dataset".to_string()),
+            machine: Some("modal:a10g".to_string()),
+            status,
+            started_at: None,
+            completed_at: None,
+            heartbeats: vec![],
+            heartbeat_sidecar_present: false,
+            failure_signal: None,
+        }
+    }
+
+    #[test]
+    fn run_card_slots_all_empty_when_no_active_runs() {
+        let cards: Vec<state::RunCard> = vec![
+            make_run_card("run-001", state::RunStatus::Complete),
+            make_run_card("run-002", state::RunStatus::Failed),
+        ];
+        let slots = run_card_slots(&cards);
+        assert!(slots.iter().all(|s| s.is_none()), "no active runs → all 4 slots None");
+    }
+
+    #[test]
+    fn run_card_slots_fills_first_two_for_two_active_runs() {
+        // C2 pass criterion 3: 2 active runs → first 2 slots filled, last 2 empty
+        let cards: Vec<state::RunCard> = vec![
+            make_run_card("run-001", state::RunStatus::Running),
+            make_run_card("run-002", state::RunStatus::Running),
+            make_run_card("run-003", state::RunStatus::Complete),
+        ];
+        let slots = run_card_slots(&cards);
+        assert!(slots[0].is_some(), "slot 0 should be filled");
+        assert!(slots[1].is_some(), "slot 1 should be filled");
+        assert!(slots[2].is_none(), "slot 2 should be empty");
+        assert!(slots[3].is_none(), "slot 3 should be empty");
+    }
+
+    #[test]
+    fn run_card_slots_all_empty_for_zero_active_runs() {
+        // C2 pass criterion 4: 0 active runs → all 4 slots empty (placeholders)
+        let cards: Vec<state::RunCard> = vec![];
+        let slots = run_card_slots(&cards);
+        assert!(slots.iter().all(|s| s.is_none()), "0 active → all 4 slots None");
+    }
+
+    #[test]
+    fn run_card_slots_caps_at_four_for_five_active_runs() {
+        // C2 pass criterion 5: >4 active → only first 4 shown, footer implicit
+        let cards: Vec<state::RunCard> = (0..5)
+            .map(|i| make_run_card(&format!("run-{:03}", i), state::RunStatus::Running))
+            .collect();
+        let slots = run_card_slots(&cards);
+        assert!(slots.iter().all(|s| s.is_some()), "all 4 slots filled when 5 active");
+    }
+
+    #[test]
+    fn run_card_slots_includes_stale_runs() {
+        let cards: Vec<state::RunCard> = vec![
+            make_run_card("run-stale", state::RunStatus::Stale),
+            make_run_card("run-complete", state::RunStatus::Complete),
+        ];
+        let slots = run_card_slots(&cards);
+        assert!(slots[0].is_some(), "Stale run should appear in active grid");
+        assert!(slots[1].is_none());
+    }
+
+    #[test]
+    fn compute_pace_returns_none_for_fewer_than_two_points() {
+        let hbs = vec![state::RunHeartbeat {
+            ts: chrono::Utc::now(),
+            last_step: Some(100),
+            last_loss: None,
+            app_state: None,
+            alert: None,
+        }];
+        assert!(compute_pace(&hbs).is_none());
+    }
+
+    #[test]
+    fn compute_pace_computes_correctly() {
+        use chrono::TimeZone;
+        let base = chrono::Utc.with_ymd_and_hms(2026, 5, 2, 12, 0, 0).unwrap();
+        let hbs = vec![
+            state::RunHeartbeat {
+                ts: base,
+                last_step: Some(1000),
+                last_loss: None,
+                app_state: None,
+                alert: None,
+            },
+            state::RunHeartbeat {
+                ts: base + chrono::Duration::seconds(100),
+                last_step: Some(1500),
+                last_loss: None,
+                app_state: None,
+                alert: None,
+            },
+        ];
+        let pace = compute_pace(&hbs).expect("should compute pace");
+        // 500 steps / 100 secs = 5.0 step/s
+        assert!((pace - 5.0).abs() < 0.01, "expected 5.0 step/s, got {}", pace);
     }
 }
