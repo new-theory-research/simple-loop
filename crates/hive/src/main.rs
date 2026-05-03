@@ -1168,10 +1168,93 @@ fn render_run_card(f: &mut ratatui::Frame, area: Rect, card: &state::RunCard) {
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-/// Render the 2x2 active-run grid into `area`.
+/// Build one-liner rows for the Recent list (non-active runs sorted by completed_at desc).
+/// Returns (lines, overflow_count). Capped at 6 rows.
+#[allow(dead_code)]
+fn recent_run_lines(cards: &[state::RunCard]) -> (Vec<Line<'static>>, usize) {
+    let mut historical: Vec<&state::RunCard> = cards
+        .iter()
+        .filter(|c| !matches!(c.status, state::RunStatus::Running | state::RunStatus::Stale))
+        .collect();
+    historical.sort_by(|a, b| match (b.completed_at, a.completed_at) {
+        (Some(bt), Some(at)) => bt.cmp(&at),
+        // b has date, a doesn't → b should come first → a > b → a after b
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        // b has no date, a does → a should come first → a < b → a before b
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => b.run_id.cmp(&a.run_id),
+    });
+    let overflow = historical.len().saturating_sub(6);
+    historical.truncate(6);
+
+    let lines = historical
+        .iter()
+        .map(|card| {
+            let (icon, _, color) = run_status_chrome(&card.status);
+            let age = card
+                .completed_at
+                .or(card.started_at)
+                .map(state::relative_time)
+                .unwrap_or_else(|| "?".to_string());
+            let policy_str = card.policy.as_deref().unwrap_or("—").to_string();
+            let metric = match &card.status {
+                state::RunStatus::Complete => {
+                    match (card.started_at, card.completed_at) {
+                        (Some(s), Some(e)) => {
+                            let secs = (e - s).num_seconds().max(0);
+                            let dur = if secs < 3600 {
+                                format!("{}m", secs / 60)
+                            } else {
+                                format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+                            };
+                            format!("done ({})", dur)
+                        }
+                        _ => "done".to_string(),
+                    }
+                }
+                state::RunStatus::Failed => "failed".to_string(),
+                state::RunStatus::Preempted => "preempted".to_string(),
+                state::RunStatus::Pending => "pending".to_string(),
+                state::RunStatus::Unknown(s) => s.clone(),
+                _ => String::new(),
+            };
+            Line::from(vec![
+                Span::styled(format!("{} ", icon), Style::default().fg(color)),
+                Span::styled(card.run_id.clone(), Style::default().fg(GOLD)),
+                Span::styled(
+                    format!(" · {} · {} · {}", policy_str, metric, age),
+                    Style::default().fg(MUTED),
+                ),
+            ])
+        })
+        .collect();
+
+    (lines, overflow)
+}
+
+/// Render the 2x2 active-run grid + Recent list into `area`.
 /// Called from the Signals slot when `signals_show_runs` is active (C4).
 #[allow(dead_code)]
 fn render_run_cards(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let (recent_lines, recent_overflow) = recent_run_lines(&app.run_cards);
+
+    // Split area: grid (top) + optional recent section (bottom)
+    let recent_section_h = if recent_lines.is_empty() {
+        0u16
+    } else {
+        (1 + recent_lines.len() + if recent_overflow > 0 { 1 } else { 0 }) as u16
+    };
+    let (grid_area, recent_area_opt): (Rect, Option<Rect>) = if recent_section_h == 0 {
+        (area, None)
+    } else {
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(4), Constraint::Length(recent_section_h)])
+            .split(area);
+        (sections[0], Some(sections[1]))
+    };
+
+    // ── 2x2 active-run grid ──────────────────────────────────────────────────
     let active_count = app
         .run_cards
         .iter()
@@ -1187,7 +1270,7 @@ fn render_run_cards(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(row_constraints)
-        .split(area);
+        .split(grid_area);
 
     let slots = run_card_slots(&app.run_cards);
     let row0 = Layout::default()
@@ -1230,6 +1313,22 @@ fn render_run_cards(f: &mut ratatui::Frame, area: Rect, app: &App) {
             )),
             rows[2],
         );
+    }
+
+    // ── Recent list ──────────────────────────────────────────────────────────
+    if let Some(recent_area) = recent_area_opt {
+        let mut all_lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+            "Recent",
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ))];
+        all_lines.extend(recent_lines);
+        if recent_overflow > 0 {
+            all_lines.push(Line::from(Span::styled(
+                format!("[+{} older — wiki/runs/index]", recent_overflow),
+                Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+            )));
+        }
+        f.render_widget(Paragraph::new(Text::from(all_lines)), recent_area);
     }
 }
 
@@ -2461,5 +2560,82 @@ mod tests {
         let pace = compute_pace(&hbs).expect("should compute pace");
         // 500 steps / 100 secs = 5.0 step/s
         assert!((pace - 5.0).abs() < 0.01, "expected 5.0 step/s, got {}", pace);
+    }
+
+    // ── recent list (brief-125 C3) ────────────────────────────────────────────
+
+    #[test]
+    fn recent_run_lines_sorted_by_completed_at_desc() {
+        // C3 pass criterion 6: mixed statuses, sorted by completed_at desc
+        use chrono::TimeZone;
+        let base = chrono::Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+        let cards = vec![
+            // Older complete run
+            state::RunCard {
+                completed_at: Some(base),
+                ..make_run_card("run-old-complete", state::RunStatus::Complete)
+            },
+            // Newest failed run
+            state::RunCard {
+                completed_at: Some(base + chrono::Duration::hours(5)),
+                ..make_run_card("run-new-failed", state::RunStatus::Failed)
+            },
+            // Active (must NOT appear in recent list)
+            make_run_card("run-active", state::RunStatus::Running),
+            // Preempted in between
+            state::RunCard {
+                completed_at: Some(base + chrono::Duration::hours(2)),
+                ..make_run_card("run-preempted", state::RunStatus::Preempted)
+            },
+            // Pending (no completed_at — trails)
+            make_run_card("run-pending", state::RunStatus::Pending),
+        ];
+
+        let (lines, overflow) = recent_run_lines(&cards);
+        assert_eq!(overflow, 0, "no overflow for 4 recent entries");
+        assert_eq!(lines.len(), 4, "running excluded → 4 historical rows");
+
+        // Sorted: newest-failed (base+5h), preempted (base+2h), old-complete (base), pending (no date)
+        let text = |line: &ratatui::text::Line<'static>| -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        assert!(text(&lines[0]).contains("run-new-failed"), "newest failed first");
+        assert!(text(&lines[1]).contains("run-preempted"), "preempted second");
+        assert!(text(&lines[2]).contains("run-old-complete"), "older complete third");
+        assert!(text(&lines[3]).contains("run-pending"), "pending (no date) last");
+    }
+
+    #[test]
+    fn recent_run_lines_caps_at_six_with_overflow() {
+        let cards: Vec<state::RunCard> = (0..8)
+            .map(|i| make_run_card(&format!("run-{:03}", i), state::RunStatus::Complete))
+            .collect();
+        let (lines, overflow) = recent_run_lines(&cards);
+        assert_eq!(lines.len(), 6, "capped at 6");
+        assert_eq!(overflow, 2, "overflow = total(8) - cap(6)");
+    }
+
+    #[test]
+    fn recent_run_lines_excludes_running_and_stale() {
+        let cards = vec![
+            make_run_card("run-running", state::RunStatus::Running),
+            make_run_card("run-stale", state::RunStatus::Stale),
+            make_run_card("run-complete", state::RunStatus::Complete),
+        ];
+        let (lines, _) = recent_run_lines(&cards);
+        assert_eq!(lines.len(), 1, "only complete appears; running/stale excluded");
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("run-complete"));
+    }
+
+    #[test]
+    fn recent_run_lines_empty_for_all_active() {
+        let cards = vec![
+            make_run_card("run-a", state::RunStatus::Running),
+            make_run_card("run-b", state::RunStatus::Stale),
+        ];
+        let (lines, overflow) = recent_run_lines(&cards);
+        assert!(lines.is_empty(), "no recent rows when all runs are active");
+        assert_eq!(overflow, 0);
     }
 }
