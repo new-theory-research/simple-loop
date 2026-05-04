@@ -242,12 +242,43 @@ def parse_concurrency_frontmatter(brief_file_path):
 
 
 def save_running(paths, data):
-    """Write running.json and commit."""
-    with open(paths["running_file"], "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    """DEPRECATED — kept for compat with callers we haven't migrated.
+
+    brief-108-d: running.json is a projected file. Direct writes are forbidden
+    by lint outside `state.write_running_json` (the projector's owner). This
+    function now projects from cards + runtime-events.jsonl and writes the
+    result, ignoring the `data` argument. The rc-mutation pattern that used
+    to live in this module is being torn out cycle-by-cycle.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from state import write_running_json
+    write_running_json(paths["project_dir"])
     git(paths["project_dir"], "add", paths["running_file"])
-    git(paths["project_dir"], "commit", "-m", "loop: update running.json", check=False)
+    git(paths["project_dir"], "commit", "-m", "loop: project running.json", check=False)
+
+
+def project_running(paths):
+    """Project running.json from cards + runtime-events.jsonl.
+
+    The single canonical writer of running.json. Returns the projected dict.
+    Lint enforces: no direct writes to running.json outside this path.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from state import write_running_json
+    return write_running_json(paths["project_dir"])
+
+
+def runtime_event(paths, event_type, brief, **fields):
+    """Append a runtime-event line to .loop/state/runtime-events.jsonl.
+
+    Convenience wrapper around state.append_event that pulls project_dir from
+    paths. Use this from action handlers — runtime facts (dispatched_at,
+    completed_at, merge_sha, worker_slot, kind, reason) belong in the events
+    log, NOT in running.json (which the projector regenerates).
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from state import append_event
+    return append_event(paths["project_dir"], event_type, brief, **fields)
 
 
 # ─── Re-queued briefs (brief-102) ───────────────────────────────────
@@ -496,58 +527,44 @@ def human_queue_summary(paths):
 # ─── Action: move-to-eval ────────────────────────────────────────────
 
 def move_to_eval(paths, brief_id):
-    """Move a brief from active to completed_pending_eval."""
+    """Move a brief from active to completed_pending_eval.
+
+    brief-108-d note: completed_pending_eval is a legacy bucket the projector
+    treats as always-empty. This action remains for API compat — it appends
+    a `completed` event so the projector routes the brief into awaiting_review
+    (the modern equivalent of completed_pending_eval).
+    """
     rc = load_running(paths)
-    active = rc.get("active", [])
-    pending = rc.get("completed_pending_eval", [])
-
-    moved = None
-    new_active = []
-    for entry in active:
-        if entry.get("brief") == brief_id:
-            moved = entry
-        else:
-            new_active.append(entry)
-
-    if not moved:
+    active_briefs = {e.get("brief") for e in rc.get("active", [])}
+    if brief_id not in active_briefs:
         print(f"Warning: brief '{brief_id}' not found in active list", file=sys.stderr)
         return False
 
-    moved["completed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    pending.append(moved)
-    rc["active"] = new_active
-    rc["completed_pending_eval"] = pending
-    save_running(paths, rc)
+    runtime_event(paths, "completed", brief_id, kind="complete", auto_merge=False)
+    project_running(paths)
 
     log_action(paths, "move-to-eval", {"brief": brief_id})
-    print(f"Moved {brief_id} to completed_pending_eval")
+    print(f"Moved {brief_id} to awaiting_review (kind=complete via move-to-eval)")
     return True
 
 
 # ─── Action: move-to-pending-merges ─────────────────────────────────
 
 def move_to_pending_merges(paths, brief_id):
-    """Move a brief from active[] to pending_merges[] (auto-merge path)."""
+    """Move a brief from active[] to pending_merges[] (auto-merge path).
+
+    brief-108-d: appends `completed` (auto_merge=true) + `approved` events.
+    Projector routes the brief into pending_merges[] on next projection.
+    """
     rc = load_running(paths)
-    active = rc.get("active", [])
-
-    moved = None
-    new_active = []
-    for entry in active:
-        if entry.get("brief") == brief_id:
-            moved = entry
-        else:
-            new_active.append(entry)
-
-    if not moved:
+    active_briefs = {e.get("brief") for e in rc.get("active", [])}
+    if brief_id not in active_briefs:
         print(f"Warning: brief '{brief_id}' not found in active list", file=sys.stderr)
         return False
 
-    moved["completed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    moved["auto_merge"] = True
-    rc["active"] = new_active
-    rc["pending_merges"].append(moved)
-    save_running(paths, rc)
+    runtime_event(paths, "completed", brief_id, kind="complete", auto_merge=True)
+    runtime_event(paths, "approved", brief_id)
+    project_running(paths)
 
     log_action(paths, "move-to-pending-merges", {"brief": brief_id})
     print(f"Moved {brief_id} to pending_merges")
@@ -628,29 +645,15 @@ def move_to_awaiting_review(paths, brief_id, kind, reason=""):
             print(f"cycle-gate: worktree not found for {brief_id} — skipping gate", file=sys.stderr)
 
     rc = load_running(paths)
-    active = rc.get("active", [])
-
-    moved = None
-    new_active = []
-    for entry in active:
-        if entry.get("brief") == brief_id:
-            moved = entry
-        else:
-            new_active.append(entry)
-
-    if not moved:
+    active_briefs = {e.get("brief") for e in rc.get("active", [])}
+    if brief_id not in active_briefs:
         print(f"Warning: brief '{brief_id}' not found in active list", file=sys.stderr)
         return False
 
-    moved["completed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    moved["auto_merge"] = False
-    moved["kind"] = kind
-    if reason:
-        moved["reason"] = reason
-        moved["conflict_note"] = reason
-    rc["active"] = new_active
-    rc["awaiting_review"].append(moved)
-    save_running(paths, rc)
+    # brief-108-d: append completed event; projector routes to awaiting_review.
+    runtime_event(paths, "completed", brief_id,
+                  kind=kind, auto_merge=False, reason=reason or "")
+    project_running(paths)
 
     signal_dedup_clear(paths, brief_id)
     log_action(paths, "move-to-awaiting-review", {"brief": brief_id, "kind": kind, "reason": reason})
@@ -661,7 +664,13 @@ def move_to_awaiting_review(paths, brief_id, kind, reason=""):
 # ─── Action: process-pending-merges ─────────────────────────────────
 
 def process_pending_merges(paths):
-    """Pop one brief from pending_merges[], write pending-merge.json, execute merge."""
+    """Pop one brief from pending_merges[], write pending-merge.json, execute merge.
+
+    brief-108-d: pending_merges[] is projected from runtime-events. The "pop"
+    is implicit — merge() flips card status to merged + appends a `merged`
+    event, after which the next projection drops the entry from pending_merges
+    and adds it to history.
+    """
     rc = load_running(paths)
     queue = rc.get("pending_merges", [])
 
@@ -687,10 +696,6 @@ def process_pending_merges(paths):
         json.dump(spec, f, indent=2)
         f.write("\n")
 
-    # Remove from queue before calling merge() (merge() will re-prune from pending_merges anyway)
-    rc["pending_merges"] = queue[1:]
-    save_running(paths, rc)
-
     log_action(paths, "process-pending-merges", {"brief": brief})
     print(f"Wrote pending-merge.json for {brief}, executing merge")
 
@@ -700,27 +705,19 @@ def process_pending_merges(paths):
 # ─── Action: approve-brief ───────────────────────────────────────────
 
 def approve_brief(paths, brief_id):
-    """Move a brief from awaiting_review[] to pending_merges[]."""
+    """Move a brief from awaiting_review[] to pending_merges[].
+
+    brief-108-d: appends an `approved` event. Projector routes the brief from
+    awaiting_review[] into pending_merges[] on next projection.
+    """
     rc = load_running(paths)
-    waiting = rc.get("awaiting_review", [])
-
-    moved = None
-    new_waiting = []
-    for entry in waiting:
-        if entry.get("brief") == brief_id:
-            moved = entry
-        else:
-            new_waiting.append(entry)
-
-    if not moved:
+    waiting_briefs = {e.get("brief") for e in rc.get("awaiting_review", [])}
+    if brief_id not in waiting_briefs:
         print(f"Warning: brief '{brief_id}' not found in awaiting_review", file=sys.stderr)
         return False
 
-    moved["approved_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    moved["auto_merge"] = True
-    rc["awaiting_review"] = new_waiting
-    rc["pending_merges"].append(moved)
-    save_running(paths, rc)
+    runtime_event(paths, "approved", brief_id)
+    project_running(paths)
 
     log_action(paths, "approve-brief", {"brief": brief_id})
     print(f"Approved {brief_id}: moved to pending_merges")
@@ -730,26 +727,16 @@ def approve_brief(paths, brief_id):
 # ─── Action: reject-brief ────────────────────────────────────────────
 
 def reject_brief(paths, brief_id, reason=""):
-    """Move a brief from awaiting_review[] and set card Status → rejected."""
+    """Move a brief from awaiting_review[] and set card Status → rejected.
+
+    brief-108-d: card-status flip is the truth; projector drops rejected cards
+    from all running.json buckets. No history[] write (card-is-truth).
+    """
     rc = load_running(paths)
-    waiting = rc.get("awaiting_review", [])
-
-    moved = None
-    new_waiting = []
-    for entry in waiting:
-        if entry.get("brief") == brief_id:
-            moved = entry
-        else:
-            new_waiting.append(entry)
-
-    if not moved:
+    waiting_briefs = {e.get("brief") for e in rc.get("awaiting_review", [])}
+    if brief_id not in waiting_briefs:
         print(f"Warning: brief '{brief_id}' not found in awaiting_review", file=sys.stderr)
         return False
-
-    moved["rejected_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    moved["reject_reason"] = reason
-    rc["awaiting_review"] = new_waiting
-    save_running(paths, rc)
 
     # Update card Status → rejected (card-is-truth: no history[] write)
     project_dir = paths["project_dir"]
@@ -766,6 +753,7 @@ def reject_brief(paths, brief_id, reason=""):
         except Exception as e:
             print(f"reject: card status update failed for {brief_id}: {e} (non-fatal)", file=sys.stderr)
 
+    project_running(paths)
     signal_dedup_clear(paths, brief_id)
     log_action(paths, "reject-brief", {"brief": brief_id, "reason": reason})
     print(f"Rejected {brief_id}: card Status → rejected")
@@ -931,19 +919,22 @@ def dispatch(paths):
     git(wt_dir, "commit", "-m", f"Initialize brief {brief}")
     git(wt_dir, "push", "-u", remote, branch)
 
-    # Update running.json on main with per-entry concurrency metadata.
+    # Compute worker_slot from current state (project before-state).
     rc = load_running(paths)
     worker_slot = len(rc.get("active", []))
-    rc.setdefault("active", []).append({
-        "brief": brief,
-        "branch": branch,
-        "brief_file": brief_file,
-        "dispatched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "parallel_safe": parallel_safe,
-        "edit_surface": edit_surface,
-        "worker_slot": worker_slot,
-    })
-    save_running(paths, rc)
+
+    # brief-108-d: append the dispatch event. Runtime facts (worker_slot,
+    # parallel_safe, edit_surface, dispatched_at) live in runtime-events.jsonl;
+    # running.json is projected from cards + events, not hand-spliced.
+    runtime_event(
+        paths, "dispatched", brief,
+        branch=branch,
+        brief_file=brief_file,
+        worker_slot=worker_slot,
+        throttle=throttle,
+        parallel_safe=parallel_safe,
+        edit_surface=edit_surface,
+    )
 
     # Update card Status → active (card-is-truth: queued → active on dispatch)
     _card_path = os.path.join(project_dir, "wiki", "briefs", "cards", brief, "index.md")
@@ -958,6 +949,12 @@ def dispatch(paths):
                 log_action(paths, "card_status_set_active", {"brief": brief})
         except Exception as e:
             print(f"dispatch: card status update failed for {brief}: {e} (non-fatal)", file=sys.stderr)
+
+    # brief-108-d: project running.json from cards + events. Single-write owner.
+    project_running(paths)
+    git(project_dir, "add", paths["running_file"],
+        os.path.join(project_dir, ".loop", "state", "runtime-events.jsonl"), check=False)
+    git(project_dir, "commit", "-m", f"loop: project running.json (dispatch {brief})", check=False)
 
     git(project_dir, "push", remote, main_branch, check=False)
 
@@ -1051,16 +1048,16 @@ def merge(paths):
         )
         if is_conflict:
             git(project_dir, "merge", "--abort", check=False)
-            rc = load_running(paths)
-            entry = next(
-                (e for e in rc.get("pending_merges", []) if e.get("brief") == brief),
-                {"brief": brief, "branch": branch},
-            )
-            entry["conflict_note"] = "merge conflict — human resolution required"
-            entry["kind"] = "merge-conflict"
-            rc["pending_merges"] = [e for e in rc.get("pending_merges", []) if e.get("brief") != brief]
-            rc.setdefault("awaiting_review", []).append(entry)
-            save_running(paths, rc)
+            # brief-108-d: append a `completed` event with merge-conflict kind.
+            # The brief was already in pending_merges (had a `completed` +
+            # `approved` event); we re-emit `completed` with the new kind so
+            # the projector flips it back to awaiting_review[]. Card status
+            # stays `active` (the brief never reached `merged`).
+            runtime_event(paths, "completed", brief,
+                          kind="merge-conflict",
+                          reason="merge conflict — human resolution required",
+                          auto_merge=False)
+            project_running(paths)
             os.remove(paths["pending_merge"])
             log_action(paths, "merge_conflict_abort", {
                 "brief": brief, "branch": branch,
@@ -1091,25 +1088,9 @@ def merge(paths):
             f"{remote}/{main_branch} failed. See escalate.json."
         )
 
-    # Update running.json — prune from both active and completed_pending_eval.
-    # A brief may reach merge via either path (direct pending-merge stamp from
-    # active, or the regular complete → eval → merge flow). If we don't prune
-    # active, the queen keeps seeing the merged brief as active, can't find
-    # its branch (deleted above), and fires stale_brief every heartbeat forever.
-    rc = load_running(paths)
-    active = rc.get("active", [])
-    new_active = [e for e in active if e.get("brief") != brief]
-    rc["active"] = new_active
-    pending = rc.get("completed_pending_eval", [])
-    new_pending = [e for e in pending if e.get("brief") != brief]
-    rc["completed_pending_eval"] = new_pending
-    rc["pending_merges"] = [e for e in rc.get("pending_merges", []) if e.get("brief") != brief]
-    rc["awaiting_review"] = [e for e in rc.get("awaiting_review", []) if e.get("brief") != brief]
-
-    save_running(paths, rc)
-
-    # --- Producer-side cleanup (brief-107, brief-108) ---
-    # Card Status → merged is the permanent record (card-is-truth). No history[] write.
+    # --- Producer-side cleanup (brief-107, brief-108, brief-108-d) ---
+    # Card Status → merged + `merged` event in runtime-events.jsonl is the
+    # truth. running.json is projected from those — no hand-splice.
     _cleanup_staged = False
 
     _card_path = os.path.join(project_dir, "wiki", "briefs", "cards", brief, "index.md")
@@ -1128,8 +1109,31 @@ def merge(paths):
         except Exception as e:
             print(f"cleanup: card status update failed for {brief}: {e} (non-fatal)", file=sys.stderr)
 
+    # brief-108-d: append `merged` event so projector populates history[].
+    merge_sha = ""
+    try:
+        sha_r = git(project_dir, "rev-parse", "HEAD", check=False)
+        merge_sha = (sha_r.stdout or "").strip()[:8]
+    except Exception:
+        pass
+    runtime_event(
+        paths, "merged", brief,
+        merge_sha=merge_sha,
+        merged_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        evaluation=evaluation,
+    )
+
+    # Project running.json from the new card+events truth and stage.
+    project_running(paths)
+    git(project_dir, "add", paths["running_file"],
+        os.path.join(project_dir, ".loop", "state", "runtime-events.jsonl"),
+        check=False)
+
     if _cleanup_staged:
         git(project_dir, "commit", "-m", f"loop: post-merge cleanup for {brief}", check=False)
+    else:
+        # Card already merged but events/projection still need committing.
+        git(project_dir, "commit", "-m", f"loop: project running.json (merge {brief})", check=False)
     # --- End producer-side cleanup ---
 
     signal_dedup_clear(paths, brief)
