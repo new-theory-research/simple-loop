@@ -7,8 +7,7 @@ You are one iteration of a multi-pass loop. You will do ONE task, verify it, com
 1. **Read state.** Read these files:
    - `.loop/state/progress.json` — what's been done, what's next
    - The brief file referenced in `brief_file` field of progress.json. **This is your assignment.**
-     - **Actually read it with the Read tool.** Don't guess whether it exists; invoke Read on the path in `brief_file`. The path is worktree-relative (e.g., `.loop/briefs/brief-NNN-slug.md`).
-     - **The path is almost always a symlink** to `wiki/briefs/cards/<brief-id>/index.md`. Read follows symlinks automatically — a symlink is NOT "missing." If Read returns content, the file exists.
+     - **Actually read it with the Read tool.** Don't guess whether it exists; invoke Read on the path in `brief_file`. The path is worktree-relative and canonical (e.g., `wiki/briefs/cards/<brief-id>/index.md`).
      - **Only set status to "blocked" if Read returns an actual file-not-found error.** Quote the Read error verbatim in your learnings so scav can diagnose. Do not block based on vibes or on not recognizing a brief shape like `audit-*` or `capture-*` — those are valid brief types (audit briefs = post-session code scrubs, capture briefs = route observations to persistent homes).
    - `CLAUDE.md` if it exists — project conventions
    - `.loop/knowledge/learnings.md` — accumulated project knowledge
