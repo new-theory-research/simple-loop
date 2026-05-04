@@ -21,6 +21,38 @@ def _utc_now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _resolve_brief_id(bid, card_ids):
+    """Resolve a possibly-truncated brief id to the canonical card-dir slug.
+
+    Legacy running.json history carries truncated ids ("brief-042") while the
+    cards on disk use full slugs ("brief-042-camera-system-architecture").
+    This function walks the set of card_ids and returns the longest unique
+    prefix-match, or the original bid if no match exists.
+
+    Symmetric with actions._brief_id_matches but here we resolve to a single
+    canonical id (the cards are the truth, not the running.json history line).
+    """
+    if not bid or bid in card_ids:
+        return bid
+    candidates = [c for c in card_ids if c == bid or c.startswith(bid + "-") or bid.startswith(c + "-")]
+    if len(candidates) == 1:
+        return candidates[0]
+    # Multiple matches → ambiguous. Don't guess; keep the original.
+    return bid
+
+
+def _list_card_ids(project_dir):
+    cards_dir = os.path.join(project_dir, "wiki", "briefs", "cards")
+    if not os.path.isdir(cards_dir):
+        return set()
+    return {
+        name for name in os.listdir(cards_dir)
+        if not name.startswith(".") and os.path.isfile(
+            os.path.join(cards_dir, name, "index.md")
+        )
+    }
+
+
 def _normalize_path(p):
     """Rewrite stale .loop/briefs/<brief>.md paths to canonical card paths.
 
@@ -155,29 +187,42 @@ def migrate(project_dir):
         rc = json.load(f)
 
     seen = _existing_briefs(events_path)
+    card_ids = _list_card_ids(project_dir)
+
+    def _resolve_in_place(entry):
+        bid = entry.get("brief", "")
+        if bid:
+            entry = dict(entry)
+            entry["brief"] = _resolve_brief_id(bid, card_ids)
+        return entry
 
     new_events = []
     for entry in rc.get("active", []):
+        entry = _resolve_in_place(entry)
         if entry.get("brief", "") in seen:
             continue
         _from_active(entry, new_events)
 
     for entry in rc.get("awaiting_review", []):
+        entry = _resolve_in_place(entry)
         if entry.get("brief", "") in seen:
             continue
         _from_awaiting_review(entry, new_events)
 
     for entry in rc.get("pending_merges", []):
+        entry = _resolve_in_place(entry)
         if entry.get("brief", "") in seen:
             continue
         _from_pending_merges(entry, new_events)
 
     for entry in rc.get("completed_pending_eval", []):
+        entry = _resolve_in_place(entry)
         if entry.get("brief", "") in seen:
             continue
         _from_awaiting_review(entry, new_events)
 
     for entry in rc.get("history", []):
+        entry = _resolve_in_place(entry)
         if entry.get("brief", "") in seen:
             continue
         _from_history(entry, new_events)
