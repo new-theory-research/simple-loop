@@ -17,15 +17,11 @@ Each brief lives in its own directory: `wiki/briefs/cards/brief-NNN-slug/`. The 
 
 Examples: `brief-014-simple-loop-hardening`, `brief-026-simple-loop-bundle-portability`
 
-## Symlink convention
+## Card-as-enumerator
 
-Brief files in `.loop/briefs/` are symlinks into the card directory:
+The card directory *is* the queue entry. The daemon enumerates dispatchable briefs by globbing `wiki/briefs/cards/*/index.md` and filtering on the card's frontmatter `Status:` field — `queued` cards are candidates, ordered by goals.md priority. See `lib/queue.py` for the canonical enumerator.
 
-```bash
-ln -s ../../wiki/briefs/cards/brief-NNN-slug/index.md .loop/briefs/brief-NNN-slug.md
-```
-
-The daemon reads `.loop/briefs/` directly; the symlink means the daemon dispatch path is stable while the canonical source stays in the wiki.
+There's no symlink layer; the card is the only writable surface for brief lifecycle state.
 
 ## The observability benefit
 
@@ -34,6 +30,5 @@ When a brief is done, the card directory contains the full record: the assignmen
 ## Adding a brief
 
 1. `mkdir wiki/briefs/cards/brief-NNN-slug/`
-2. Write `wiki/briefs/cards/brief-NNN-slug/index.md`
-3. `ln -s ../../wiki/briefs/cards/brief-NNN-slug/index.md .loop/briefs/brief-NNN-slug.md`
-4. Add to `goals.md` under `## Queued next`
+2. Write `wiki/briefs/cards/brief-NNN-slug/index.md` with frontmatter `Status: queued`
+3. Add a line for the brief to `goals.md` under `## Queued next`

@@ -12,7 +12,7 @@ Simple-loop started as the daemon — queen, worker, validator loop. Over time, 
 
 - **Zensical-backed wiki** with `briefs/cards/` + `operating-docs/` + `decisions/` + riffs + the CLAUDE.md director opening — the shape of the repo's own brain.
 - **Beehive** (`crates/hive/`) — the ratatui TUI for glancing at queue + active + pending briefs.
-- **The cards pattern** — each brief gets a directory with `index.md` + `plan.md` + `closeout.md` + any artifacts. Doubles as an observability surface and as a primitive (symlinked into `.loop/briefs/` for dispatch).
+- **The cards pattern** — each brief gets a directory with `index.md` + `plan.md` + `closeout.md` + any artifacts. Doubles as an observability surface and as the dispatch primitive (the daemon enumerates `wiki/briefs/cards/*/index.md` directly, filtering on frontmatter `Status:`).
 - **Stewardship-log** — `.loop/state/stewardship-log.md` as the narrative log of non-automated interventions.
 - **Goals.md + Queued/Awaiting/Done sections** — the queen's queue source + human-readable overview.
 

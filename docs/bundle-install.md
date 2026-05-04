@@ -125,16 +125,20 @@ Open it and fill in the brief. At minimum: a title, a goal, a task list, and com
 
 ---
 
-## 6. Symlink the brief into `.loop/briefs/`
+## 6. Mark the brief as queued
 
-The daemon reads briefs from `.loop/briefs/`. The convention is a symlink into `wiki/briefs/cards/`:
+The daemon enumerates dispatchable briefs by globbing `wiki/briefs/cards/*/index.md` and filtering on the card's frontmatter `Status:` field. To make a brief dispatchable, set `Status: queued` in the YAML frontmatter at the top of `index.md`:
 
-```bash
-ln -s ../../wiki/briefs/cards/brief-001-your-slug/index.md \
-      .loop/briefs/brief-001-your-slug.md
+```yaml
+---
+ID: brief-001-your-slug
+Branch: brief-001-your-slug
+Status: queued
+Model: opus
+---
 ```
 
-The relative path (`../../wiki/...`) works from inside `.loop/briefs/` — it's relative to the symlink's location, not the cwd when you run `ln`.
+No symlink needed — the card *is* the queue entry. See `lib/queue.py` for the canonical enumerator.
 
 ---
 
