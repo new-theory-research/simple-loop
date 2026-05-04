@@ -18,7 +18,7 @@ What's the situation?
 - **Brief complete?** → Evaluate it. Read the diff (`git diff <main_branch>...<branch> --stat`), check quality, write evaluation to `.loop/evaluations/`. Decide: merge, fix, or escalate.
 - **Brief active and running?** → The daemon handles worker iterations. No action needed unless it's blocked.
 - **Brief blocked?** → Read the learnings. Can you unblock it, or does the human need to intervene? If stuck, write `.loop/state/signals/escalate.json`.
-- **No active brief?** → Check goals.md for what to do next. If there are queued briefs in `.loop/briefs/` that haven't been dispatched, dispatch the highest priority one.
+- **No active brief?** → Check goals.md for what to do next. Run `python3 lib/queue.py .` to get the dispatchable queue; dispatch the queue head.
 - **Nothing to do?** → Idle. That's fine.
 
 ## Step 3: Evaluate (if brief complete)
@@ -33,20 +33,19 @@ What's the situation?
 
 ## Step 4: Dispatch (if no active brief)
 
-**Any file in `.loop/briefs/` is a dispatchable brief, regardless of naming pattern.** The queue order in `goals.md` determines priority. Supported naming conventions include but are not limited to:
+Run the shared enumerator:
 
-- `brief-NNN-slug` — feature/scaffolding/plumbing briefs (most common)
-- `audit-YYYY-MM-DD-NNN` — post-session audit briefs (scan commit range for drift)
-- `capture-YYYY-MM-DD-NNN` — post-session capture briefs (route observations to persistent homes)
-- any other convention documented in `goals.md` or the repo's brief template
+```bash
+python3 lib/queue.py .
+```
 
-**The filter is state, not name:** enumerate `.loop/briefs/*.md`, exclude any brief already in `running.json` under `active` / `completed_pending_eval` / `pending_merges` / `awaiting_review` / `history`. The remainder are candidates. Pick the one that matches the `goals.md` queue head. If the queue lists a brief you don't find a file for, log and move on — don't stall.
+Returns a JSON array ordered by `goals.md` priority — `Status: queued` cards only, filtered against `running.json`. Pick index 0 (the queue head). If the array is empty, idle.
 
-Write `.loop/state/pending-dispatch.json` using the brief's actual ID (file basename without `.md`) as both `brief` and `branch`:
+Write `.loop/state/pending-dispatch.json` using the values from the enumerator output:
 
 ```json
-{"brief": "audit-2026-04-22-01", "branch": "audit-2026-04-22-01",
- "brief_file": ".loop/briefs/audit-2026-04-22-01.md",
+{"brief": "brief-NNN-slug", "branch": "brief-NNN-slug",
+ "brief_file": "wiki/briefs/cards/brief-NNN-slug/index.md",
  "notes": "Brief description"}
 ```
 
