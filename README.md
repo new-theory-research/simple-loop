@@ -81,7 +81,7 @@ loop init --wiki-full    # full scaffold: .loop/ + wiki/ skeleton
 loop init --minimal      # .loop/ only, no wiki/
 ```
 
-Then author a brief, symlink it into `.loop/briefs/`, and `loop start`. Full step-by-step walkthrough in [docs/bundle-install.md](docs/bundle-install.md).
+Then author a brief at `wiki/briefs/cards/brief-NNN-slug/index.md` with `Status: queued` in its frontmatter, and `loop start`. Full step-by-step walkthrough in [docs/bundle-install.md](docs/bundle-install.md).
 
 ## Workstation skills
 
