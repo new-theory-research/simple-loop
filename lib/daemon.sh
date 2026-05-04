@@ -69,6 +69,14 @@ mkdir -p "$STATE_DIR/signals" "$LOG_DIR"
 # Ensure state files exist
 [ -f "$RUNNING_FILE" ] || echo '{"active":[],"completed_pending_eval":[],"pending_merges":[],"awaiting_review":[]}' > "$RUNNING_FILE"
 
+# brief-108-d: project running.json from cards + runtime-events.jsonl on every
+# daemon start. This is idempotent — running it twice produces the same output
+# — and replaces the legacy "running.json is hand-spliced by 4+ writers" model
+# with single-writer ownership (lib/state.py:write_running_json). The
+# startup_repair pass that follows seeds runtime-events.jsonl from running.json
+# the first time after this brief lands.
+python3 "$DAEMON_LIB_DIR/state.py" write-running-json "$PROJECT_DIR" 2>/dev/null || true
+
 echo ""
 echo "╔══════════════════════════════════════╗"
 echo "║       Simple Loop Daemon             ║"
@@ -1177,6 +1185,16 @@ while true; do
     fi
 
     DID_WORK=false
+
+    # ┌──────────────────────────────────────────────────────────────────┐
+    # │  brief-108-d: project running.json (single-writer safety net)    │
+    # │                                                                  │
+    # │  Cards + runtime-events.jsonl are the truth. running.json is     │
+    # │  derived. Re-projecting on every tick is idempotent and catches  │
+    # │  drift introduced by hand-edits or stale state (the 4-write tail │
+    # │  hand-merge-brief.md used to enshrine).                          │
+    # └──────────────────────────────────────────────────────────────────┘
+    python3 "$DAEMON_LIB_DIR/state.py" write-running-json "$PROJECT_DIR" 2>/dev/null || true
 
     # ┌─────────────────────────────────────┐
     # │  Phase 1: Assess state              │

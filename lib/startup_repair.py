@@ -240,6 +240,29 @@ def run_startup_repair(paths: dict, project_dir: str) -> list:
     if all_actions:
         save_running(paths, running)
 
+    # brief-108-d: seed runtime-events.jsonl from the (potentially repaired)
+    # running.json so the projector has the runtime facts. Idempotent — second
+    # daemon start does nothing because brief ids already in the log are skipped.
+    try:
+        import sys as _sys
+        _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from migrate_runtime_events import migrate as _migrate
+        _events_added = _migrate(project_dir)
+        if _events_added:
+            log_action(paths, "startup_repair", {
+                "reason": "migrate_runtime_events",
+                "events_added": _events_added,
+            })
+            # Re-project running.json from cards + events now that the events
+            # log is seeded — single-writer ownership.
+            from state import write_running_json as _write_running
+            _write_running(project_dir)
+    except Exception as _e:
+        log_action(paths, "startup_repair", {
+            "reason": "migrate_runtime_events_failed",
+            "error": str(_e),
+        })
+
     duration_ms = int((datetime.now(timezone.utc) - t_start).total_seconds() * 1000)
     summary = {
         "timestamp": t_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
