@@ -763,6 +763,79 @@ GOALS_CHECKS: List[Tuple[str, Callable]] = [
 ]
 
 
+# ── Source-code check: forbid direct running.json writes (brief-108-d) ────
+
+# Matches `open(... running.json ..., "w")` and `open(... running.json ..., 'w')`
+# in any combination, with optional whitespace and parens. Bytewise match;
+# we don't AST-parse — keeps lint fast and matches str-template patterns too.
+_RUNNING_JSON_WRITE_RE = re.compile(
+    r"open\s*\([^)]*running\.json[^)]*['\"]w['\"]",
+    re.IGNORECASE,
+)
+# Allowed call sites — anything in lib/state.py (the projector module) or the
+# migration script (which writes running.json once at migration time, indirect
+# via state.write_running_json).
+_RUNNING_JSON_WRITE_ALLOWED_FILES = frozenset({
+    "state.py",
+    "state_test.py",  # tests construct fixtures
+    "lint.py",        # this file (the regex itself)
+    "migrate_runtime_events.py",
+})
+
+
+def check_running_json_writes(content: str, source_path: Path,
+                              project_root: Path) -> List[Issue]:
+    """Forbid direct writes to running.json outside lib/state.py.
+
+    Pattern: `open(... running.json ..., "w")` matches in any python file
+    under lib/ except the allow-list. Ensures running.json stays a projected
+    file (brief-108-d) — single-writer ownership in
+    lib/state.py:write_running_json.
+    """
+    issues: List[Issue] = []
+    if source_path.name in _RUNNING_JSON_WRITE_ALLOWED_FILES:
+        return issues
+    for lineno, line in enumerate(content.splitlines(), start=1):
+        if _RUNNING_JSON_WRITE_RE.search(line):
+            issues.append(Issue(
+                severity=ERROR,
+                message=(
+                    f"{source_path.name}:{lineno}: direct write to running.json. "
+                    f"running.json is a projected file (brief-108-d). "
+                    f"Use state.write_running_json(project_dir) instead."
+                ),
+                expected=(
+                    "running.json is derived from cards + runtime-events.jsonl. "
+                    "Mutate the source (card status, runtime event), then call "
+                    "state.write_running_json() to project."
+                ),
+                fix=(
+                    "Replace with `from state import write_running_json; "
+                    "write_running_json(project_dir)`."
+                ),
+            ))
+    return issues
+
+
+def lint_lib_dir(lib_dir: Path, project_root: Path) -> List[Tuple[Path, List[Issue]]]:
+    """Scan lib/*.py for the running.json write check.
+
+    Returns list of (file_path, issues) for files with at least one issue.
+    """
+    out: List[Tuple[Path, List[Issue]]] = []
+    if not lib_dir.is_dir():
+        return out
+    for py in sorted(lib_dir.glob("*.py")):
+        try:
+            content = py.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        issues = check_running_json_writes(content, py, project_root)
+        if issues:
+            out.append((py, issues))
+    return out
+
+
 def lint_goals_md(goals_path: Path, project_root: Path) -> List[Issue]:
     """Run goals.md-specific lint checks."""
     try:
@@ -891,15 +964,41 @@ def main(argv: List[str] = None) -> int:
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         print("Usage: loop lint [--all] <brief-path-or-dir>")
+        print("       loop lint --lib <lib-dir>      # source-code checks")
         print()
         print("  loop lint wiki/briefs/cards/brief-049-scene-reset-on-run/index.md")
         print("  loop lint wiki/briefs/cards/              # queued briefs only")
         print("  loop lint --all wiki/briefs/cards/        # all briefs regardless of status")
+        print("  loop lint --lib lib/                      # forbid direct running.json writes")
         print()
         print("Checks:")
         for name, _ in CHECKS:
             print(f"  {name}")
         return 0
+
+    # ── --lib mode: scan source files for the running.json-write check ──
+    if argv[0] == "--lib":
+        if len(argv) < 2:
+            print("Error: --lib requires a directory argument", file=sys.stderr)
+            return 1
+        lib_dir = Path(argv[1]).resolve()
+        project_root = find_project_root(lib_dir) or Path.cwd()
+        results = lint_lib_dir(lib_dir, project_root)
+        if not results:
+            print(f"✓ Clean ({lib_dir}).")
+            return 0
+        total = 0
+        for py, issues in results:
+            try:
+                rel = py.relative_to(project_root)
+            except ValueError:
+                rel = py
+            print(format_issues(str(rel), issues))
+            total += len(issues)
+            print()
+        word = "issue" if total == 1 else "issues"
+        print(f"{total} {word} across {len(results)} file(s).")
+        return 1
 
     target_arg = argv[0]
     target = Path(target_arg).resolve()
