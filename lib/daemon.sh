@@ -1255,7 +1255,7 @@ except: pass
             AM_FLAG=$(python3 -c "
 import json, sys
 sys.path.insert(0, '$DAEMON_LIB_DIR')
-from assess import git_read_follow, AUTO_MERGE_LINE_RE
+from assess import git_show, AUTO_MERGE_LINE_RE
 try:
     with open('$RUNNING_FILE') as f:
         rc = json.load(f)
@@ -1267,7 +1267,7 @@ try:
         if not branch or not brief_file:
             break
         for ref in [branch, '$GIT_REMOTE/' + branch]:
-            content = git_read_follow('$PROJECT_DIR', ref, brief_file)
+            content = git_show('$PROJECT_DIR', ref, brief_file)
             if content is not None:
                 for line in content.splitlines():
                     m = AUTO_MERGE_LINE_RE.match(line)
