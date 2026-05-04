@@ -48,38 +48,6 @@ def _git_show(project_dir, ref, path):
     return None
 
 
-def _git_read_follow(project_dir, ref, path, _depth=0):
-    """Like _git_show, but follows symlinks (git mode 120000) up to 5 levels.
-
-    Brief files are canonical card paths (`wiki/briefs/cards/<id>/index.md`)
-    post-brief-108-cont-a. Symlink-following is retained for any legacy paths
-    that still exist during the transition window.
-    """
-    if _depth > 5:
-        return None
-    try:
-        r = subprocess.run(
-            ["git", "-C", project_dir, "ls-tree", ref, "--", path],
-            capture_output=True, text=True, timeout=10,
-        )
-    except Exception:
-        return None
-    if r.returncode != 0 or not r.stdout.strip():
-        return None
-    mode = r.stdout.split(None, 1)[0]
-    blob = _git_show(project_dir, ref, path)
-    if blob is None:
-        return None
-    if mode != "120000":
-        return blob
-    target = blob.strip()
-    if target.startswith("/"):
-        resolved = target.lstrip("/")
-    else:
-        resolved = os.path.normpath(os.path.join(os.path.dirname(path), target))
-    return _git_read_follow(project_dir, ref, resolved, _depth + 1)
-
-
 def _git_rev_parse(project_dir, ref):
     try:
         r = subprocess.run(
@@ -241,7 +209,7 @@ def decide(project_dir, brief_id, branch, brief_file_rel=None):
         }
     details["brief_file"] = brief_file_rel
 
-    brief_content = _git_read_follow(project_dir, ref, brief_file_rel)
+    brief_content = _git_show(project_dir, ref, brief_file_rel)
     flag = parse_auto_merge_flag(brief_content or "")
     details["auto_merge_flag"] = flag
     if not flag:

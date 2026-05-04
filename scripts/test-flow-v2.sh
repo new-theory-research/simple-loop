@@ -1013,75 +1013,12 @@ assert_eq "model-field (f): missing field → sonnet (default)" \
 
 rm -f "$SCRATCH/brief-model-"*.md
 
-# ── Test 19 (brief-019): Auto-merge symlink routing — git_read_follow ────────
-
-echo ""
-echo "=== Test 19: Auto-merge symlink routing — git_read_follow reads through git symlinks ==="
-
-# Mirrors the portal pattern: .loop/briefs/brief-NNN.md → wiki/briefs/cards/NNN/index.md
-mkdir -p "$SCRATCH/wiki/briefs/cards/brief-LINK-test"
-cat > "$SCRATCH/wiki/briefs/cards/brief-LINK-test/index.md" <<'BRIEFEOF'
-# Brief: symlink test
-
-**ID:** brief-LINK-test
-**Auto-merge:** true
-**Model:** sonnet
-**Status:** queued
-BRIEFEOF
-
-# Create a relative symlink from .loop/briefs/ into the card dir
-ln -sf "../../wiki/briefs/cards/brief-LINK-test/index.md" \
-    "$SCRATCH/.loop/briefs/brief-LINK-test.md"
-git -C "$SCRATCH" add -A
-git -C "$SCRATCH" commit -q -m "test: add symlinked brief" 2>/dev/null || true
-
-# git show on a symlink returns the target path, not the file body
-GIT_SHOW_RESULT=$(git -C "$SCRATCH" show "HEAD:.loop/briefs/brief-LINK-test.md" 2>/dev/null)
-assert_eq "git show on symlink returns target path (documents the bug)" \
-    "$GIT_SHOW_RESULT" "../../wiki/briefs/cards/brief-LINK-test/index.md"
-
-# git_read_follow should resolve the symlink and return the actual file content
-GRF_AUTO=$(python3 -c "
-import sys
-sys.path.insert(0, '$LIB_DIR')
-from assess import git_read_follow, AUTO_MERGE_LINE_RE
-content = git_read_follow('$SCRATCH', 'HEAD', '.loop/briefs/brief-LINK-test.md')
-if content is None:
-    print('NONE')
-else:
-    for line in content.splitlines():
-        m = AUTO_MERGE_LINE_RE.match(line)
-        if m:
-            val = m.group(1).strip().lower()
-            print('true' if val == 'true' else 'false')
-            break
-    else:
-        print('not_found')
-" 2>/dev/null)
-assert_eq "git_read_follow reads Auto-merge flag through symlink" "$GRF_AUTO" "true"
-
-# Bare git show would miss the flag (returns symlink target, regex no match)
-# — documents why task-7 must switch daemon.sh to use git_read_follow
-GIT_SHOW_AM=$(python3 -c "
-import sys, subprocess, re
-RE = re.compile(r'^\s*\*\*Auto-merge:\*\*\s*(\S+)', re.IGNORECASE)
-r = subprocess.run(['git', '-C', '$SCRATCH', 'show', 'HEAD:.loop/briefs/brief-LINK-test.md'],
-    capture_output=True, text=True, timeout=10)
-for line in r.stdout.splitlines():
-    m = RE.match(line)
-    if m:
-        print(m.group(1).strip().lower())
-        break
-else:
-    print('false')
-" 2>/dev/null)
-assert_eq "bare git show misses Auto-merge flag on symlinked brief (the bug)" "$GIT_SHOW_AM" "false"
-
-# Cleanup symlink test artifacts from the SCRATCH repo
-rm -f "$SCRATCH/.loop/briefs/brief-LINK-test.md"
-rm -rf "$SCRATCH/wiki/briefs/cards/brief-LINK-test"
-git -C "$SCRATCH" add -A
-git -C "$SCRATCH" commit -q -m "test: cleanup symlink artifacts" 2>/dev/null || true
+# ── Test 19 retired by brief-108-cont-b ──────────────────────────────────────
+# The auto-merge symlink-routing test exercised git_read_follow against a
+# .loop/briefs/<slug>.md symlink. Brief-108-cont-a migrated dispatch to
+# canonical card paths; brief-108-cont-b removed the symlink-following helper.
+# Auto-merge flag reads now use git_show on `wiki/briefs/cards/<id>/index.md`,
+# which is the codepath the rest of the auto-merge tests already cover.
 
 # ── Tests 20-21 (brief-019): Presence-check gate — running vs complete ────────
 

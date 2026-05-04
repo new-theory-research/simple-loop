@@ -551,9 +551,8 @@ def check_outputs(content: str, brief_path: Path, project_root: Path) -> List[Is
               detected (identical H1, identical first paragraph, or ≥60% Jaccard).
       WARN  — Human-gate = none AND review.md exists (unnecessary artifact).
 
-    Card directory: resolved via brief_path.resolve().parent so symlinked brief
-    paths (e.g. .loop/briefs/brief-NNN.md → wiki/briefs/cards/.../index.md)
-    land in the correct directory.
+    Briefs live at canonical card paths (`wiki/briefs/cards/<id>/index.md`)
+    post-brief-108-cont-b; the card directory is just `brief_path.parent`.
     """
     gate_m = _HUMAN_GATE_RE.search(content)
     gate_val = gate_m.group(1).strip().lower() if gate_m else "none"
@@ -562,8 +561,7 @@ def check_outputs(content: str, brief_path: Path, project_root: Path) -> List[Is
     status_m = _STATUS_FIELD_RE.search(content)
     brief_status = status_m.group(1).strip().lower() if status_m else ""
 
-    # Card dir via symlink resolution so .loop/briefs/ symlinks land correctly.
-    card_dir = brief_path.resolve().parent
+    card_dir = brief_path.parent
     if not card_dir.is_dir():
         return []
 
