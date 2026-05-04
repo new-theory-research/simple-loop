@@ -103,9 +103,9 @@ def git_show(project_dir, ref, path):
 def git_read_follow(project_dir, ref, path, _depth=0):
     """Like git_show, but follows git symlinks (mode 120000) up to 5 levels.
 
-    Briefs can be symlinked from `.loop/briefs/brief-NNN.md` into the card
-    dir's `index.md`. `git show` on a symlink returns the target path, not
-    the file body — callers parsing frontmatter would see no match. Follow.
+    Brief files are canonical card paths (`wiki/briefs/cards/<id>/index.md`)
+    post-brief-108-cont-a. Symlink-following is retained for any legacy paths
+    that still exist during the transition window.
     """
     if _depth > 5:
         return None

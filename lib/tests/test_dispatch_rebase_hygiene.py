@@ -30,7 +30,7 @@ class TestEnsureProgressForBrief(unittest.TestCase):
             progress = self._progress_path(tmp, "brief-124-test")
 
             result = ensure_progress_for_brief(
-                str(progress), "brief-124-test", ".loop/briefs/brief-124-test.md"
+                str(progress), "brief-124-test", "wiki/briefs/cards/brief-124-test/index.md"
             )
             self.assertEqual(result, "initialized")
 
@@ -40,7 +40,7 @@ class TestEnsureProgressForBrief(unittest.TestCase):
             progress = self._progress_path(tmp, "brief-124-test")
 
             ensure_progress_for_brief(
-                str(progress), "brief-124-test", ".loop/briefs/brief-124-test.md"
+                str(progress), "brief-124-test", "wiki/briefs/cards/brief-124-test/index.md"
             )
 
             with open(progress) as f:
@@ -68,7 +68,7 @@ class TestEnsureProgressForBrief(unittest.TestCase):
             }))
 
             result = ensure_progress_for_brief(
-                str(progress), "brief-124-test", ".loop/briefs/brief-124-test.md"
+                str(progress), "brief-124-test", "wiki/briefs/cards/brief-124-test/index.md"
             )
             self.assertEqual(result, "reset:brief-119-hive-buzz-view")
 
@@ -87,7 +87,7 @@ class TestEnsureProgressForBrief(unittest.TestCase):
             }))
 
             ensure_progress_for_brief(
-                str(progress), "brief-124-test", ".loop/briefs/brief-124-test.md"
+                str(progress), "brief-124-test", "wiki/briefs/cards/brief-124-test/index.md"
             )
 
             with open(progress) as f:
@@ -113,7 +113,7 @@ class TestEnsureProgressForBrief(unittest.TestCase):
             }))
 
             result = ensure_progress_for_brief(
-                str(progress), "brief-124-test", ".loop/briefs/brief-124-test.md"
+                str(progress), "brief-124-test", "wiki/briefs/cards/brief-124-test/index.md"
             )
             self.assertEqual(result, "unchanged")
 
@@ -133,7 +133,7 @@ class TestEnsureProgressForBrief(unittest.TestCase):
             progress.write_text(json.dumps(original))
 
             ensure_progress_for_brief(
-                str(progress), "brief-124-test", ".loop/briefs/brief-124-test.md"
+                str(progress), "brief-124-test", "wiki/briefs/cards/brief-124-test/index.md"
             )
 
             with open(progress) as f:
@@ -152,7 +152,7 @@ class TestEnsureProgressForBrief(unittest.TestCase):
             progress.write_text('{"brief": "brief-124-test", invalid json}')
 
             result = ensure_progress_for_brief(
-                str(progress), "brief-124-test", ".loop/briefs/brief-124-test.md"
+                str(progress), "brief-124-test", "wiki/briefs/cards/brief-124-test/index.md"
             )
             self.assertIn(result, ("initialized", "reset:"))
             with open(progress) as f:

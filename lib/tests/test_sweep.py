@@ -59,7 +59,7 @@ def add_active(tmp: Path, brief_id: str, dispatched_at: str,
     running["active"].append({
         "brief": brief_id,
         "branch": brief_id,
-        "brief_file": f".loop/briefs/{brief_id}.md",
+        "brief_file": f"wiki/briefs/cards/{brief_id}/index.md",
         "dispatched_at": dispatched_at,
         "parallel_safe": False,
     })

@@ -45,7 +45,7 @@ fresh_repo() {
     git -C "$dir" config user.name  "Dry Run"
 
     mkdir -p "$dir/.loop/state/signals"
-    mkdir -p "$dir/.loop/briefs"
+    mkdir -p "$dir/wiki/briefs/cards/$brief_id"
     mkdir -p "$dir/.loop/modules/validator/state/reviews"
 
     cat > "$dir/.loop/config.sh" <<EOF
@@ -54,7 +54,7 @@ GIT_REMOTE="origin"
 GIT_MAIN_BRANCH="main"
 EOF
 
-    local brief_file=".loop/briefs/${brief_id}.md"
+    local brief_file="wiki/briefs/cards/${brief_id}/index.md"
     {
         echo "# Brief: dry-run"
         echo ""
