@@ -1,7 +1,7 @@
 ---
 ID: brief-145-loop-install-service-reads-main-branch
 Branch: brief-145-loop-install-service-reads-main-branch
-Status: queued
+Status: active
 Model: sonnet
 Auto-merge: false
 Validator: core/agents/reviewer.md
