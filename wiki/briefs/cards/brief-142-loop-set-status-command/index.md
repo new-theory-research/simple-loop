@@ -1,7 +1,7 @@
 ---
 ID: brief-142-loop-set-status-command
 Branch: brief-142-loop-set-status-command
-Status: queued
+Status: active
 Model: sonnet
 Auto-merge: false
 Validator: core/agents/reviewer.md
