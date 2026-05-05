@@ -1,0 +1,1 @@
+{"ts": "2026-05-05T19:52:48Z", "event": "dispatched", "brief": "brief-142-loop-set-status-command", "branch": "brief-142-loop-set-status-command", "brief_file": "wiki/briefs/cards/brief-142-loop-set-status-command/index.md", "worker_slot": 0, "throttle": 1, "parallel_safe": true, "edit_surface": ["bin/loop", "lib/actions.py"]}

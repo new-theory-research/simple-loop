@@ -1,5 +1,18 @@
 {
-  "active": [],
+  "active": [
+    {
+      "brief": "brief-142-loop-set-status-command",
+      "branch": "brief-142-loop-set-status-command",
+      "brief_file": "wiki/briefs/cards/brief-142-loop-set-status-command/index.md",
+      "dispatched_at": "2026-05-05T19:52:48Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "bin/loop",
+        "lib/actions.py"
+      ],
+      "worker_slot": 0
+    }
+  ],
   "completed_pending_eval": [],
   "pending_merges": [],
   "awaiting_review": [],
