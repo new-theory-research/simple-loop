@@ -1,6 +1,21 @@
 {
   "active": [
     {
+      "brief": "brief-144-loop-init-scaffolds-prompts",
+      "branch": "brief-144-loop-init-scaffolds-prompts",
+      "brief_file": "wiki/briefs/cards/brief-144-loop-init-scaffolds-prompts/index.md",
+      "dispatched_at": "2026-05-05T20:04:50Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "bin/loop"
+      ],
+      "worker_slot": 0
+    }
+  ],
+  "completed_pending_eval": [],
+  "pending_merges": [],
+  "awaiting_review": [
+    {
       "brief": "brief-142-loop-set-status-command",
       "branch": "brief-142-loop-set-status-command",
       "brief_file": "wiki/briefs/cards/brief-142-loop-set-status-command/index.md",
@@ -10,11 +25,11 @@
         "bin/loop",
         "lib/actions.py"
       ],
-      "worker_slot": 0
+      "worker_slot": 0,
+      "completed_at": "2026-05-05T20:01:57Z",
+      "auto_merge": false,
+      "kind": "complete"
     }
   ],
-  "completed_pending_eval": [],
-  "pending_merges": [],
-  "awaiting_review": [],
   "history": []
 }
