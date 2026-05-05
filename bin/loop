@@ -1826,13 +1826,37 @@ cmd_install_service() {
     mkdir -p "$agents_dir"
     mkdir -p "$LOG_DIR"
 
+    # Read git.main_branch from config.json; fallback to "main" with a warning
+    local main_branch _config_json="$LOOP_DIR/config.json"
+    if [ -f "$_config_json" ]; then
+        main_branch="$(python3 - "$_config_json" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        c = json.load(f)
+    val = c.get('git', {}).get('main_branch', '')
+    print(val if val else 'main')
+except Exception:
+    print('__MALFORMED__')
+PYEOF
+        )"
+        if [ "$main_branch" = "__MALFORMED__" ] || [ -z "$main_branch" ]; then
+            echo "warning: .loop/config.json missing or malformed — defaulting GIT_MAIN_BRANCH=main"
+            main_branch="main"
+        fi
+    else
+        echo "warning: .loop/config.json not found — defaulting GIT_MAIN_BRANCH=main"
+        main_branch="main"
+    fi
+
     # Interpolate template — sed-safe: escape / in paths
-    local safe_project_dir safe_lib_dir safe_log_file safe_home safe_path
+    local safe_project_dir safe_lib_dir safe_log_file safe_home safe_path safe_main_branch
     safe_project_dir="$(printf '%s\n' "$PROJECT_DIR" | sed 's/[\/&]/\\&/g')"
     safe_lib_dir="$(printf '%s\n' "$resolved_lib_dir" | sed 's/[\/&]/\\&/g')"
     safe_log_file="$(printf '%s\n' "$log_file" | sed 's/[\/&]/\\&/g')"
     safe_home="$(printf '%s\n' "$HOME" | sed 's/[\/&]/\\&/g')"
     safe_path="$(printf '%s\n' "$PATH" | sed 's/[\/&]/\\&/g')"
+    safe_main_branch="$(printf '%s\n' "$main_branch" | sed 's/[\/&]/\\&/g')"
 
     sed \
         -e "s/{{PROJECT_NAME}}/${project_name}/g" \
@@ -1842,6 +1866,7 @@ cmd_install_service() {
         -e "s/{{LOG_FILE}}/${safe_log_file}/g" \
         -e "s/{{HOME}}/${safe_home}/g" \
         -e "s/{{PATH}}/${safe_path}/g" \
+        -e "s/{{GIT_MAIN_BRANCH}}/${safe_main_branch}/g" \
         "$plist_template" > "$plist_dest"
 
     echo "LaunchAgent written: $plist_dest"
