@@ -1,10 +1,10 @@
 {
   "active": [
     {
-      "brief": "brief-144-loop-init-scaffolds-prompts",
-      "branch": "brief-144-loop-init-scaffolds-prompts",
-      "brief_file": "wiki/briefs/cards/brief-144-loop-init-scaffolds-prompts/index.md",
-      "dispatched_at": "2026-05-05T20:04:50Z",
+      "brief": "brief-145-loop-install-service-reads-main-branch",
+      "branch": "brief-145-loop-install-service-reads-main-branch",
+      "brief_file": "wiki/briefs/cards/brief-145-loop-install-service-reads-main-branch/index.md",
+      "dispatched_at": "2026-05-05T20:16:54Z",
       "parallel_safe": true,
       "edit_surface": [
         "bin/loop"
@@ -27,6 +27,20 @@
       ],
       "worker_slot": 0,
       "completed_at": "2026-05-05T20:01:57Z",
+      "auto_merge": false,
+      "kind": "complete"
+    },
+    {
+      "brief": "brief-144-loop-init-scaffolds-prompts",
+      "branch": "brief-144-loop-init-scaffolds-prompts",
+      "brief_file": "wiki/briefs/cards/brief-144-loop-init-scaffolds-prompts/index.md",
+      "dispatched_at": "2026-05-05T20:04:50Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "bin/loop"
+      ],
+      "worker_slot": 0,
+      "completed_at": "2026-05-05T20:13:50Z",
       "auto_merge": false,
       "kind": "complete"
     }
