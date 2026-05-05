@@ -1,1 +1,17 @@
 target/
+
+# simple-loop ephemeral state (per loop's own conventions)
+.loop/logs/
+.loop/worktrees/
+.loop/state/daemon.pid
+.loop/state/signals/
+.loop/state/pending-dispatch.json
+.loop/state/pending-merge.json
+.loop/state/heartbeat.json
+.loop/state/log.jsonl
+.loop/state/metrics.jsonl
+.loop/config.local.sh
+
+# Zensical build output
+site/
+.site/

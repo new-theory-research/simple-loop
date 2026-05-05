@@ -1,0 +1,13 @@
+{
+  "project_name": "simple-loop",
+  "version": "0.2.0",
+  "heartbeat_interval": 300,
+  "worker_cooldown": 30,
+  "max_iterations": 20,
+  "git": {
+    "remote": "origin",
+    "main_branch": "master"
+  },
+  "modules": [],
+  "beehive": {}
+}

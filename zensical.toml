@@ -1,0 +1,34 @@
+[site]
+name = "Project Wiki"
+description = ""
+
+[build]
+docs_dir = "wiki"
+site_dir = "site"
+
+[theme]
+name = "material"
+
+[[nav]]
+title = "Home"
+file = "index.md"
+
+[[nav]]
+title = "Soul"
+file = "soul.md"
+
+[[nav]]
+title = "Briefs"
+file = "briefs/index.md"
+
+[[nav]]
+title = "Decisions"
+file = "decisions/README.md"
+
+[[nav]]
+title = "Riffs"
+file = "riffs/README.md"
+
+[[nav]]
+title = "Operating Docs"
+file = "operating-docs/README.md"
