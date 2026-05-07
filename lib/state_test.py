@@ -350,6 +350,26 @@ class TestAppendEvent(unittest.TestCase):
         self.assertEqual(lines[0]["event"], "dispatched")
         self.assertEqual(lines[1]["event"], "completed")
 
+    def test_cli_keeps_all_digit_sha_as_string(self):
+        # Regression: short-SHAs that happen to be all digits (e.g. 92329478)
+        # were being coerced to int by the CLI arg parser, which broke
+        # downstream typed parsers (notably hive's RunningJson).
+        import subprocess
+        state_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.py")
+        subprocess.run(
+            [sys.executable, state_py, "append-event", self.tmp, "merged", "brief-145",
+             "merge_sha=92329478", "merged_at=2026-05-06T01:34:36Z", "worker_slot=0"],
+            check=True,
+        )
+        path = os.path.join(self.tmp, ".loop", "state", "runtime-events.jsonl")
+        with open(path) as f:
+            entry = json.loads(f.read().strip().splitlines()[-1])
+        self.assertEqual(entry["merge_sha"], "92329478")
+        self.assertIsInstance(entry["merge_sha"], str)
+        # Allowlisted int fields still coerce.
+        self.assertEqual(entry["worker_slot"], 0)
+        self.assertIsInstance(entry["worker_slot"], int)
+
 
 # ── End-to-end: append + project ──────────────────────────────────────
 

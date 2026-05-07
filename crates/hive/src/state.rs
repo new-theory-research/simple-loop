@@ -1,11 +1,27 @@
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::{
     collections::HashSet,
     fs,
     io::{BufRead, BufReader},
     path::Path,
 };
+
+/// Deserialize a `Vec<T>` element-by-element, dropping any element that fails
+/// to deserialize. Lets one stray entry not poison the whole list — important
+/// for `running.json` which is occasionally hand-edited or written by paths
+/// (the hand-merge recipe, etc.) that may emit unexpected types.
+fn deserialize_lossy_vec<'de, D, T>(de: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let raw: Vec<serde_json::Value> = Vec::deserialize(de)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect())
+}
 
 // ── time helpers ──────────────────────────────────────────────────────────────
 
@@ -431,13 +447,13 @@ impl HiveState {
 
 #[derive(Deserialize, Default)]
 pub struct RunningJson {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_vec")]
     pub active: Vec<ActiveBriefRaw>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_vec")]
     pub completed_pending_eval: Vec<PendingEvalRaw>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_vec")]
     pub awaiting_review: Vec<PendingEvalRaw>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_vec")]
     #[allow(dead_code)]
     pub history: Vec<HistoryEntryRaw>,
 }
@@ -2988,6 +3004,43 @@ mod tests {
             parsed.active[0].dispatched_at.as_deref(),
             Some("2026-04-21T17:36:06Z")
         );
+    }
+
+    #[test]
+    fn running_json_bad_history_entry_does_not_blank_active() {
+        // Regression: one bad history entry (here, merge_sha as a JSON
+        // integer instead of a string — the 92329478 short-SHA bug from
+        // the hand-merge recipe) was poisoning the whole RunningJson parse,
+        // collapsing active[] to empty. With per-element lossy parsing,
+        // the bad entry drops itself and active stays intact.
+        let json = r#"{
+            "active": [
+                {
+                    "brief": "brief-147",
+                    "branch": "brief-147",
+                    "dispatched_at": "2026-05-07T16:31:34Z"
+                }
+            ],
+            "completed_pending_eval": [],
+            "awaiting_review": [],
+            "history": [
+                {
+                    "brief": "brief-good",
+                    "merge_sha": "abc1234",
+                    "merged_at": "2026-05-06T00:00:00Z"
+                },
+                {
+                    "brief": "brief-bad",
+                    "merge_sha": 92329478,
+                    "merged_at": "2026-05-06T01:34:36Z"
+                }
+            ]
+        }"#;
+        let parsed: RunningJson = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.active.len(), 1, "active must survive a bad history entry");
+        assert_eq!(parsed.active[0].brief, "brief-147");
+        assert_eq!(parsed.history.len(), 1, "good history entry survives");
+        assert_eq!(parsed.history[0].brief, "brief-good");
     }
 
     #[test]

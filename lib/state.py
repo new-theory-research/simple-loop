@@ -466,17 +466,23 @@ def main():
         event_type = sys.argv[3]
         brief = sys.argv[4]
         fields = {}
+        # Int coercion is allowlisted: SHAs and other identifiers can be
+        # all-digit strings (e.g. short-SHA `92329478`); auto-int-coercing
+        # them turns merge_sha into a JSON number, which downstream consumers
+        # (notably hive's typed RunningJson parser) can't deserialize.
+        INT_FIELDS = {"worker_slot", "throttle", "iteration", "duration_ms", "in_flight_count"}
         for kv in sys.argv[5:]:
             if "=" in kv:
                 k, _, v = kv.partition("=")
-                # bool / int coercion — the daemon shells in some of these
                 if v.lower() in ("true", "false"):
                     fields[k] = v.lower() == "true"
-                else:
+                elif k in INT_FIELDS:
                     try:
                         fields[k] = int(v)
                     except ValueError:
                         fields[k] = v
+                else:
+                    fields[k] = v
         append_event(project_dir, event_type, brief, **fields)
         return 0
 
