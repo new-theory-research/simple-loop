@@ -194,6 +194,13 @@ if [ -d "$SCRIPT_DIR/crates/hive" ]; then
         "$CARGO" build --release --manifest-path "$SCRIPT_DIR/crates/hive/Cargo.toml" --quiet
         cp "$SCRIPT_DIR/target/release/hive" "$BIN_DIR/hive"
         chmod +x "$BIN_DIR/hive"
+        # Re-sign after cp: cargo emits a linker-signed adhoc binary, and on
+        # macOS 26+ Taskgated rejects the signature once the file is copied
+        # (SIGKILL "Code Signature Invalid" on launch). codesign --force --sign -
+        # restamps an adhoc signature in place. No-op on non-Darwin.
+        if command -v codesign >/dev/null 2>&1; then
+            codesign --force --sign - "$BIN_DIR/hive" 2>/dev/null || true
+        fi
         echo "  Binary: $BIN_DIR/hive"
     else
         echo "  Warning: cargo not found — hive TUI not installed."
