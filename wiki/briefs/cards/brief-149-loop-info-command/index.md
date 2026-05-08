@@ -1,7 +1,7 @@
 ---
 ID: brief-149-loop-info-command
 Branch: brief-149-loop-info-command
-Status: queued
+Status: active
 Model: sonnet
 Auto-merge: false
 Validator: core/agents/reviewer.md
