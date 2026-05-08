@@ -1282,6 +1282,80 @@ def push_with_escalate(paths, remote=None, branch=None, brief=None,
     return False
 
 
+# ─── Rebase-conflict escalate (brief-146) ────────────────────────────
+
+def emit_rebase_conflict_escalate(paths, brief_id, main_head, conflicted_paths):
+    """Write signals/escalate.json when a worker rebase conflicts with main.
+
+    If escalate.json already exists (queen wrote one), append this event as
+    chained_failures[] rather than clobbering the existing signal.
+
+    Args:
+        paths: init_paths() dict.
+        brief_id: brief being worked.
+        main_head: str like "<sha> <author> <subject>" from git log -1.
+        conflicted_paths: list of file paths that conflicted (may be empty).
+    """
+    signals_dir = paths.get("signals_dir", os.path.join(paths["state_dir"], "signals"))
+    os.makedirs(signals_dir, exist_ok=True)
+    escalate_path = os.path.join(signals_dir, "escalate.json")
+
+    worktree = os.path.join(paths.get("worktrees_dir", ""), brief_id)
+    note = None if conflicted_paths else "non-path conflict; see worker log"
+
+    payload = {
+        "type": "rebase_conflict",
+        "reason": "rebase_conflict_against_main",
+        "brief": brief_id,
+        "kind": "rebase-conflict",
+        "conflicted_paths": conflicted_paths,
+        "main_head": main_head,
+        "worktree": worktree,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if note:
+        payload["note"] = note
+
+    if os.path.exists(escalate_path):
+        try:
+            with open(escalate_path) as f:
+                existing = json.load(f)
+            chained = existing.get("chained_failures", [])
+            chained.append(payload)
+            existing["chained_failures"] = chained
+            with open(escalate_path, "w") as f:
+                json.dump(existing, f, indent=2)
+                f.write("\n")
+            try:
+                log_action(paths, "rebase_conflict_chained", {
+                    "brief": brief_id,
+                    "main_head": main_head,
+                    "conflicted_paths": conflicted_paths,
+                })
+            except Exception:
+                pass
+            print(f"Chained rebase-conflict escalate for {brief_id} (escalate.json already existed)")
+            return True
+        except Exception as e:
+            print(f"Warning: could not chain into escalate.json: {e} — overwriting", file=sys.stderr)
+
+    with open(escalate_path, "w") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+
+    try:
+        log_action(paths, "rebase_conflict_escalate", {
+            "brief": brief_id,
+            "main_head": main_head,
+            "conflicted_paths": conflicted_paths,
+        })
+    except Exception:
+        pass
+
+    print(f"Wrote rebase-conflict escalate for {brief_id} ({len(conflicted_paths)} conflicted paths)")
+    return True
+
+
 # ─── Heartbeat (brief-014 fix 4) ────────────────────────────────────
 
 def write_heartbeat(heartbeat_path, pid=None, last_event="tick"):
@@ -1619,7 +1693,8 @@ def ensure_progress_for_brief(progress_file: str, brief_id: str, brief_file: str
 
 def main():
     BRIEF_ACTIONS = ("move-to-eval", "move-to-pending-merges", "move-to-awaiting-review",
-                     "approve-brief", "reject-brief", "ensure-progress-for-brief")
+                     "approve-brief", "reject-brief", "ensure-progress-for-brief",
+                     "emit-rebase-conflict-escalate")
 
     if len(sys.argv) < 3:
         print(f"Usage: {sys.argv[0]} <action> <project_dir> [args]", file=sys.stderr)
@@ -1690,6 +1765,12 @@ def main():
             result = ensure_progress_for_brief(progress_file_arg, brief_id, brief_file_arg)
             print(result)
             success = True
+        elif action == "emit-rebase-conflict-escalate":
+            # extra[0] = main_head (may contain spaces), extra[1] = newline-sep paths (optional)
+            main_head = extra[0] if extra else "unknown"
+            conflicted_raw = extra[1] if len(extra) > 1 else ""
+            conflicted_paths = [p for p in conflicted_raw.splitlines() if p.strip()]
+            success = emit_rebase_conflict_escalate(paths, brief_id, main_head, conflicted_paths)
         else:
             print(f"Unknown action: {action}", file=sys.stderr)
             sys.exit(1)

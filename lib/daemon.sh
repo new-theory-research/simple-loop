@@ -333,12 +333,27 @@ run_worker_iteration() {
     if git -C "$WORKTREE_DIR" rebase "${GIT_REMOTE}/${GIT_MAIN_BRANCH}" -q 2>/dev/null; then
         daemon_log "WORKER: rebased $branch onto ${GIT_REMOTE}/${GIT_MAIN_BRANCH} ($COMMITS_BEHIND_BEFORE commits)"
     else
+        # Capture diagnostics before abort (brief-146): conflicted paths + teammate's HEAD commit.
+        CONFLICTED_PATHS=$(git -C "$WORKTREE_DIR" diff --name-only --diff-filter=U 2>/dev/null || true)
+        MAIN_HEAD=$(git -C "$WORKTREE_DIR" log -1 --format='%h %an %s' "${GIT_REMOTE}/${GIT_MAIN_BRANCH}" 2>/dev/null || echo "unknown")
+        MAIN_HEAD_SHORT="${MAIN_HEAD%% *}"
+        if [ -z "$CONFLICTED_PATHS" ]; then
+            CONFLICTED_COUNT=0
+        else
+            CONFLICTED_COUNT=$(echo "$CONFLICTED_PATHS" | wc -l | tr -d ' ')
+        fi
+
         git -C "$WORKTREE_DIR" rebase --abort 2>/dev/null || true
-        daemon_log "WORKER: rebase failed for $branch (conflicts) → routed to awaiting_review"
+        daemon_log "WORKER: rebase failed for $branch (conflicts, ${CONFLICTED_COUNT} files vs ${MAIN_HEAD_SHORT}) → escalate + awaiting_review"
+
+        python3 "$DAEMON_LIB_DIR/actions.py" emit-rebase-conflict-escalate "$brief_id" "$PROJECT_DIR" \
+            "$MAIN_HEAD" "$CONFLICTED_PATHS" \
+            2>>"$LOG_DIR/daemon.log" || true
+
         python3 "$DAEMON_LIB_DIR/actions.py" move-to-awaiting-review "$brief_id" "$PROJECT_DIR" \
             rebase-blocked "rebase conflict against main — human resolution required" \
             2>>"$LOG_DIR/daemon.log" || true
-        notify "$brief_id: rebase conflict → routed to awaiting_review"
+        notify "$brief_id: rebase conflict (${CONFLICTED_COUNT} files) vs ${MAIN_HEAD_SHORT} → escalate"
         return 0
     fi
     # ─────────────────────────────────────────────────────────────────────────
