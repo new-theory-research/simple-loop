@@ -1,18 +1,5 @@
 {
-  "active": [
-    {
-      "brief": "brief-147-hive-external-commits-on-main",
-      "branch": "brief-147-hive-external-commits-on-main",
-      "brief_file": "wiki/briefs/cards/brief-147-hive-external-commits-on-main/index.md",
-      "dispatched_at": "2026-05-08T19:14:55Z",
-      "parallel_safe": true,
-      "edit_surface": [
-        "crates/hive/src/state.rs",
-        "crates/hive/src/main.rs"
-      ],
-      "worker_slot": 0
-    }
-  ],
+  "active": [],
   "completed_pending_eval": [],
   "pending_merges": [],
   "awaiting_review": [
