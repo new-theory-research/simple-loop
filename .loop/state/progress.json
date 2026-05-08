@@ -1,18 +1,19 @@
 {
   "brief": "brief-146-worker-rebase-conflict-escalate",
   "brief_file": "wiki/briefs/cards/brief-146-worker-rebase-conflict-escalate/index.md",
-  "iteration": 1,
-  "status": "running",
+  "iteration": 2,
+  "status": "complete",
   "tasks_completed": [
-    "Cycle 1: implement rebase-conflict escalate — capture conflicted paths + main HEAD in daemon.sh before rebase --abort; add emit_rebase_conflict_escalate() to actions.py with chaining support; wire CLI dispatch; update notify string"
-  ],
-  "tasks_remaining": [
+    "Cycle 1: implement rebase-conflict escalate — capture conflicted paths + main HEAD in daemon.sh before rebase --abort; add emit_rebase_conflict_escalate() to actions.py with chaining support; wire CLI dispatch; update notify string",
     "Cycle 2: write test for rebase-conflict escalate path — assert escalate.json written with expected fields, awaiting_review[] has kind=rebase-blocked"
   ],
+  "tasks_remaining": [],
   "learnings": [
     "CONFLICTED_PATHS captured via 'git diff --name-only --diff-filter=U' before rebase --abort; passed to Python as a single newline-separated arg (extra[1]) which splitlines() parses correctly.",
     "emit-rebase-conflict-escalate added to BRIEF_ACTIONS so it gets the brief_id/project_dir positional parsing.",
     "Chaining: if escalate.json already exists, appends to chained_failures[] rather than clobbering — important for multi-tenant hackathon scenarios where queen may have already written an escalate.",
-    "54 existing lib/tests/ pass unchanged."
+    "54 existing lib/tests/ pass unchanged.",
+    "Unit-testing awaiting_review[] kind requires the state projector path (append_event → project_running_json) — running.json is derived, not written directly.",
+    "15 new tests added in test_rebase_conflict_escalate.py; 69 total pass."
   ]
 }
