@@ -1,21 +1,5 @@
 {
-  "active": [
-    {
-      "brief": "brief-150-daemon-state-writes-to-main-redo",
-      "branch": "brief-150-daemon-state-writes-to-main-redo",
-      "brief_file": "wiki/briefs/cards/brief-150-daemon-state-writes-to-main-redo/index.md",
-      "dispatched_at": "2026-05-08T00:05:43Z",
-      "parallel_safe": true,
-      "edit_surface": [
-        "lib/daemon.sh",
-        "lib/actions.py",
-        "lib/_set_card_status.py",
-        "lib/git_plumbing.py (new)",
-        "install.sh"
-      ],
-      "worker_slot": 0
-    }
-  ],
+  "active": [],
   "completed_pending_eval": [],
   "pending_merges": [],
   "awaiting_review": [
