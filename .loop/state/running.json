@@ -1,5 +1,19 @@
 {
-  "active": [],
+  "active": [
+    {
+      "brief": "brief-149-loop-info-command",
+      "branch": "brief-149-loop-info-command",
+      "brief_file": "wiki/briefs/cards/brief-149-loop-info-command/index.md",
+      "dispatched_at": "2026-05-08T19:41:08Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "bin/loop",
+        "install.sh",
+        ".loop/config.json"
+      ],
+      "worker_slot": 0
+    }
+  ],
   "completed_pending_eval": [],
   "pending_merges": [],
   "awaiting_review": [
