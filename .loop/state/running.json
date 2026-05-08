@@ -1,14 +1,14 @@
 {
   "active": [
     {
-      "brief": "brief-146-worker-rebase-conflict-escalate",
-      "branch": "brief-146-worker-rebase-conflict-escalate",
-      "brief_file": "wiki/briefs/cards/brief-146-worker-rebase-conflict-escalate/index.md",
-      "dispatched_at": "2026-05-08T19:03:31Z",
+      "brief": "brief-147-hive-external-commits-on-main",
+      "branch": "brief-147-hive-external-commits-on-main",
+      "brief_file": "wiki/briefs/cards/brief-147-hive-external-commits-on-main/index.md",
+      "dispatched_at": "2026-05-08T19:14:55Z",
       "parallel_safe": true,
       "edit_surface": [
-        "lib/daemon.sh",
-        "lib/actions.py"
+        "crates/hive/src/state.rs",
+        "crates/hive/src/main.rs"
       ],
       "worker_slot": 0
     }
@@ -56,6 +56,21 @@
       ],
       "worker_slot": 0,
       "completed_at": "2026-05-05T20:23:15Z",
+      "auto_merge": false,
+      "kind": "complete"
+    },
+    {
+      "brief": "brief-146-worker-rebase-conflict-escalate",
+      "branch": "brief-146-worker-rebase-conflict-escalate",
+      "brief_file": "wiki/briefs/cards/brief-146-worker-rebase-conflict-escalate/index.md",
+      "dispatched_at": "2026-05-08T19:03:31Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "lib/daemon.sh",
+        "lib/actions.py"
+      ],
+      "worker_slot": 0,
+      "completed_at": "2026-05-08T19:12:45Z",
       "auto_merge": false,
       "kind": "complete"
     },
