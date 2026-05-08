@@ -1,5 +1,18 @@
 {
-  "active": [],
+  "active": [
+    {
+      "brief": "brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces",
+      "branch": "brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces",
+      "brief_file": "wiki/briefs/cards/brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces/index.md",
+      "dispatched_at": "2026-05-08T19:19:10Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "lib/daemon.sh",
+        "bin/loop"
+      ],
+      "worker_slot": 0
+    }
+  ],
   "completed_pending_eval": [],
   "pending_merges": [],
   "awaiting_review": [
