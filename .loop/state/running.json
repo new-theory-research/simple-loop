@@ -62,6 +62,23 @@
       "kind": "complete"
     },
     {
+      "brief": "brief-147-hive-external-commits-on-main",
+      "branch": "brief-147-hive-external-commits-on-main",
+      "brief_file": "wiki/briefs/cards/brief-147-hive-external-commits-on-main/index.md",
+      "dispatched_at": "2026-05-08T19:14:55Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "crates/hive/src/state.rs",
+        "crates/hive/src/main.rs"
+      ],
+      "worker_slot": 0,
+      "completed_at": "2026-05-08T19:17:44Z",
+      "auto_merge": false,
+      "kind": "rebase-blocked",
+      "reason": "rebase conflict against main \u2014 human resolution required",
+      "conflict_note": "rebase conflict against main \u2014 human resolution required"
+    },
+    {
       "brief": "brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces",
       "branch": "brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces",
       "brief_file": "wiki/briefs/cards/brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces/index.md",
