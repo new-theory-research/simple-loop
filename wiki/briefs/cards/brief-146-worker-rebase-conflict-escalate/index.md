@@ -1,7 +1,7 @@
 ---
 ID: brief-146-worker-rebase-conflict-escalate
 Branch: brief-146-worker-rebase-conflict-escalate
-Status: queued
+Status: active
 Model: sonnet
 Auto-merge: false
 Validator: core/agents/reviewer.md
