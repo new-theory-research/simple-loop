@@ -1,17 +1,14 @@
 {
   "active": [
     {
-      "brief": "brief-150-daemon-state-writes-to-main-redo",
-      "branch": "brief-150-daemon-state-writes-to-main-redo",
-      "brief_file": "wiki/briefs/cards/brief-150-daemon-state-writes-to-main-redo/index.md",
-      "dispatched_at": "2026-05-08T00:05:43Z",
+      "brief": "brief-146-worker-rebase-conflict-escalate",
+      "branch": "brief-146-worker-rebase-conflict-escalate",
+      "brief_file": "wiki/briefs/cards/brief-146-worker-rebase-conflict-escalate/index.md",
+      "dispatched_at": "2026-05-08T19:03:31Z",
       "parallel_safe": true,
       "edit_surface": [
         "lib/daemon.sh",
-        "lib/actions.py",
-        "lib/_set_card_status.py",
-        "lib/git_plumbing.py (new)",
-        "install.sh"
+        "lib/actions.py"
       ],
       "worker_slot": 0
     }
@@ -59,6 +56,24 @@
       ],
       "worker_slot": 0,
       "completed_at": "2026-05-05T20:23:15Z",
+      "auto_merge": false,
+      "kind": "complete"
+    },
+    {
+      "brief": "brief-150-daemon-state-writes-to-main-redo",
+      "branch": "brief-150-daemon-state-writes-to-main-redo",
+      "brief_file": "wiki/briefs/cards/brief-150-daemon-state-writes-to-main-redo/index.md",
+      "dispatched_at": "2026-05-08T00:05:43Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "lib/daemon.sh",
+        "lib/actions.py",
+        "lib/_set_card_status.py",
+        "lib/git_plumbing.py (new)",
+        "install.sh"
+      ],
+      "worker_slot": 0,
+      "completed_at": "2026-05-08T19:01:13Z",
       "auto_merge": false,
       "kind": "complete"
     }
