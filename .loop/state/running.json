@@ -1,19 +1,5 @@
 {
-  "active": [
-    {
-      "brief": "brief-149-loop-info-command",
-      "branch": "brief-149-loop-info-command",
-      "brief_file": "wiki/briefs/cards/brief-149-loop-info-command/index.md",
-      "dispatched_at": "2026-05-08T19:41:08Z",
-      "parallel_safe": true,
-      "edit_surface": [
-        "bin/loop",
-        "install.sh",
-        ".loop/config.json"
-      ],
-      "worker_slot": 0
-    }
-  ],
+  "active": [],
   "completed_pending_eval": [],
   "pending_merges": [],
   "awaiting_review": [
@@ -76,23 +62,6 @@
       "kind": "complete"
     },
     {
-      "brief": "brief-147-hive-external-commits-on-main",
-      "branch": "brief-147-hive-external-commits-on-main",
-      "brief_file": "wiki/briefs/cards/brief-147-hive-external-commits-on-main/index.md",
-      "dispatched_at": "2026-05-08T19:14:55Z",
-      "parallel_safe": true,
-      "edit_surface": [
-        "crates/hive/src/state.rs",
-        "crates/hive/src/main.rs"
-      ],
-      "worker_slot": 0,
-      "completed_at": "2026-05-08T19:17:44Z",
-      "auto_merge": false,
-      "kind": "rebase-blocked",
-      "reason": "rebase conflict against main \u2014 human resolution required",
-      "conflict_note": "rebase conflict against main \u2014 human resolution required"
-    },
-    {
       "brief": "brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces",
       "branch": "brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces",
       "brief_file": "wiki/briefs/cards/brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces/index.md",
@@ -104,6 +73,22 @@
       ],
       "worker_slot": 0,
       "completed_at": "2026-05-08T19:31:40Z",
+      "auto_merge": false,
+      "kind": "complete"
+    },
+    {
+      "brief": "brief-149-loop-info-command",
+      "branch": "brief-149-loop-info-command",
+      "brief_file": "wiki/briefs/cards/brief-149-loop-info-command/index.md",
+      "dispatched_at": "2026-05-08T19:41:08Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "bin/loop",
+        "install.sh",
+        ".loop/config.json"
+      ],
+      "worker_slot": 0,
+      "completed_at": "2026-05-08T19:54:53Z",
       "auto_merge": false,
       "kind": "complete"
     },
