@@ -1165,7 +1165,10 @@ fn extract_brief_ids_from_prose(s: &str) -> Vec<String> {
 /// Returns `[]` for `_none_` or when no valid tokens survive.
 fn split_depends_on_value(raw: &str) -> Vec<String> {
     let trimmed = raw.trim();
-    if trimmed == "_none_" || trimmed.eq_ignore_ascii_case("none") {
+    // Sentinel detection ignores a trailing parenthetical rationale:
+    // `_none_ (concurrent with Phase 1-3)` still means "no deps".
+    let sentinel_head = trimmed.split('(').next().unwrap_or("").trim();
+    if sentinel_head == "_none_" || sentinel_head.eq_ignore_ascii_case("none") {
         return vec![];
     }
     let mut out: Vec<String> = Vec::new();
@@ -4697,6 +4700,20 @@ some non-bracket junk line
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("index.md");
         std::fs::write(&path, "---\nStatus: queued\nDepends-on: _none_\n---\n").unwrap();
+        assert_eq!(parse_depends_on(&path), Vec::<String>::new());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_depends_on_none_with_parenthetical_rationale_returns_empty() {
+        let dir = std::env::temp_dir().join(format!("hive_dep_none_paren_{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.md");
+        std::fs::write(
+            &path,
+            "---\nStatus: queued\nDepends-on: _none_ (concurrent with Phase 1-3; gates Phase 5 demo)\n---\n",
+        )
+        .unwrap();
         assert_eq!(parse_depends_on(&path), Vec::<String>::new());
         std::fs::remove_dir_all(&dir).ok();
     }

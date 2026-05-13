@@ -22,14 +22,68 @@ use std::{
     panic,
     path::Path,
     sync::mpsc,
+    sync::atomic::{AtomicI32, Ordering},
     time::{Duration, Instant},
 };
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Saved fd 2 from before we redirected stderr to a log file.
+/// Used to restore stderr on graceful shutdown / panic so messages reach
+/// the user's terminal again.
+#[cfg(unix)]
+static SAVED_STDERR_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Redirect stderr (fd 2) into `.loop/state/hive.stderr.log`.
+///
+/// ratatui owns the screen via the alternate buffer; any `eprintln!` from
+/// render-path code (state.rs::parse_depends_on, config warnings, etc.)
+/// would otherwise smear text across panels. Call after the `.loop/` check
+/// and before `enable_raw_mode`.
+#[cfg(unix)]
+fn redirect_stderr_to_log() {
+    let path = Path::new(".loop/state/hive.stderr.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    use std::os::fd::AsRawFd;
+    unsafe {
+        let saved = libc::dup(libc::STDERR_FILENO);
+        if saved >= 0 {
+            SAVED_STDERR_FD.store(saved, Ordering::SeqCst);
+        }
+        libc::dup2(f.as_raw_fd(), libc::STDERR_FILENO);
+    }
+}
+
+#[cfg(not(unix))]
+fn redirect_stderr_to_log() {}
+
+#[cfg(unix)]
+fn restore_stderr() {
+    let saved = SAVED_STDERR_FD.swap(-1, Ordering::SeqCst);
+    if saved >= 0 {
+        unsafe {
+            libc::dup2(saved, libc::STDERR_FILENO);
+            libc::close(saved);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_stderr() {}
+
 fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    restore_stderr();
 }
 
 fn setup_panic_hook() {
@@ -1729,6 +1783,7 @@ fn main() -> Result<()> {
     }
 
     setup_panic_hook();
+    redirect_stderr_to_log();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();

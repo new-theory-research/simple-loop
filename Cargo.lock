@@ -263,6 +263,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "crossterm",
+ "libc",
  "notify",
  "ratatui",
  "serde",
