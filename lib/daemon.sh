@@ -324,6 +324,21 @@ run_worker_iteration() {
     # Pull latest into worktree (doesn't touch main tree)
     git -C "$WORKTREE_DIR" pull --ff-only "$GIT_REMOTE" "$branch" -q 2>/dev/null || true
 
+    # ── Snapshot dirty progress.json before rebase (issue #5) ────────────────
+    # Workers sometimes leave .loop/state/progress.json uncommitted at cycle
+    # end. A dirty working tree makes the cycle-start rebase below fail with a
+    # false "conflict", routing the brief to awaiting_review unnecessarily.
+    # Commit the snapshot so rebase has a clean tree; the post-rebase reset
+    # logic below overrides progress.json if it belongs to a different brief.
+    if [ -f "$WORKTREE_DIR/.loop/state/progress.json" ] && \
+       ! git -C "$WORKTREE_DIR" diff --quiet HEAD -- .loop/state/progress.json 2>/dev/null; then
+        git -C "$WORKTREE_DIR" add .loop/state/progress.json 2>/dev/null
+        if git -C "$WORKTREE_DIR" commit -m "loop: snapshot progress.json before cycle-start rebase" -q 2>/dev/null; then
+            daemon_log "WORKER: snapshotted dirty progress.json before rebase for $brief_id"
+        fi
+    fi
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ── Rebase onto main (cycle-start, Phase 1 of brief-061) ─────────────────
     # Each cycle starts on current main so merge-time staleness is bounded to
     # single-cycle wall-clock (~15 min). Conflict → abort + route to
