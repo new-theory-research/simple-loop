@@ -803,6 +803,20 @@ def remove_worktree(paths, brief):
     git(paths["project_dir"], "worktree", "prune", check=False)
 
 
+def _init_commit_already_landed(wt_dir, brief):
+    """True iff HEAD in wt_dir is already the init commit for `brief`.
+
+    Detects mid-dispatch crash recovery (issue #7): when dispatch() crashes
+    after `git commit -m "Initialize brief ..."` lands but before
+    pending-dispatch.json is consumed, the daemon retries the whole flow on
+    the next tick. The retry would re-attempt the same commit and fail with
+    "nothing to commit", leaving pending-dispatch.json on disk forever.
+    """
+    expected = f"Initialize brief {brief}"
+    head = git(wt_dir, "log", "-1", "--format=%s", check=False)
+    return head.returncode == 0 and head.stdout.strip() == expected
+
+
 def dispatch(paths):
     """Process pending-dispatch.json: concurrency gate + worktree + progress init.
 
@@ -898,25 +912,33 @@ def dispatch(paths):
     # Create worktree with new branch
     wt_dir = ensure_worktree(paths, brief, branch, config)
 
-    # Initialize progress.json in the worktree
-    wt_progress = os.path.join(wt_dir, ".loop", "state", "progress.json")
-    os.makedirs(os.path.dirname(wt_progress), exist_ok=True)
+    # Initialize progress.json + commit, unless this is a retry where the
+    # init commit already landed but the rest of the transaction didn't
+    # finish (issue #7 — dispatch idempotency on init-commit).
+    if _init_commit_already_landed(wt_dir, brief):
+        print(f"dispatch: init commit for {brief} already landed — skipping init block (retry)",
+              file=sys.stderr)
+    else:
+        wt_progress = os.path.join(wt_dir, ".loop", "state", "progress.json")
+        os.makedirs(os.path.dirname(wt_progress), exist_ok=True)
 
-    progress = {
-        "brief": brief,
-        "brief_file": brief_file,
-        "iteration": 0,
-        "status": "running",
-        "tasks_completed": [],
-        "tasks_remaining": [],
-        "learnings": [],
-    }
-    with open(wt_progress, "w") as f:
-        json.dump(progress, f, indent=2)
-        f.write("\n")
+        progress = {
+            "brief": brief,
+            "brief_file": brief_file,
+            "iteration": 0,
+            "status": "running",
+            "tasks_completed": [],
+            "tasks_remaining": [],
+            "learnings": [],
+        }
+        with open(wt_progress, "w") as f:
+            json.dump(progress, f, indent=2)
+            f.write("\n")
 
-    git(wt_dir, "add", ".loop/state/progress.json")
-    git(wt_dir, "commit", "-m", f"Initialize brief {brief}")
+        git(wt_dir, "add", ".loop/state/progress.json")
+        git(wt_dir, "commit", "-m", f"Initialize brief {brief}")
+
+    # Push is idempotent — up-to-date branches push as no-op.
     git(wt_dir, "push", "-u", remote, branch)
 
     # Compute worker_slot from current state (project before-state).
