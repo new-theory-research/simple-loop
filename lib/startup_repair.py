@@ -234,9 +234,11 @@ def run_startup_repair(paths: dict, project_dir: str) -> list:
     running, actions = clean_stale_queues(running, paths["state_dir"], project_dir, main_branch)
     all_actions.extend(actions)
 
-    for action in all_actions:
-        log_action(paths, "startup_repair", action)
-
+    # Per-action log entries used to be written here, but they stamped current
+    # `datetime.now()` on every backfilled brief — making old briefs appear in
+    # the Dance Floor as "Xm ago" on every daemon restart. The summary entry
+    # below (startup_repair_complete) carries the same `actions` payload, so
+    # audit information is preserved without polluting the recent-activity feed.
     if all_actions:
         save_running(paths, running)
 
