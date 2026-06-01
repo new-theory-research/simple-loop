@@ -148,6 +148,17 @@ impl RawLogLine {
         }
         false
     }
+
+    /// True for per-brief startup_repair backfill entries. These are emitted
+    /// with `datetime.now()` timestamps on every daemon restart, one row per
+    /// historical brief, which flooded the Dance Floor with "Xm ago" entries
+    /// for old briefs whenever the daemon bounced. Filtered from the Dance
+    /// Floor; still visible inside the `startup_repair_complete` summary line
+    /// for audit. The summary itself is NOT filtered — it's one row per
+    /// restart and signals "daemon just came up."
+    pub fn is_startup_repair(&self) -> bool {
+        self.action.as_deref() == Some("daemon:startup_repair")
+    }
 }
 
 pub fn parse_heartbeat_timestamps(log_path: &Path) -> Vec<DateTime<Utc>> {
@@ -2089,6 +2100,9 @@ impl DanceFloorState {
                 }
                 match serde_json::from_str::<RawLogLine>(&line) {
                     Ok(entry) => {
+                        if entry.is_startup_repair() {
+                            continue;
+                        }
                         let ts = entry
                             .ts_str()
                             .and_then(parse_log_ts);
@@ -3156,6 +3170,41 @@ mod tests {
     }
 
     #[test]
+    fn dance_floor_filters_startup_repair_per_brief_rows() {
+        // Per-brief startup_repair entries get a fresh timestamp on every daemon
+        // restart — they polluted the Dance Floor with bursts of "Xm ago" rows
+        // for old briefs. The Dance Floor should skip them; the summary line
+        // (startup_repair_complete) should still appear.
+        let data = concat!(
+            r#"{"timestamp":"2026-06-01T20:28:11Z","action":"daemon:startup_repair","reason":"backfilled_from_git","brief":"brief-018","merge_sha":"abc"}"#, "\n",
+            r#"{"timestamp":"2026-06-01T20:28:11Z","action":"daemon:startup_repair","reason":"backfilled_from_git","brief":"brief-019","merge_sha":"def"}"#, "\n",
+            r#"{"timestamp":"2026-06-01T20:28:11Z","action":"daemon:startup_repair_complete","duration_ms":97}"#, "\n",
+            r#"{"timestamp":"2026-06-01T20:30:00Z","action":"daemon:dispatch","brief":"brief-200-real","actor":"daemon"}"#, "\n",
+        );
+        let tmp = tempfile_write(data.as_bytes());
+        let state = load_dance_floor_from_path(&tmp);
+        let briefs: Vec<&str> = state
+            .events
+            .iter()
+            .filter_map(|e| e.brief.as_deref())
+            .collect();
+        assert!(!briefs.contains(&"brief-018"), "startup_repair brief-018 should be filtered");
+        assert!(!briefs.contains(&"brief-019"), "startup_repair brief-019 should be filtered");
+        assert!(briefs.contains(&"brief-200-real"), "real dispatch should be retained");
+        // Summary line has no brief field but should still appear.
+        let actions: Vec<&str> = state
+            .events
+            .iter()
+            .filter_map(|e| e.event.as_deref())
+            .collect();
+        assert!(
+            actions.iter().any(|a| a.contains("startup_repair_complete")),
+            "startup_repair_complete summary should still be shown",
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
     fn dance_floor_caps_at_500_events() {
         use std::io::Write;
         let mut data = Vec::new();
@@ -3221,6 +3270,9 @@ mod tests {
             }
             match serde_json::from_str::<RawLogLine>(&line) {
                 Ok(entry) => {
+                    if entry.is_startup_repair() {
+                        continue;
+                    }
                     let ts = entry.ts_str().and_then(parse_log_ts);
                     let actor = entry.derived_actor();
                     let event_msg = entry.event.or(entry.action);
