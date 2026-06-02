@@ -993,6 +993,27 @@ fn event_color(event: Option<&str>) -> Color {
     }
 }
 
+/// Strip the brief id from a dance-floor event message. The brief is already
+/// rendered in its own column, so embedding it in the message column is
+/// redundant — and it was triggering false-positive coloring in event_color
+/// for briefs whose id contained words like "error", "fail", "merge", etc.
+/// Falls back to the original message if the brief id isn't a substring (or
+/// stripping leaves an empty string).
+fn clean_event_message(raw: &str, brief: Option<&str>) -> String {
+    let Some(b) = brief.filter(|s| !s.is_empty()) else {
+        return raw.to_string();
+    };
+    let stripped = raw.replace(b, "");
+    // Collapse the double-space left by removing an inline brief id.
+    let collapsed = stripped.replace("  ", " ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        raw.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn signal_glyph_color(signal_type: &state::SignalType) -> (&'static str, Color) {
     match signal_type {
         state::SignalType::Escalate => ("◆", CORAL),
@@ -1030,9 +1051,14 @@ fn render_dance_floor<'a>(df: &'a state::DanceFloorState) -> (Text<'a>, u16) {
             .unwrap_or_else(|| "?".to_string());
         let actor_str = display_actor(ev.actor.as_deref());
         let ac = actor_color(ev.actor.as_deref());
-        let msg_str = ev.event.as_deref().unwrap_or("?");
-        let msg = truncate_chars(msg_str, 55);
-        let ec = event_color(ev.event.as_deref());
+        // Strip the brief id from the message — it's already in its own
+        // column, and the redundancy triggered false positives in event_color
+        // for briefs whose id contains words like "error", "fail", "merge",
+        // etc. (e.g. brief-217-error-catalog turned every worker row coral).
+        let raw_event = ev.event.as_deref().unwrap_or("?");
+        let cleaned_event = clean_event_message(raw_event, ev.brief.as_deref());
+        let msg = truncate_chars(&cleaned_event, 55);
+        let ec = event_color(Some(&cleaned_event));
 
         // Scout events get a leading diamond glyph so they're distinct from
         // brief-cycle rows even in monochrome terminals / colorblind palettes.
@@ -2289,6 +2315,51 @@ mod tests {
         std::env::set_current_dir(&tmp).unwrap();
         let _ = detect_loop_root();
         std::env::set_current_dir(&original).unwrap();
+    }
+
+    #[test]
+    fn clean_event_strips_brief_id_so_error_in_slug_does_not_color_row_coral() {
+        // brief-217-error-catalog-and-envelope-retrofit appearing in a worker
+        // message used to flag the whole row as coral because event_color
+        // substring-matches "error". Stripping the brief id (already shown in
+        // its own column) defuses the false positive.
+        let raw = "rebased brief-217-error-catalog-and-envelope-retrofit onto origin/main (2 commits)";
+        let cleaned = clean_event_message(raw, Some("brief-217-error-catalog-and-envelope-retrofit"));
+        assert!(!cleaned.contains("error"), "stripped msg should not contain 'error': {cleaned}");
+        assert!(!matches!(event_color(Some(&cleaned)), CORAL));
+    }
+
+    #[test]
+    fn clean_event_preserves_real_error_keyword_outside_brief_id() {
+        // If the message has a real "error" keyword elsewhere, stripping the
+        // brief id must NOT scrub it — actual errors should still color red.
+        let raw = "WORKER iteration FAILED for brief-300-foo — exit 1";
+        let cleaned = clean_event_message(raw, Some("brief-300-foo"));
+        assert!(cleaned.contains("FAILED"));
+        assert!(!cleaned.contains("brief-300-foo"));
+    }
+
+    #[test]
+    fn clean_event_no_brief_returns_raw() {
+        let raw = "QUEEN #1: complete (33s)";
+        assert_eq!(clean_event_message(raw, None), raw);
+        assert_eq!(clean_event_message(raw, Some("")), raw);
+    }
+
+    #[test]
+    fn clean_event_brief_not_substring_returns_raw_unchanged() {
+        let raw = "daemon:dispatch";
+        let cleaned = clean_event_message(raw, Some("brief-218"));
+        assert_eq!(cleaned, raw);
+    }
+
+    #[test]
+    fn clean_event_fallback_when_strip_leaves_empty() {
+        // If the message *is* just the brief id, the stripped string would be
+        // empty — fall back to the raw value so the row doesn't render blank.
+        let raw = "brief-217-error-catalog";
+        let cleaned = clean_event_message(raw, Some("brief-217-error-catalog"));
+        assert_eq!(cleaned, raw);
     }
 
     #[test]
