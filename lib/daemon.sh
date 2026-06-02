@@ -1138,23 +1138,32 @@ while true; do
     fi
     LAST_ESCALATE_PRESENT="$CURRENT_ESCALATE_PRESENT"
 
-    # --- State-change dedup clear (brief-076) ---
+    # --- State-change dedup clear (brief-076; portal-obs 2026-06-01 Pattern 1) ---
     # actions.py writes dedup-clear-<brief_id>.json after moving a brief out
-    # of active[]. If the cached trigger is for that brief, flush the entry so
-    # the queen re-evaluates on the next tick instead of sitting deduped on a
-    # resolved condition.  Always consume the file regardless of match.
+    # of active[] (merge, approve, reject, move-to-awaiting-review). The
+    # signal means "world changed, please re-evaluate." Always clear the
+    # cached trigger when we see one.
+    #
+    # Earlier this code gated the clear on `LAST_CONDUCTOR_TRIGGER`
+    # containing the brief id, which only matched `stale_brief:brief-N`-shape
+    # triggers and missed the common `no_active` case. After a merge the
+    # cached trigger is typically `CONDUCTOR:no_active` (no brief id), so the
+    # signal was consumed without clearing — leaving the next queued brief
+    # stuck for the full 1800s TTL even though its depends_on just resolved.
+    _CLEAR_COUNT=0
     for _CLEAR_FILE in "$SIGNALS_DIR"/dedup-clear-*.json; do
         [ -f "$_CLEAR_FILE" ] || continue
         _CLEAR_FNAME=$(basename "$_CLEAR_FILE")
         _CLEAR_BRIEF="${_CLEAR_FNAME#dedup-clear-}"
         _CLEAR_BRIEF="${_CLEAR_BRIEF%.json}"
-        if echo "$LAST_CONDUCTOR_TRIGGER" | grep -qF ":${_CLEAR_BRIEF}"; then
-            daemon_log "QUEEN: dedup cleared for ${_CLEAR_BRIEF} (state-change signal — brief moved out of active)"
-            LAST_CONDUCTOR_TRIGGER=""
-            LAST_CONDUCTOR_TRIGGER_TS=0
-        fi
+        daemon_log "QUEEN: dedup cleared by state-change signal (${_CLEAR_BRIEF})"
         rm -f "$_CLEAR_FILE"
+        _CLEAR_COUNT=$((_CLEAR_COUNT + 1))
     done
+    if [ "$_CLEAR_COUNT" -gt 0 ]; then
+        LAST_CONDUCTOR_TRIGGER=""
+        LAST_CONDUCTOR_TRIGGER_TS=0
+    fi
 
     # --- Pause check ---
     if [ -f "$SIGNALS_DIR/pause.json" ]; then
