@@ -1242,10 +1242,32 @@ while true; do
             # the trigger is re-evaluated from scratch (brief-076).
             _NOW=$(date +%s)
             _TRIGGER_AGE=$(( _NOW - LAST_CONDUCTOR_TRIGGER_TS ))
+            _SHOULD_DEDUP=false
             if [ "$CONDUCTOR_TRIGGER" = "$LAST_CONDUCTOR_TRIGGER" ] && [ "$_TRIGGER_AGE" -lt "$CONDUCTOR_DEDUP_TTL_SECS" ]; then
+                _SHOULD_DEDUP=true
+            fi
+
+            # Queue-aware dedup bypass (portal-obs P1 companion). The
+            # `no_active` trigger reason ignores the dispatchable queue —
+            # filing a new brief while the daemon is idle doesn't change the
+            # reason, so dedup would silently swallow it for up to 1800s.
+            # Whenever we're about to skip on `no_active`, do a cheap
+            # filesystem scan via queue.py; if there's anything dispatchable,
+            # bypass the dedup so the queen sees the new work this tick.
+            if [ "$_SHOULD_DEDUP" = "true" ] && [ "$REASON" = "no_active" ]; then
+                _DISPATCH_COUNT=$(python3 "$DAEMON_LIB_DIR/queue.py" "$PROJECT_DIR" 2>/dev/null \
+                    | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null \
+                    || echo "0")
+                if [ "${_DISPATCH_COUNT:-0}" -gt 0 ]; then
+                    daemon_log "QUEEN: dedup bypassed — ${_DISPATCH_COUNT} dispatchable brief(s) queued while trigger is no_active"
+                    _SHOULD_DEDUP=false
+                fi
+            fi
+
+            if [ "$_SHOULD_DEDUP" = "true" ]; then
                 daemon_log "QUEEN: dedup — same trigger ($REASON), skipping (age ${_TRIGGER_AGE}s / ttl ${CONDUCTOR_DEDUP_TTL_SECS}s)"
             else
-                if [ "$CONDUCTOR_TRIGGER" = "$LAST_CONDUCTOR_TRIGGER" ]; then
+                if [ "$CONDUCTOR_TRIGGER" = "$LAST_CONDUCTOR_TRIGGER" ] && [ "$_TRIGGER_AGE" -ge "$CONDUCTOR_DEDUP_TTL_SECS" ]; then
                     daemon_log "QUEEN: dedup TTL expired (age ${_TRIGGER_AGE}s) — re-evaluating trigger ($REASON)"
                 fi
                 write_heartbeat "phase2_queen:$REASON"
