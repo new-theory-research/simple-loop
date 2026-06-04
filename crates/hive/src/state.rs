@@ -783,6 +783,7 @@ impl ScoutEventKind {
         }
     }
 
+    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
             ScoutEventKind::Fire => "fired",
@@ -792,8 +793,10 @@ impl ScoutEventKind {
     }
 }
 
-/// One enabled-or-declared scout specialist. Surfaced in the Cells Scouts
-/// subsection so Mattie can see cadence + health at a glance.
+/// One enabled-or-declared scout specialist. Loader still populates it for
+/// completeness; the Cells Scouts subsection was removed 2026-06-04, so the
+/// fields are unread. Kept so restoring the view is just a render addition.
+#[allow(dead_code)]
 pub struct Scout {
     pub name: String,
     /// Most recent `daemon:scout_*` event for this specialist, or None if
@@ -813,6 +816,10 @@ pub struct CellsState {
     pub drafts: Vec<DraftBrief>,
     pub recently_finished: Vec<RecentlyFinishedBrief>,
     pub not_doing: Vec<NotDoingBrief>,
+    /// Scouts loader still populates this for completeness, but the Cells
+    /// panel no longer renders a Scouts subsection (2026-06-04). Kept so
+    /// restoring the view is just a render-block addition.
+    #[allow(dead_code)]
     pub scouts: Vec<Scout>,
 }
 
