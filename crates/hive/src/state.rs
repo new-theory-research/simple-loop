@@ -1607,7 +1607,10 @@ pub fn discover_draft_briefs(cards_dir: &Path, exclude: &HashSet<String>) -> Vec
             has_index,
         });
     }
-    out.sort_by_key(|d| brief_sort_key(&d.brief));
+    // Reverse numeric order so the highest brief id appears first — recent
+    // drafts are the most salient and imminent, low brief ids are usually
+    // long-abandoned holdovers.
+    out.sort_by(|a, b| brief_sort_key(&b.brief).cmp(&brief_sort_key(&a.brief)));
     out
 }
 
@@ -4194,10 +4197,11 @@ some non-bracket junk line
 
         let drafts = discover_draft_briefs(&cards, &exclude);
         let ids: Vec<_> = drafts.iter().map(|d| d.brief.as_str()).collect();
-        assert_eq!(ids, vec!["brief-010-api-v0-1", "brief-012-proposed"]);
+        // Reverse numeric order — recent drafts first.
+        assert_eq!(ids, vec!["brief-012-proposed", "brief-010-api-v0-1"]);
         // has_index reflects the structural truth
-        assert!(!drafts[0].has_index, "brief-010 has no index.md");
-        assert!(drafts[1].has_index, "brief-012 has index.md");
+        assert!(drafts[0].has_index, "brief-012 has index.md");
+        assert!(!drafts[1].has_index, "brief-010 has no index.md");
 
         std::fs::remove_dir_all(&cards).ok();
     }
