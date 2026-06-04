@@ -31,6 +31,7 @@ You are one iteration of a multi-pass loop. You will do ONE task, verify it, com
    - If the value is `review` AND you are setting status to `"complete"` or `"blocked"`: write `review.md` in the card dir.
    - If the value is `escalation-possible` AND you are setting status to `"blocked"` (a genuine escalation trigger fired): write `escalation.md` in the card dir.
    - Use the artifact template at `~/.local/share/simple-loop/templates/artifacts/human-gate.md`. Fill all sections from context about the brief. Create the card dir if it doesn't exist.
+   - **Lead plain, then technical.** The artifact MUST open with the plain-language TL;DR block (what shipped in one plain sentence + "Your part," the human's ask with a time estimate) — no code symbols, tables, or diffs before it. This is the surface the human clicks into; the staging tooling lifts this lede onto the review page verbatim. A gate artifact that opens with a wall of code symbols is unreviewable. (Principle: plain outcome first, technical precision after.)
    - **Do NOT produce an artifact for `Human-gate: none` or a missing field.** Plumbing briefs are unaffected by this step.
 
    **6b. Set status.** Update `.loop/state/progress.json`:
