@@ -829,57 +829,6 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
         }
     }
 
-    // ── Scouts ────────────────────────────────────────────────────────────────
-    // Declared scouts (files in `.loop/specialists/`) with last-fired age +
-    // today's fire/noop/failure counts. Dormant scouts (file present, never
-    // fired) render with a muted "never" — file-on-disk is the roster, the
-    // log tells you whether SCOUTS_ENABLED actually included them. Suppress
-    // the section entirely when no specialists exist so plain briefs-only
-    // projects don't carry a permanent "no scouts" row.
-    if !cells.scouts.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(section_header("Scouts", TEAL));
-        for sc in &cells.scouts {
-            let (glyph, glyph_color) = match sc.last_event_kind {
-                Some(state::ScoutEventKind::Fire) => ("◉", TEAL),
-                Some(state::ScoutEventKind::Noop) => ("○", MUTED),
-                Some(state::ScoutEventKind::Failed) => ("✗", CORAL),
-                None => ("·", MUTED),
-            };
-            let last_label = match (sc.last_event_at, &sc.last_event_kind) {
-                (Some(ts), Some(kind)) => {
-                    format!("{} {}", kind.label(), state::relative_time(ts))
-                }
-                _ => "never".to_string(),
-            };
-            let last_color = match sc.last_event_kind {
-                Some(state::ScoutEventKind::Failed) => CORAL,
-                Some(state::ScoutEventKind::Fire) => Color::White,
-                Some(state::ScoutEventKind::Noop) => MUTED,
-                None => MUTED,
-            };
-            let counts = format!(
-                "{}✓ {}∅ {}✗",
-                sc.fires_today, sc.noops_today, sc.failures_today
-            );
-            // Highlight failure counts in coral even when the last event was
-            // a successful fire — a trailing failure pattern matters for
-            // "is this scout healthy today" regardless of the most recent tick.
-            let counts_color = if sc.failures_today > 0 { CORAL } else { MUTED };
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", glyph), Style::default().fg(glyph_color)),
-                Span::styled(
-                    sc.name.clone(),
-                    Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  ·  ", Style::default().fg(MUTED)),
-                Span::styled(last_label, Style::default().fg(last_color)),
-                Span::styled("  ·  ", Style::default().fg(MUTED)),
-                Span::styled(counts, Style::default().fg(counts_color)),
-            ]));
-        }
-    }
-
     // ── Drafts ────────────────────────────────────────────────────────────────
     // Only surface the section when there's something to show — Drafts should
     // be background signal, not visual noise in the common case.
