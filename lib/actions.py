@@ -134,6 +134,7 @@ def load_running(paths):
 # THROTTLE>1 has been dead since brief-108 collapsed cards to YAML.
 PARALLEL_SAFE_LINE_RE = re.compile(r"^\s*(?:\*\*Parallel-safe:\*\*|Parallel-safe:)\s*(\S+)", re.IGNORECASE)
 EDIT_SURFACE_LINE_RE = re.compile(r"^\s*(?:\*\*Edit-surface:\*\*|Edit-surface:)\s*(.*?)\s*$", re.IGNORECASE)
+TARGET_REPO_LINE_RE = re.compile(r"^\s*(?:\*\*Target-repo:\*\*|Target-repo:)\s*(.*?)\s*$", re.IGNORECASE)
 
 
 def _normalize_surface_path(p):
@@ -524,6 +525,111 @@ def human_queue_summary(paths):
     return items
 
 
+# ─── Delivered gate (brief-237) ─────────────────────────────────────
+
+def _parse_target_repo(brief_file_path):
+    """Parse Target-repo: frontmatter. Returns list of external (non-portal) repo names.
+
+    Splitting rule: split on comma or '+', strip whitespace. Any token that is
+    not 'portal' (case-insensitive) and not empty is an external repo.
+    Absent or empty field → [] (portal-only, gate not triggered).
+    """
+    if not brief_file_path or not os.path.exists(brief_file_path):
+        return []
+    try:
+        with open(brief_file_path) as f:
+            for line in f:
+                m = TARGET_REPO_LINE_RE.match(line)
+                if m:
+                    raw = m.group(1).strip()
+                    if not raw:
+                        return []
+                    tokens = [t.strip() for t in re.split(r"[,+]", raw)]
+                    return [t for t in tokens if t and t.lower() != "portal"]
+    except (IOError, OSError):
+        pass
+    return []
+
+
+def _verify_delivered_url(url):
+    """Verify a GitHub URL exists on the remote via gh api.
+
+    Returns (ok: bool, reason: str).
+    Missing gh binary → (True, '') — best-effort; don't block on tooling absence.
+    """
+    import shutil
+    if not shutil.which("gh"):
+        return True, ""
+
+    m = re.match(r"https://github\.com/([^/]+)/([^/]+)/(commit|pull)/([^/\s]+)", url)
+    if not m:
+        return False, f"not a recognized GitHub URL shape: {url!r}"
+
+    owner, repo, kind, ref = m.groups()
+    api_path = (
+        f"repos/{owner}/{repo}/commits/{ref}"
+        if kind == "commit"
+        else f"repos/{owner}/{repo}/pulls/{ref}"
+    )
+    try:
+        r = subprocess.run(
+            ["gh", "api", api_path],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if r.returncode == 0:
+            return True, ""
+        return False, f"gh api {api_path} → exit {r.returncode}"
+    except subprocess.TimeoutExpired:
+        return False, "gh api timed out"
+    except Exception as e:
+        return False, str(e)
+
+
+def _check_delivered_gate(paths, brief_id, brief_file_path):
+    """Refuse completion if cross-repo work isn't verifiably on the remote.
+
+    For each external repo named in Target-repo: frontmatter, checks that
+    progress.json carries a 'delivered' dict entry with a GitHub URL, and that
+    the ref is reachable via gh api (best-effort; skipped when gh is absent).
+
+    Returns (passed: bool, errors: list[str]).
+    Passes immediately if the brief has no external Target-repo entries.
+    """
+    external_repos = _parse_target_repo(brief_file_path)
+    if not external_repos:
+        return True, []
+
+    wt_progress = os.path.join(
+        paths["worktrees_dir"], brief_id, ".loop", "state", "progress.json"
+    )
+    delivered = {}
+    if os.path.exists(wt_progress):
+        try:
+            with open(wt_progress) as f:
+                prog = json.load(f)
+            delivered = prog.get("delivered") or {}
+        except Exception:
+            pass
+
+    errors = []
+    for repo in external_repos:
+        url = delivered.get(repo)
+        if not url:
+            errors.append(
+                f"delivered-gate: REFUSED — {brief_id} missing Delivered['{repo}']: "
+                f"cross-repo work must be pushed before marking complete"
+            )
+            continue
+        ok, reason = _verify_delivered_url(url)
+        if not ok:
+            errors.append(
+                f"delivered-gate: REFUSED — {brief_id} Delivered['{repo}'] = {url!r} "
+                f"is not verifiable on the remote: {reason}"
+            )
+
+    return len(errors) == 0, errors
+
+
 # ─── Action: move-to-eval ────────────────────────────────────────────
 
 def move_to_eval(paths, brief_id):
@@ -560,6 +666,14 @@ def move_to_pending_merges(paths, brief_id):
     active_briefs = {e.get("brief") for e in rc.get("active", [])}
     if brief_id not in active_briefs:
         print(f"Warning: brief '{brief_id}' not found in active list", file=sys.stderr)
+        return False
+
+    # Delivered gate: cross-repo briefs must prove delivery before completion.
+    bf_path = os.path.join(paths["project_dir"], "wiki", "briefs", "cards", brief_id, "index.md")
+    passed, gate_errors = _check_delivered_gate(paths, brief_id, bf_path)
+    if not passed:
+        for err in gate_errors:
+            print(err, file=sys.stderr)
         return False
 
     runtime_event(paths, "completed", brief_id, kind="complete", auto_merge=True)
@@ -643,6 +757,14 @@ def move_to_awaiting_review(paths, brief_id, kind, reason=""):
                 print(f"cycle-gate: failed to read progress for {brief_id}: {e} — skipping gate", file=sys.stderr)
         else:
             print(f"cycle-gate: worktree not found for {brief_id} — skipping gate", file=sys.stderr)
+
+        # Delivered gate: cross-repo briefs must prove delivery before completion.
+        bf_path = os.path.join(paths["project_dir"], "wiki", "briefs", "cards", brief_id, "index.md")
+        passed, gate_errors = _check_delivered_gate(paths, brief_id, bf_path)
+        if not passed:
+            for err in gate_errors:
+                print(err, file=sys.stderr)
+            return False
 
     rc = load_running(paths)
     active_briefs = {e.get("brief") for e in rc.get("active", [])}

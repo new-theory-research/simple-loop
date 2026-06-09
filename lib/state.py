@@ -214,6 +214,14 @@ def _merged_event(events_for_brief):
     return last
 
 
+def _superseded_event(events_for_brief):
+    last = None
+    for e in events_for_brief:
+        if e.get("event") == "superseded":
+            last = e
+    return last
+
+
 def _build_active_entry(brief_id, fm, events_for_brief):
     """Shape of an active[] entry — mirrors actions.dispatch()'s splice."""
     disp = _dispatched_event(events_for_brief) or {}
@@ -298,6 +306,33 @@ def _build_history_entry(brief_id, fm, events_for_brief):
     return entry
 
 
+def _build_superseded_history_entry(brief_id, fm, events_for_brief):
+    """history[] entry for superseded briefs (work shipped through another door).
+
+    Mirrors _build_history_entry shape but carries delivered_via + superseded_at
+    instead of merge_sha + merged_at. Uses full-lifecycle shape when a dispatched
+    event exists, else minimal backfill shape.
+    """
+    sup = _superseded_event(events_for_brief) or {}
+    disp = _dispatched_event(events_for_brief)
+    if disp is None:
+        return {
+            "brief": brief_id,
+            "branch": fm.get("branch", brief_id),
+            "status": "superseded",
+            "delivered_via": sup.get("delivered_via", ""),
+            "reason": sup.get("reason", ""),
+            "superseded_at": sup.get("ts", ""),
+        }
+    entry = _build_active_entry(brief_id, fm, events_for_brief)
+    entry["status"] = "superseded"
+    entry["delivered_via"] = sup.get("delivered_via", "")
+    if sup.get("reason"):
+        entry["reason"] = sup["reason"]
+    entry["superseded_at"] = sup.get("ts", "")
+    return entry
+
+
 # ── Projector ─────────────────────────────────────────────────────────
 
 def project_running_json(project_dir, events=None):
@@ -367,6 +402,11 @@ def project_running_json(project_dir, events=None):
 
         if status == "merged":
             history_entries[brief_id] = _build_history_entry(brief_id, fm, evs)
+            continue
+
+        if status == "superseded":
+            # Work shipped through another door (loop close --delivered-via).
+            history_entries[brief_id] = _build_superseded_history_entry(brief_id, fm, evs)
             continue
 
         # rejected / not-doing / draft / unknown → no bucket; not user-visible
