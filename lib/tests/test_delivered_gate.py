@@ -5,14 +5,12 @@ Three goldens:
   1. "A brief can't claim done while its code exists only on the worker's machine."
      (lineage: brief-230)
   2. "Work that shipped through another door closes in one command."
-     (lineage: brief-300, 2026-06-09) — implemented in Mechanism B (next cycle)
+     (lineage: brief-300, 2026-06-09)
   3. "Portal-only briefs feel nothing."
-
-Goldens 1 and 3 are covered here. Golden 2 is added in the Mechanism B cycle.
 """
 
-import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -20,8 +18,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from actions import _parse_target_repo, _check_delivered_gate  # noqa: E402
-from state import project_running_json  # noqa: E402
+from actions import _parse_target_repo, _check_delivered_gate, close_as_delivered, init_paths  # noqa: E402
+from state import project_running_json, write_running_json  # noqa: E402
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -246,6 +244,156 @@ class TestGoldenPortalOnlyBriefFeelsNothing(unittest.TestCase):
 
             self.assertTrue(passed)
             self.assertEqual(errors, [])
+
+
+# ── Golden 2 — "Work that shipped through another door closes in one command." ──
+# lineage: brief-300, 2026-06-09 — work landed via design-director land (ab80d0b4)
+# + brief-301's merge; ledger still pointed at stale branch; daemon retried
+# conflicting merge every tick; human hand-edited running.json four times.
+
+def _make_project_dir(tmp: Path, brief_id: str, status: str = "active") -> None:
+    """Set up a minimal project tree: card + state dir."""
+    card_dir = tmp / "wiki" / "briefs" / "cards" / brief_id
+    card_dir.mkdir(parents=True, exist_ok=True)
+    (card_dir / "index.md").write_text(
+        f"---\nID: {brief_id}\nBranch: {brief_id}\nStatus: {status}\n---\n\n# {brief_id}\n"
+    )
+    state_dir = tmp / ".loop" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _write_events(tmp: Path, events: list) -> None:
+    events_path = tmp / ".loop" / "state" / "runtime-events.jsonl"
+    with open(events_path, "w") as f:
+        for e in events:
+            f.write(json.dumps(e) + "\n")
+
+
+class TestGoldenWorkShippedThroughAnotherDoor(unittest.TestCase):
+    """Golden 2: close_as_delivered atomically supersedes a brief from any queue state.
+
+    The brief-300 failure mode: work shipped through another door; the daemon
+    retried conflicting merges every tick; a human had to hand-edit running.json
+    (four writes, error-prone, done twice in one day — 2026-06-09).
+    """
+
+    def _setup_pending_merges(self, tmp: Path, brief_id: str) -> dict:
+        """Create a brief that projects into pending_merges[] (dispatched + completed + approved)."""
+        _make_project_dir(tmp, brief_id)
+        _write_events(tmp, [
+            {"ts": "2026-06-09T09:00:00Z", "event": "dispatched", "brief": brief_id,
+             "branch": brief_id, "brief_file": f"wiki/briefs/cards/{brief_id}/index.md",
+             "worker_slot": 1},
+            {"ts": "2026-06-09T09:10:00Z", "event": "completed", "brief": brief_id,
+             "kind": "complete", "auto_merge": True},
+            {"ts": "2026-06-09T09:11:00Z", "event": "approved", "brief": brief_id,
+             "auto_merge": True},
+        ])
+        paths = init_paths(str(tmp))
+        write_running_json(str(tmp))
+        return paths
+
+    def test_close_removes_from_pending_merges_to_history(self):
+        """Brief in pending_merges[] → close_as_delivered → history[] with superseded status.
+
+        Asserts the four writes happen atomically: card flipped, event appended,
+        running.json updated, history[] carries delivered_via pointer.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            brief_id = "brief-300-replay"
+            delivered_via = "https://github.com/ScavieFae/simple-loop/commit/ab80d0b4"
+            paths = self._setup_pending_merges(tmp, brief_id)
+
+            # Verify pre-condition: brief is in pending_merges
+            pre = project_running_json(str(tmp))
+            self.assertIn(brief_id, {e["brief"] for e in pre["pending_merges"]},
+                          "Pre-condition: brief should be in pending_merges before close")
+
+            result = close_as_delivered(paths, brief_id, delivered_via, reason="landed via design-director")
+
+            self.assertTrue(result, "close_as_delivered must return True")
+
+            # Card status flipped to superseded
+            card_path = tmp / "wiki" / "briefs" / "cards" / brief_id / "index.md"
+            card_text = card_path.read_text()
+            self.assertIn("Status: superseded", card_text, "Card must have Status: superseded")
+
+            # Superseded event appended to runtime-events.jsonl
+            events_path = tmp / ".loop" / "state" / "runtime-events.jsonl"
+            events = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+            sup_events = [e for e in events if e.get("event") == "superseded" and e.get("brief") == brief_id]
+            self.assertEqual(len(sup_events), 1, "Exactly one superseded event must be appended")
+            self.assertEqual(sup_events[0]["delivered_via"], delivered_via)
+
+            # running.json history[] carries the entry; pending_merges[] is empty for this brief
+            rc = project_running_json(str(tmp))
+            history_briefs = {e["brief"] for e in rc["history"]}
+            self.assertIn(brief_id, history_briefs, "Brief must appear in history[] after close")
+            pending_briefs = {e["brief"] for e in rc["pending_merges"]}
+            self.assertNotIn(brief_id, pending_briefs, "Brief must not remain in pending_merges[] after close")
+
+            history_entry = next(e for e in rc["history"] if e["brief"] == brief_id)
+            self.assertEqual(history_entry["status"], "superseded")
+            self.assertEqual(history_entry["delivered_via"], delivered_via)
+
+    def test_close_from_awaiting_review(self):
+        """Brief in awaiting_review[] → close_as_delivered also works (gap that caused 2026-06-09 hand-edit)."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            brief_id = "brief-300-awaiting"
+            _make_project_dir(tmp, brief_id)
+            _write_events(tmp, [
+                {"ts": "2026-06-09T09:00:00Z", "event": "dispatched", "brief": brief_id,
+                 "branch": brief_id, "brief_file": f"wiki/briefs/cards/{brief_id}/index.md",
+                 "worker_slot": 1},
+                {"ts": "2026-06-09T09:10:00Z", "event": "completed", "brief": brief_id,
+                 "kind": "complete", "auto_merge": False},
+            ])
+            paths = init_paths(str(tmp))
+            write_running_json(str(tmp))
+
+            pre = project_running_json(str(tmp))
+            self.assertIn(brief_id, {e["brief"] for e in pre["awaiting_review"]})
+
+            delivered_via = "https://github.com/ScavieFae/simple-loop/pull/15"
+            result = close_as_delivered(paths, brief_id, delivered_via)
+
+            self.assertTrue(result)
+            rc = project_running_json(str(tmp))
+            self.assertIn(brief_id, {e["brief"] for e in rc["history"]})
+            self.assertNotIn(brief_id, {e["brief"] for e in rc["awaiting_review"]})
+
+    def test_close_is_idempotent(self):
+        """Re-running close_as_delivered on an already-superseded brief returns True, no extra event."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            brief_id = "brief-300-idempotent"
+            delivered_via = "https://github.com/ScavieFae/simple-loop/commit/abc123ef"
+            paths = self._setup_pending_merges(tmp, brief_id)
+
+            # First close
+            result1 = close_as_delivered(paths, brief_id, delivered_via, reason="first close")
+            self.assertTrue(result1)
+
+            events_path = tmp / ".loop" / "state" / "runtime-events.jsonl"
+            events_after_first = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+            sup_count_after_first = sum(
+                1 for e in events_after_first
+                if e.get("event") == "superseded" and e.get("brief") == brief_id
+            )
+
+            # Second close — idempotent re-run
+            result2 = close_as_delivered(paths, brief_id, delivered_via, reason="second close")
+            self.assertTrue(result2, "Idempotent re-run must return True")
+
+            events_after_second = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+            sup_count_after_second = sum(
+                1 for e in events_after_second
+                if e.get("event") == "superseded" and e.get("brief") == brief_id
+            )
+            self.assertEqual(sup_count_after_first, sup_count_after_second,
+                             "Idempotent re-run must not append another superseded event")
 
 
 # ── Superseded projector routing ──────────────────────────────────────────────

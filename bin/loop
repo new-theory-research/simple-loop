@@ -1713,6 +1713,60 @@ cmd_reject() {
     echo "Branch preserved for forensics. Worktree removed."
 }
 
+# ── close ────────────────────────────────────────────────────
+
+cmd_close() {
+    require_loop_dir
+    local brief_id="${1:-}"
+    [ -z "$brief_id" ] && die "Usage: loop close <brief-id> --delivered-via <sha-or-pr-url> [reason]"
+    shift
+
+    local delivered_via=""
+    local reason="delivered via external PR or merge"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --delivered-via)
+                delivered_via="${2:-}"
+                [ -z "$delivered_via" ] && die "--delivered-via requires a value"
+                shift 2
+                ;;
+            --delivered-via=*)
+                delivered_via="${1#--delivered-via=}"
+                shift
+                ;;
+            *)
+                reason="$*"
+                break
+                ;;
+        esac
+    done
+
+    [ -z "$delivered_via" ] && die "Usage: loop close <brief-id> --delivered-via <sha-or-pr-url> [reason]"
+
+    local actions_script="$LIB_DIR/actions.py"
+    if [ ! -f "$actions_script" ]; then
+        actions_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/actions.py"
+    fi
+    [ -f "$actions_script" ] || die "actions.py not found. Is Simple Loop installed?"
+
+    python3 "$actions_script" close-brief "$brief_id" "$PROJECT_DIR" "$delivered_via" "$reason" \
+        || die "close-brief action failed"
+
+    # Commit the projected state files.
+    if git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        cd "$PROJECT_DIR"
+        git add ".loop/state/running.json" ".loop/state/runtime-events.jsonl" \
+                ".loop/state/log.jsonl" 2>/dev/null
+        git commit -m "loop: close $brief_id as superseded — $delivered_via" -q 2>/dev/null || true
+        git push "${GIT_REMOTE:-origin}" "${GIT_MAIN_BRANCH:-main}" -q 2>/dev/null || true
+    fi
+
+    echo "Closed: $brief_id"
+    echo "Delivered via: $delivered_via"
+    echo "Branch preserved for forensics. Worktree removed."
+}
+
 # ── lint ─────────────────────────────────────────────────────
 
 cmd_lint() {
@@ -1883,6 +1937,10 @@ Signals:
                            --waive N --reason '...' --tracking-brief brief-MMM
                            for partial-approval with waiver record
   reject <brief-id> [why]  Reject a brief: mark in history, remove worktree
+  close <brief-id> --delivered-via <sha-or-url> [why]
+                           Close a brief as delivered-elsewhere: supersede from
+                           any queue state, append delivered_via to history,
+                           remove worktree (branch preserved). Idempotent.
 
 Quality:
   lint <path>              Lint a brief file or directory for format drift
@@ -1921,6 +1979,7 @@ case "${1:-help}" in
     resume)  shift; cmd_resume "$@" ;;
     approve) shift; cmd_approve "$@" ;;
     reject)  shift; cmd_reject "$@" ;;
+    close)   shift; cmd_close "$@" ;;
     metrics) shift; cmd_metrics "$@" ;;
     lint)    shift; cmd_lint "$@" ;;
     sweep)   shift; cmd_sweep "$@" ;;

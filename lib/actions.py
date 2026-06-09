@@ -882,6 +882,86 @@ def reject_brief(paths, brief_id, reason=""):
     return True
 
 
+# ─── Action: close-as-delivered ──────────────────────────────────────
+
+def close_as_delivered(paths, brief_id, delivered_via, reason=""):
+    """Close a brief as delivered-elsewhere: card superseded + event + project.
+
+    Atomic replacement for the four-write hand-merge recipe when work has shipped
+    through another door (a PR, a direct land, another brief). Works from any
+    queue state — active, awaiting_review, or pending_merges.
+
+    Idempotent: if the card is already Status: superseded, re-projects and
+    returns True without appending another event.
+    """
+    _card_path = os.path.join(
+        paths["project_dir"], "wiki", "briefs", "cards", brief_id, "index.md"
+    )
+
+    # Early idempotency: if card is already superseded, skip state writes.
+    if os.path.exists(_card_path):
+        try:
+            with open(_card_path) as _f:
+                for _line in _f:
+                    _s = _line.strip()
+                    if re.match(r"^Status\s*:", _s, re.IGNORECASE):
+                        if _s.split(":", 1)[1].strip().lower() == "superseded":
+                            project_running(paths)
+                            print(f"close-as-delivered: {brief_id} already superseded (idempotent re-run)")
+                            return True
+                        break
+        except (IOError, OSError):
+            pass
+
+    # Verify the brief is in a closeable queue state.
+    rc = load_running(paths)
+    all_closeable = (
+        {e.get("brief") for e in rc.get("active", [])} |
+        {e.get("brief") for e in rc.get("awaiting_review", [])} |
+        {e.get("brief") for e in rc.get("pending_merges", [])}
+    )
+    if brief_id not in all_closeable:
+        print(
+            f"close-as-delivered: brief '{brief_id}' not found in active, "
+            f"awaiting_review, or pending_merges",
+            file=sys.stderr,
+        )
+        return False
+
+    # Card Status → superseded (card-is-truth; projector routes to history[]).
+    if os.path.exists(_card_path):
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from _set_card_status import set_card_status as _set_card_status_fn
+            _changed = _set_card_status_fn(_card_path, "superseded")
+            if _changed:
+                git(paths["project_dir"], "add", _card_path, check=False)
+                git(paths["project_dir"], "commit", "-m",
+                    f"loop: card status → superseded for {brief_id}", check=False)
+                log_action(paths, "card_status_set_superseded", {"brief": brief_id})
+        except Exception as e:
+            print(
+                f"close-as-delivered: card status update failed for {brief_id}: {e} (non-fatal)",
+                file=sys.stderr,
+            )
+
+    # Append superseded runtime event (delivered_via + reason land in history[]).
+    runtime_event(paths, "superseded", brief_id, delivered_via=delivered_via, reason=reason or "")
+
+    # Re-project running.json from cards + events.
+    project_running(paths)
+
+    # Remove worktree (preserve branch for forensics).
+    remove_worktree(paths, brief_id)
+
+    signal_dedup_clear(paths, brief_id)
+    log_action(paths, "close-as-delivered", {
+        "brief": brief_id, "delivered_via": delivered_via, "reason": reason or "",
+    })
+    print(f"Closed {brief_id} as superseded (delivered via: {delivered_via})")
+    return True
+
+
 # ─── Action: dispatch ─────────────────────────────────────────────────
 
 def worktree_dir_for(paths, brief):
@@ -1763,7 +1843,7 @@ def ensure_progress_for_brief(progress_file: str, brief_id: str, brief_file: str
 
 def main():
     BRIEF_ACTIONS = ("move-to-eval", "move-to-pending-merges", "move-to-awaiting-review",
-                     "approve-brief", "reject-brief", "ensure-progress-for-brief")
+                     "approve-brief", "reject-brief", "close-brief", "ensure-progress-for-brief")
 
     if len(sys.argv) < 3:
         print(f"Usage: {sys.argv[0]} <action> <project_dir> [args]", file=sys.stderr)
@@ -1773,6 +1853,7 @@ def main():
         print("         process-pending-merges <project_dir>", file=sys.stderr)
         print("         approve-brief <brief_id> <project_dir>", file=sys.stderr)
         print("         reject-brief <brief_id> <project_dir> [reason]", file=sys.stderr)
+        print("         close-brief <brief_id> <project_dir> <delivered_via> [reason]", file=sys.stderr)
         print("         dispatch <project_dir>", file=sys.stderr)
         print("         merge <project_dir>", file=sys.stderr)
         print("         cleanup <project_dir>", file=sys.stderr)
@@ -1814,6 +1895,13 @@ def main():
         elif action == "reject-brief":
             reason = " ".join(extra) if extra else ""
             success = reject_brief(paths, brief_id, reason)
+        elif action == "close-brief":
+            if not extra:
+                print("close-brief requires <delivered_via> [reason...]", file=sys.stderr)
+                sys.exit(1)
+            delivered_via = extra[0]
+            reason = " ".join(extra[1:]) if len(extra) > 1 else ""
+            success = close_as_delivered(paths, brief_id, delivered_via, reason)
         elif action == "dispatch":
             success = dispatch(paths)
         elif action == "merge":
