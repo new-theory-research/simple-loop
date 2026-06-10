@@ -527,12 +527,68 @@ def human_queue_summary(paths):
 
 # ─── Delivered gate (brief-237) ─────────────────────────────────────
 
+# Infra surfaces that appear in Target-repo:/Edit-surface: but are NOT git
+# repos — there is no commit URL to verify, so the gate skips them.
+# Case-insensitive membership check.
+NON_GIT_TARGETS = {"modal", "railway", "vercel"}
+
+# Placeholder tokens observed in live cards (e.g. `Target-repo: TBD (...)`,
+# `Depends-on: _none_`) — not repos; never gate on them.
+PLACEHOLDER_TOKENS = {"tbd", "none", "n/a", "na", "_none_"}
+
+# Known sibling repos → GitHub remotes. Used for the gh-free `git ls-remote`
+# fallback and for verifying plain-SHA delivered refs (where the ref alone
+# doesn't name an org). Extend when a new sibling repo joins the ecosystem.
+KNOWN_REPO_REMOTES = {
+    "nt-runway": "https://github.com/new-theory-research/nt-runway",
+    "newt-python": "https://github.com/new-theory-research/newt-python",
+    "newt-starter-trossen-widowx": "https://github.com/new-theory-research/newt-starter-trossen-widowx",
+    "newt-starter-yam": "https://github.com/new-theory-research/newt-starter-yam",
+    "imitation_learning": "https://github.com/new-theory-research/imitation_learning",
+    "simple-loop": "https://github.com/ScavieFae/simple-loop",
+}
+
+_ANNOTATION_RE = re.compile(r"\([^)]*\)")
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+_GH_URL_RE = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/(commit|pull)/([^/\s]+)")
+_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _normalize_repo_token(token):
+    """One raw token → bare external repo name, or None if it isn't one.
+
+    Handles the observed card grammar:
+      - parenthetical annotations: `portal (apps/docs)`, `newt-python (new)`
+      - org-prefixed names: `new-theory-research/newt-python` → `newt-python`
+      - portal itself (the host repo — never gated)
+      - non-git infra surfaces (Modal/Railway/Vercel — nothing to verify)
+    """
+    t = _ANNOTATION_RE.sub(" ", token).strip().strip("`*").strip()
+    if "/" in t:
+        t = t.rstrip("/").rsplit("/", 1)[-1].strip()
+    if not t or not _REPO_NAME_RE.match(t):
+        return None
+    tl = t.lower()
+    if tl == "portal" or tl in NON_GIT_TARGETS or tl in PLACEHOLDER_TOKENS:
+        return None
+    return t
+
+
 def _parse_target_repo(brief_file_path):
     """Parse Target-repo: frontmatter. Returns list of external (non-portal) repo names.
 
-    Splitting rule: split on comma or '+', strip whitespace. Any token that is
-    not 'portal' (case-insensitive) and not empty is an external repo.
-    Absent or empty field → [] (portal-only, gate not triggered).
+    Observed grammar across live portal cards (the parser is written against
+    these real strings, not an idealized format):
+      Target-repo: portal (apps/docs)
+      Target-repo: nt-runway + Modal
+      Target-repo: nt-runway + newt-python + Railway
+      Target-repo: nt-runway + new-theory-research/newt-python (new) + portal
+      Target-repo: newt-starter-trossen-widowx (+ newt-starter-yam if same pattern)
+      Target-repo: portal+nt-runway
+
+    Rule: strip parenthetical annotations FIRST (they can contain '+'), then
+    split on comma or '+', then normalize each token (org-prefix → bare name,
+    drop portal and non-git infra targets). Absent/empty field → [].
     """
     if not brief_file_path or not os.path.exists(brief_file_path):
         return []
@@ -541,62 +597,203 @@ def _parse_target_repo(brief_file_path):
             for line in f:
                 m = TARGET_REPO_LINE_RE.match(line)
                 if m:
-                    raw = m.group(1).strip()
-                    if not raw:
-                        return []
-                    tokens = [t.strip() for t in re.split(r"[,+]", raw)]
-                    return [t for t in tokens if t and t.lower() != "portal"]
+                    raw = _ANNOTATION_RE.sub(" ", m.group(1).strip())
+                    repos = []
+                    for tok in re.split(r"[,+]", raw):
+                        r = _normalize_repo_token(tok)
+                        if r and r not in repos:
+                            repos.append(r)
+                    return repos
     except (IOError, OSError):
         pass
     return []
 
 
-def _verify_delivered_url(url):
-    """Verify a GitHub URL exists on the remote via gh api.
+def _edit_surface_entry_repo(entry):
+    """One Edit-surface list entry → bare external repo name, or None.
+
+    Observed entry shapes that name a sibling repo:
+      - /Users/<user>/new-theory/nt-runway/serve_nt0.py   (absolute path through
+        the sibling-checkout parent dir — repo is the component after new-theory/)
+      - simple-loop lib/actions.py                        (bare repo name + path)
+      - Railway (new always-on service + config)          (infra target — skipped)
+
+    Everything else (relative portal paths like `apps/console/`, bare filenames
+    like `closeout.md`) is portal-internal → None.
+    """
+    m = re.search(r"/new-theory/([A-Za-z0-9._-]+)", entry)
+    if m:
+        return _normalize_repo_token(m.group(1))
+    stripped = _ANNOTATION_RE.sub(" ", entry).strip()
+    first = stripped.split()[0] if stripped.split() else ""
+    if first and "/" not in first and "." not in first:
+        return _normalize_repo_token(first)
+    return None
+
+
+def _parse_edit_surface_repos(brief_file_path):
+    """Parse Edit-surface: frontmatter (inline or block-list form) → external repo names.
+
+    Block form (the common one):
+        Edit-surface:
+          - /Users/.../new-theory/nt-runway/serve_nt0.py
+          - apps/console/
+    Inline form is parsed with the same token rules as Target-repo.
+    Only the first Edit-surface: block in the file is read (frontmatter).
+    """
+    if not brief_file_path or not os.path.exists(brief_file_path):
+        return []
+    repos = []
+    try:
+        with open(brief_file_path) as f:
+            in_block = False
+            for line in f:
+                if in_block:
+                    item = re.match(r"^\s+-\s+(.*\S)\s*$", line)
+                    if item:
+                        r = _edit_surface_entry_repo(item.group(1))
+                        if r and r not in repos:
+                            repos.append(r)
+                        continue
+                    break  # contiguous block ended
+                m = EDIT_SURFACE_LINE_RE.match(line)
+                if m:
+                    inline = m.group(1).strip()
+                    if inline:
+                        raw = _ANNOTATION_RE.sub(" ", inline)
+                        for tok in re.split(r"[,+]", raw):
+                            r = _normalize_repo_token(tok)
+                            if r and r not in repos:
+                                repos.append(r)
+                        return repos
+                    in_block = True
+    except (IOError, OSError):
+        pass
+    return repos
+
+
+def _external_repos_for_brief(brief_file_path):
+    """External repos a brief touches: UNION of Target-repo: and Edit-surface:.
+
+    WHY the union (director call, 2026-06-09 review of brief-237): live cards
+    are inconsistent about which field carries the cross-repo signal. The
+    brief-237 card itself names the gate input as Edit-surface: (three times),
+    while the first implementation keyed off Target-repo:. Some cards carry
+    only one of the two; either field alone misses real cases. Gating on the
+    deduplicated union — with the same parser, portal exclusion, and non-git
+    skip applied to both — means a brief is gated iff ANY field names a
+    sibling git repo, regardless of which convention the card author used.
+    """
+    repos = _parse_target_repo(brief_file_path)
+    for r in _parse_edit_surface_repos(brief_file_path):
+        if r not in repos:
+            repos.append(r)
+    return repos
+
+
+def _verify_delivered_ref(ref, repo):
+    """Verify a delivered ref (GitHub commit/PR URL, or plain commit SHA) on the remote.
 
     Returns (ok: bool, reason: str).
-    Missing gh binary → (True, '') — best-effort; don't block on tooling absence.
+
+    Verification ladder:
+      1. gh available → `gh api` the commit/PR (plain SHAs resolve via
+         KNOWN_REPO_REMOTES to get the org).
+      2. gh unavailable, plain SHA on a known repo → `git ls-remote` the remote
+         and accept the SHA if it matches an advertised ref tip.
+      3. Otherwise fall OPEN — but loudly: a warning line on stderr names the
+         repo and the skipped verification. Never silently.
     """
     import shutil
-    if not shutil.which("gh"):
-        return True, ""
-
-    m = re.match(r"https://github\.com/([^/]+)/([^/]+)/(commit|pull)/([^/\s]+)", url)
-    if not m:
-        return False, f"not a recognized GitHub URL shape: {url!r}"
-
-    owner, repo, kind, ref = m.groups()
-    api_path = (
-        f"repos/{owner}/{repo}/commits/{ref}"
-        if kind == "commit"
-        else f"repos/{owner}/{repo}/pulls/{ref}"
-    )
-    try:
-        r = subprocess.run(
-            ["gh", "api", api_path],
-            capture_output=True, text=True, timeout=15, check=False,
+    url_m = _GH_URL_RE.match(ref)
+    sha_m = _SHA_RE.match(ref)
+    if not url_m and not sha_m:
+        return False, (
+            f"not a recognized GitHub commit/PR URL or plain commit SHA: {ref!r}. "
+            f"Expected https://github.com/<org>/{repo}/commit/<sha>, .../pull/<n>, or a bare SHA"
         )
-        if r.returncode == 0:
-            return True, ""
-        return False, f"gh api {api_path} → exit {r.returncode}"
-    except subprocess.TimeoutExpired:
-        return False, "gh api timed out"
-    except Exception as e:
-        return False, str(e)
+
+    if shutil.which("gh"):
+        if url_m:
+            owner, repo_name, kind, gref = url_m.groups()
+            api_path = (
+                f"repos/{owner}/{repo_name}/commits/{gref}"
+                if kind == "commit"
+                else f"repos/{owner}/{repo_name}/pulls/{gref}"
+            )
+        else:
+            remote = KNOWN_REPO_REMOTES.get(repo)
+            if not remote:
+                return False, (
+                    f"plain SHA given for repo {repo!r} not in KNOWN_REPO_REMOTES — "
+                    f"record a full commit URL (https://github.com/<org>/{repo}/commit/<sha>) instead"
+                )
+            owner_repo = remote.split("github.com/", 1)[1]
+            api_path = f"repos/{owner_repo}/commits/{ref}"
+        try:
+            r = subprocess.run(
+                ["gh", "api", api_path],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            if r.returncode == 0:
+                return True, ""
+            return False, (
+                f"gh api {api_path} → exit {r.returncode}. "
+                f"If gh is unauthenticated, run `gh auth login`; "
+                f"emergency override: SIMPLE_LOOP_SKIP_DELIVERED_GATE=1"
+            )
+        except subprocess.TimeoutExpired:
+            return False, "gh api timed out"
+        except Exception as e:
+            return False, str(e)
+
+    # gh unavailable — try the gh-free ls-remote fallback for plain SHAs on known repos.
+    if sha_m and repo in KNOWN_REPO_REMOTES and shutil.which("git"):
+        try:
+            r = subprocess.run(
+                ["git", "ls-remote", KNOWN_REPO_REMOTES[repo]],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            if r.returncode == 0:
+                tips = {ln.split("\t", 1)[0] for ln in r.stdout.splitlines() if ln.strip()}
+                if any(t.startswith(ref.lower()) for t in tips):
+                    return True, ""
+        except Exception:
+            pass
+
+    print(
+        f"delivered-gate: gh unavailable — remote verification SKIPPED for {repo} "
+        f"(ref {ref!r} accepted unverified)",
+        file=sys.stderr,
+    )
+    return True, ""
 
 
 def _check_delivered_gate(paths, brief_id, brief_file_path):
     """Refuse completion if cross-repo work isn't verifiably on the remote.
 
-    For each external repo named in Target-repo: frontmatter, checks that
-    progress.json carries a 'delivered' dict entry with a GitHub URL, and that
-    the ref is reachable via gh api (best-effort; skipped when gh is absent).
+    For each external repo named in the UNION of Target-repo: and Edit-surface:
+    frontmatter, checks that progress.json carries a 'delivered' dict entry
+    (commit/PR URL or plain SHA) and that the ref is reachable on the remote.
 
     Returns (passed: bool, errors: list[str]).
-    Passes immediately if the brief has no external Target-repo entries.
+    Passes immediately if the brief names no external repos.
+    Escape hatch: SIMPLE_LOOP_SKIP_DELIVERED_GATE=1 skips the gate (loudly).
     """
-    external_repos = _parse_target_repo(brief_file_path)
+    external_repos = _external_repos_for_brief(brief_file_path)
     if not external_repos:
+        return True, []
+
+    if os.environ.get("SIMPLE_LOOP_SKIP_DELIVERED_GATE") == "1":
+        print(
+            "=" * 72 + "\n"
+            f"delivered-gate: SKIPPED for {brief_id} via SIMPLE_LOOP_SKIP_DELIVERED_GATE=1\n"
+            f"  external repos NOT verified: {', '.join(external_repos)}\n"
+            f"  if this brief's cross-repo work is not actually pushed, you are\n"
+            f"  reintroducing the brief-230 failure mode. Unset the env var after use.\n"
+            + "=" * 72,
+            file=sys.stderr,
+        )
         return True, []
 
     wt_progress = os.path.join(
@@ -616,14 +813,19 @@ def _check_delivered_gate(paths, brief_id, brief_file_path):
         url = delivered.get(repo)
         if not url:
             errors.append(
-                f"delivered-gate: REFUSED — {brief_id} missing Delivered['{repo}']: "
-                f"cross-repo work must be pushed before marking complete"
+                f"delivered-gate: REFUSED — {brief_id} missing delivered['{repo}'] in progress.json.\n"
+                f"  Cross-repo work must be pushed before this brief can complete.\n"
+                f"  Fix: push the {repo} commits, then add to\n"
+                f"  {wt_progress}:\n"
+                f'    "delivered": {{"{repo}": "https://github.com/<org>/{repo}/commit/<sha>"}}\n'
+                f"  (a PR URL or a bare pushed commit SHA also works).\n"
+                f"  Emergency override (use sparingly): SIMPLE_LOOP_SKIP_DELIVERED_GATE=1"
             )
             continue
-        ok, reason = _verify_delivered_url(url)
+        ok, reason = _verify_delivered_ref(url, repo)
         if not ok:
             errors.append(
-                f"delivered-gate: REFUSED — {brief_id} Delivered['{repo}'] = {url!r} "
+                f"delivered-gate: REFUSED — {brief_id} delivered['{repo}'] = {url!r} "
                 f"is not verifiable on the remote: {reason}"
             )
 
@@ -644,6 +846,16 @@ def move_to_eval(paths, brief_id):
     active_briefs = {e.get("brief") for e in rc.get("active", [])}
     if brief_id not in active_briefs:
         print(f"Warning: brief '{brief_id}' not found in active list", file=sys.stderr)
+        return False
+
+    # Delivered gate: move_to_eval is a legacy path but still routes briefs
+    # into awaiting_review (kind=complete) — without this call it is an
+    # unguarded back door around the cross-repo delivered gate.
+    bf_path = os.path.join(paths["project_dir"], "wiki", "briefs", "cards", brief_id, "index.md")
+    passed, gate_errors = _check_delivered_gate(paths, brief_id, bf_path)
+    if not passed:
+        for err in gate_errors:
+            print(err, file=sys.stderr)
         return False
 
     runtime_event(paths, "completed", brief_id, kind="complete", auto_merge=False)

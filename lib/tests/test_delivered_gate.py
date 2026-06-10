@@ -18,7 +18,18 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from actions import _parse_target_repo, _check_delivered_gate, close_as_delivered, init_paths  # noqa: E402
+from actions import (  # noqa: E402
+    _parse_target_repo,
+    _parse_edit_surface_repos,
+    _external_repos_for_brief,
+    _verify_delivered_ref,
+    _check_delivered_gate,
+    close_as_delivered,
+    init_paths,
+    move_to_awaiting_review,
+    move_to_pending_merges,
+    move_to_eval,
+)
 from state import project_running_json, write_running_json  # noqa: E402
 
 
@@ -201,6 +212,213 @@ class TestGoldenBriefCantClaimDone(unittest.TestCase):
             self.assertFalse(passed)
             self.assertTrue(any("repo-b" in e for e in errors),
                             f"Error should name 'repo-b'; got: {errors}")
+
+
+# ── Parser vs. real card grammar ─────────────────────────────────────────────
+# Every string below is copied VERBATIM from a live portal card
+# (wiki/briefs/cards/*/index.md, 2026-06-09). The parser is tested against
+# what cards actually say, not an idealized format.
+
+class TestParserRealCardFormats(unittest.TestCase):
+
+    def _parse(self, value):
+        with tempfile.TemporaryDirectory() as d:
+            card = _make_card(Path(d), "brief-real", f"Target-repo: {value}\n")
+            return _parse_target_repo(card)
+
+    def test_portal_with_parenthetical_annotation_is_portal_only(self):
+        """brief-231: `Target-repo: portal (apps/docs)` → [] — the annotation must
+        not turn a portal-only brief into a gated one (the false positive the
+        reviewer caught)."""
+        self.assertEqual(self._parse("portal (apps/docs)"), [])
+
+    def test_modal_is_not_a_git_repo(self):
+        """brief-207: `Target-repo: nt-runway + Modal` — Modal is an infra
+        surface, not a repo; gating on it would be a permanent refusal."""
+        self.assertEqual(self._parse("nt-runway + Modal"), ["nt-runway"])
+
+    def test_railway_is_not_a_git_repo(self):
+        """brief-233: `Target-repo: nt-runway + newt-python + Railway`."""
+        self.assertEqual(
+            self._parse("nt-runway + newt-python + Railway"),
+            ["nt-runway", "newt-python"],
+        )
+
+    def test_org_prefixed_name_with_annotation_normalizes(self):
+        """brief-211: `Target-repo: nt-runway + new-theory-research/newt-python (new) + portal`
+        → org prefix and `(new)` annotation stripped so delivered['newt-python'] can match."""
+        self.assertEqual(
+            self._parse("nt-runway + new-theory-research/newt-python (new) + portal"),
+            ["nt-runway", "newt-python"],
+        )
+
+    def test_annotation_containing_plus_does_not_split(self):
+        """brief-230: `Target-repo: newt-starter-trossen-widowx (+ newt-starter-yam if same pattern)`
+        — the '+' lives INSIDE the parenthetical; annotations strip before splitting."""
+        self.assertEqual(
+            self._parse("newt-starter-trossen-widowx (+ newt-starter-yam if same pattern)"),
+            ["newt-starter-trossen-widowx"],
+        )
+
+    def test_plus_without_spaces(self):
+        """brief-235: `Target-repo: portal+nt-runway`."""
+        self.assertEqual(self._parse("portal+nt-runway"), ["nt-runway"])
+
+    def test_starter_with_new_annotation(self):
+        """brief-225: `Target-repo: newt-starter-yam (new) + portal`."""
+        self.assertEqual(self._parse("newt-starter-yam (new) + portal"), ["newt-starter-yam"])
+
+    def test_three_way_multi_repo(self):
+        """brief-228: `Target-repo: newt-python + nt-runway + portal`."""
+        self.assertEqual(
+            self._parse("newt-python + nt-runway + portal"),
+            ["newt-python", "nt-runway"],
+        )
+
+    def test_comma_separated_multi_value(self):
+        """Comma-separated form (allowed by the grammar)."""
+        self.assertEqual(self._parse("nt-runway, newt-python"), ["nt-runway", "newt-python"])
+
+    def test_tbd_placeholder_is_not_a_repo(self):
+        """brief-242: `Target-repo: TBD (starter + possibly vendored tooling)` —
+        a placeholder must not gate the brief on delivered['TBD'] forever."""
+        self.assertEqual(self._parse("TBD (starter + possibly vendored tooling)"), [])
+
+
+class TestEditSurfaceParser(unittest.TestCase):
+
+    def test_block_list_real_entries(self):
+        """Edit-surface block copied from live cards (brief-205-cont-b, brief-233,
+        brief-237, brief-153): absolute sibling paths → repo; bare-name+path →
+        repo; bare-name (annotation) → repo; Railway (…) → skipped; relative
+        portal paths and bare filenames → skipped."""
+        fm = (
+            "Edit-surface:\n"
+            "  - /Users/mattie-newtheory/new-theory/nt-runway/serve_nt0.py\n"
+            "  - /Users/mattie-newtheory/new-theory/portal/wiki/specs/streaming-ws-protocol.md\n"
+            "  - simple-loop lib/actions.py\n"
+            "  - simple-loop bin/loop (or equivalent CLI entry)\n"
+            "  - nt-runway (registry service — lifted out of the GPU serve app)\n"
+            "  - Railway (new always-on service + config)\n"
+            "  - apps/console/\n"
+            "  - closeout.md\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            card = _make_card(Path(d), "brief-es", fm)
+            self.assertEqual(_parse_edit_surface_repos(card), ["nt-runway", "simple-loop"])
+
+    def test_tbd_entry_is_skipped(self):
+        """brief-242: `- TBD pending decisions (newt-starter-trossen-widowx + …)`."""
+        fm = (
+            "Edit-surface:\n"
+            "  - TBD pending decisions (newt-starter-trossen-widowx + possibly vendored calibration tooling)\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            card = _make_card(Path(d), "brief-es-tbd", fm)
+            self.assertEqual(_parse_edit_surface_repos(card), [])
+
+    def test_union_of_target_repo_and_edit_surface(self):
+        """Gate input is the UNION: a repo named only in Edit-surface still gates,
+        a repo named in both appears once."""
+        fm = (
+            "Target-repo: nt-runway\n"
+            "Edit-surface:\n"
+            "  - /Users/mattie-newtheory/new-theory/nt-runway/serve_nt0.py\n"
+            "  - /Users/mattie-newtheory/new-theory/newt-python/src/newt/_client/robot.py\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            card = _make_card(Path(d), "brief-union", fm)
+            self.assertEqual(_external_repos_for_brief(card), ["nt-runway", "newt-python"])
+
+
+# ── Delivered-ref verification (plain SHA + gh-free fallback) ────────────────
+
+class TestVerifyDeliveredRef(unittest.TestCase):
+
+    def test_plain_sha_on_known_repo_verified_by_gh(self):
+        import subprocess as sp
+        ok_run = sp.CompletedProcess(args=[], returncode=0, stdout="{}", stderr="")
+        with patch("shutil.which", return_value="/usr/bin/gh"), \
+             patch("subprocess.run", return_value=ok_run):
+            ok, reason = _verify_delivered_ref("deadbeefcafe", "nt-runway")
+        self.assertTrue(ok, reason)
+
+    def test_plain_sha_on_unknown_repo_with_gh_is_refused_with_actionable_message(self):
+        with patch("shutil.which", return_value="/usr/bin/gh"):
+            ok, reason = _verify_delivered_ref("deadbeefcafe", "mystery-repo")
+        self.assertFalse(ok)
+        self.assertIn("commit URL", reason)
+
+    def test_plain_sha_gh_free_ls_remote_fallback_verifies_branch_tip(self):
+        """gh absent, git present: ls-remote advertises the SHA as a tip → verified
+        without falling open."""
+        import subprocess as sp
+
+        def fake_which(name):
+            return "/usr/bin/git" if name == "git" else None
+
+        sha = "ab80d0b4ab80d0b4ab80d0b4ab80d0b4ab80d0b4"
+        ls_out = f"{sha}\trefs/heads/master\n"
+        ls_run = sp.CompletedProcess(args=[], returncode=0, stdout=ls_out, stderr="")
+        with patch("shutil.which", side_effect=fake_which), \
+             patch("subprocess.run", return_value=ls_run):
+            ok, reason = _verify_delivered_ref(sha[:12], "simple-loop")
+        self.assertTrue(ok, reason)
+
+    def test_gh_absent_falls_open_loudly_not_silently(self):
+        """gh + git both absent → gate falls open but prints the loud SKIPPED
+        warning naming the repo (the silent fail-open was the reviewer's flag)."""
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with patch("shutil.which", return_value=None), redirect_stderr(buf):
+            ok, _ = _verify_delivered_ref(
+                "https://github.com/new-theory-research/nt-runway/commit/abc123", "nt-runway"
+            )
+        self.assertTrue(ok)
+        err = buf.getvalue()
+        self.assertIn("gh unavailable", err)
+        self.assertIn("SKIPPED", err)
+        self.assertIn("nt-runway", err)
+
+
+# ── Escape hatch ──────────────────────────────────────────────────────────────
+
+class TestEscapeHatch(unittest.TestCase):
+
+    def test_skip_env_var_bypasses_gate_with_banner(self):
+        """SIMPLE_LOOP_SKIP_DELIVERED_GATE=1 → gate passes despite missing
+        delivered, and a loud banner lands on stderr."""
+        import io
+        from contextlib import redirect_stderr
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            brief_id = "brief-skip"
+            card = _make_card(tmp, brief_id, "Target-repo: nt-runway\n")
+            paths = _paths(tmp)
+            buf = io.StringIO()
+            with patch.dict(os.environ, {"SIMPLE_LOOP_SKIP_DELIVERED_GATE": "1"}), \
+                 redirect_stderr(buf):
+                passed, errors = _check_delivered_gate(paths, brief_id, card)
+            self.assertTrue(passed)
+            self.assertEqual(errors, [])
+            self.assertIn("SIMPLE_LOOP_SKIP_DELIVERED_GATE", buf.getvalue())
+
+    def test_refusal_message_is_self_serve(self):
+        """The refusal names the expected JSON shape, the file to edit, and the
+        escape hatch — a stuck human at 2am can fix it from the message alone."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            brief_id = "brief-2am"
+            card = _make_card(tmp, brief_id, "Target-repo: nt-runway\n")
+            paths = _paths(tmp)
+            passed, errors = _check_delivered_gate(paths, brief_id, card)
+            self.assertFalse(passed)
+            msg = errors[0]
+            self.assertIn('"delivered"', msg)
+            self.assertIn("progress.json", msg)
+            self.assertIn("nt-runway", msg)
+            self.assertIn("SIMPLE_LOOP_SKIP_DELIVERED_GATE", msg)
 
 
 # ── Golden 3 — "Portal-only briefs feel nothing." ─────────────────────────────
@@ -437,6 +655,163 @@ class TestSupersededProjectorRouting(unittest.TestCase):
                 bucket_briefs = [e.get("brief") for e in result[bucket]]
                 self.assertNotIn(brief_id, bucket_briefs,
                                  f"Superseded card must not appear in {bucket}[]")
+
+
+# ── Integration: the gate wired THROUGH the real transition writers ──────────
+# These drive move_to_awaiting_review / move_to_pending_merges / move_to_eval
+# against a fixture state dir. If the _check_delivered_gate call is deleted
+# from any writer, the corresponding refusal test below FAILS (the transition
+# would wrongly proceed).
+
+def _fake_subprocess_run(gh_rc=0):
+    """Mock at the subprocess boundary (not the gate function): git rev-list
+    reports 2 commits (satisfies the cycle gate), gh api returns gh_rc."""
+    import subprocess as sp
+
+    def run(args, **kwargs):
+        prog = args[0] if args else ""
+        if prog == "git" and "rev-list" in args:
+            return sp.CompletedProcess(args, 0, stdout="2\n", stderr="")
+        if prog == "gh":
+            out = "{}" if gh_rc == 0 else ""
+            return sp.CompletedProcess(args, gh_rc, stdout=out, stderr="" if gh_rc == 0 else "Not Found")
+        return sp.CompletedProcess(args, 0, stdout="", stderr="")
+
+    return run
+
+
+class TestGateWiredThroughWriters(unittest.TestCase):
+
+    def _setup_active(self, tmp: Path, brief_id: str, frontmatter: str, progress: dict) -> dict:
+        """Fixture: a dispatched (active) brief with a card + worktree progress.json."""
+        card_dir = tmp / "wiki" / "briefs" / "cards" / brief_id
+        card_dir.mkdir(parents=True, exist_ok=True)
+        (card_dir / "index.md").write_text(
+            f"---\nID: {brief_id}\nBranch: {brief_id}\nStatus: active\n{frontmatter}---\n\n# {brief_id}\n"
+        )
+        (tmp / ".loop" / "state").mkdir(parents=True, exist_ok=True)
+        _write_events(tmp, [
+            {"ts": "2026-06-09T09:00:00Z", "event": "dispatched", "brief": brief_id,
+             "branch": brief_id, "brief_file": f"wiki/briefs/cards/{brief_id}/index.md",
+             "worker_slot": 1},
+        ])
+        _make_progress(tmp, brief_id, progress)
+        paths = init_paths(str(tmp))
+        write_running_json(str(tmp))
+        return paths
+
+    _COMPLETE_PROGRESS = {"status": "complete", "iteration": 1, "tasks_remaining": []}
+
+    def test_awaiting_review_refused_without_delivered(self):
+        """(a) Cross-repo brief (real string `Target-repo: nt-runway + Modal`),
+        no delivered → move_to_awaiting_review REFUSES through the real writer;
+        brief stays in active[]. Deleting the gate call from the writer makes
+        this fail."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            brief_id = "brief-int-a"
+            paths = self._setup_active(tmp, brief_id, "Target-repo: nt-runway + Modal\n",
+                                       dict(self._COMPLETE_PROGRESS))
+
+            result = move_to_awaiting_review(paths, brief_id, "complete")
+
+            self.assertFalse(result, "Writer must refuse the transition without delivered refs")
+            rc = project_running_json(str(tmp))
+            self.assertIn(brief_id, {e["brief"] for e in rc["active"]},
+                          "Brief must remain in active[] after refusal")
+            self.assertNotIn(brief_id, {e["brief"] for e in rc["awaiting_review"]})
+
+    def test_pending_merges_refused_without_delivered_edit_surface_only(self):
+        """(a, union) Cross-repo signal carried ONLY by Edit-surface (the field the
+        brief card spec'd) → move_to_pending_merges REFUSES through the real writer."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            brief_id = "brief-int-b"
+            fm = (
+                "Edit-surface:\n"
+                "  - /Users/mattie-newtheory/new-theory/nt-runway/serve_nt0.py\n"
+                "  - apps/console/\n"
+            )
+            paths = self._setup_active(tmp, brief_id, fm, dict(self._COMPLETE_PROGRESS))
+
+            result = move_to_pending_merges(paths, brief_id)
+
+            self.assertFalse(result)
+            rc = project_running_json(str(tmp))
+            self.assertIn(brief_id, {e["brief"] for e in rc["active"]})
+            self.assertNotIn(brief_id, {e["brief"] for e in rc["pending_merges"]})
+
+    def test_awaiting_review_proceeds_with_delivered(self):
+        """(b) Same brief WITH a delivered ref, gh/git mocked at the subprocess
+        boundary → the real writer proceeds; brief lands in awaiting_review[]."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            brief_id = "brief-int-c"
+            progress = dict(self._COMPLETE_PROGRESS)
+            progress["delivered"] = {
+                "nt-runway": "https://github.com/new-theory-research/nt-runway/commit/abc123def456",
+            }
+            paths = self._setup_active(tmp, brief_id, "Target-repo: nt-runway + Modal\n", progress)
+
+            with patch("shutil.which", return_value="/usr/bin/gh"), \
+                 patch("subprocess.run", new=_fake_subprocess_run(gh_rc=0)):
+                result = move_to_awaiting_review(paths, brief_id, "complete")
+
+            self.assertTrue(result, "Writer must proceed when delivered ref verifies")
+            rc = project_running_json(str(tmp))
+            self.assertIn(brief_id, {e["brief"] for e in rc["awaiting_review"]})
+            self.assertNotIn(brief_id, {e["brief"] for e in rc["active"]})
+
+    def test_pending_merges_proceeds_with_delivered(self):
+        """(b) Auto-merge path: delivered ref present + verifiable → brief lands
+        in pending_merges[]."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            brief_id = "brief-int-d"
+            progress = dict(self._COMPLETE_PROGRESS)
+            progress["delivered"] = {
+                "nt-runway": "https://github.com/new-theory-research/nt-runway/commit/abc123def456",
+            }
+            paths = self._setup_active(tmp, brief_id, "Target-repo: nt-runway\n", progress)
+
+            with patch("shutil.which", return_value="/usr/bin/gh"), \
+                 patch("subprocess.run", new=_fake_subprocess_run(gh_rc=0)):
+                result = move_to_pending_merges(paths, brief_id)
+
+            self.assertTrue(result)
+            rc = project_running_json(str(tmp))
+            self.assertIn(brief_id, {e["brief"] for e in rc["pending_merges"]})
+
+    def test_portal_only_with_annotation_never_gated(self):
+        """(c) Real string `Target-repo: portal (apps/docs)` (brief-231) → the
+        annotation must NOT gate a portal-only brief; transition proceeds with
+        no delivered field at all."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            brief_id = "brief-int-e"
+            paths = self._setup_active(tmp, brief_id, "Target-repo: portal (apps/docs)\n",
+                                       dict(self._COMPLETE_PROGRESS))
+
+            result = move_to_awaiting_review(paths, brief_id, "complete")
+
+            self.assertTrue(result, "portal (apps/docs) is portal-only — must never gate")
+            rc = project_running_json(str(tmp))
+            self.assertIn(brief_id, {e["brief"] for e in rc["awaiting_review"]})
+
+    def test_move_to_eval_legacy_path_is_gated(self):
+        """Fast-follow (a): move_to_eval routes into awaiting_review too — the
+        legacy path must run the same gate, not stay an unguarded back door."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            brief_id = "brief-int-f"
+            paths = self._setup_active(tmp, brief_id, "Target-repo: nt-runway\n",
+                                       dict(self._COMPLETE_PROGRESS))
+
+            result = move_to_eval(paths, brief_id)
+
+            self.assertFalse(result, "move_to_eval must refuse cross-repo briefs without delivered")
+            rc = project_running_json(str(tmp))
+            self.assertIn(brief_id, {e["brief"] for e in rc["active"]})
 
 
 if __name__ == "__main__":

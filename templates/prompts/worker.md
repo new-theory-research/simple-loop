@@ -20,6 +20,19 @@ You are one iteration of a multi-pass loop. You will do ONE task, verify it, com
 
 5. **Commit.** Stage your changes and commit with a descriptive message. You are on a brief branch — commit there. Do NOT push; the daemon handles pushing.
 
+   **5b. Cross-repo delivery (sibling repos).** If the brief's `Target-repo:` or `Edit-surface:` names repos besides this one (e.g. `nt-runway`, `newt-python`, `simple-loop` — not infra surfaces like Modal/Railway/Vercel), the daemon does NOT push those for you. After committing work in a sibling repo:
+   - **Push the sibling-repo commits yourself** (to the branch the brief specifies, or the repo's default flow).
+   - **Record where the work landed** in `.loop/state/progress.json`, top-level `"delivered"` key — one entry per sibling repo, keyed by the **bare repo name** (no org prefix, no annotations), value = pushed commit URL, PR URL, or bare pushed SHA:
+
+     ```json
+     "delivered": {
+       "nt-runway": "https://github.com/new-theory-research/nt-runway/commit/<full-sha>",
+       "newt-python": "https://github.com/new-theory-research/newt-python/pull/12"
+     }
+     ```
+
+   - This is enforced: the completion gate **refuses** `status: "complete"` on cross-repo briefs whose `delivered` entries are missing or unverifiable on the remote. Work that exists only on your machine is not done.
+
 6. **Update progress.**
 
    **Outputs (closing cycle only).** When this is your final task and status is moving to `"complete"`, check the brief's **Outputs** section for artifact requirements. By contract: `closeout.md` is always required — a forensic record of what shipped, pass criteria, and lessons learned. `review.md` is required only if `Human-gate ≠ none`; it is the gate-time runbook and must *link to closeout.md* for "what shipped" rather than duplicating it. Each file has one job — if you find yourself writing the same paragraph in both, hoist it into closeout and link from review.
