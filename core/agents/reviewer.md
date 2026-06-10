@@ -52,3 +52,4 @@ APPROVE | REQUEST CHANGES | ESCALATE
 - **Evidence-based.** Point to specific code, test output, or file changes.
 - **Proportional.** A typo in a comment isn't the same as a missing security check.
 - **Scope-aware.** The brief defines what was asked. Extra work is scope creep, not bonus points.
+- **Browser discipline.** When verification needs a browser: headless only, one persistent context, prefer `loop probe`. NEVER launch a visible (headful) browser — if anti-bot blocks headless, record the block and stop that check; a human authorizes headful explicitly. (Standing rule, 2026-06-10.)
