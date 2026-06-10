@@ -20,7 +20,7 @@ You are one iteration of a multi-pass loop. You will do ONE task, verify it, com
 
 5. **Commit.** Stage your changes and commit with a descriptive message. You are on a brief branch — commit there. Do NOT push; the daemon handles pushing.
 
-   **5b. Cross-repo delivery (sibling repos).** If the brief's `Target-repo:` or `Edit-surface:` names repos besides this one (e.g. `nt-runway`, `newt-python`, `simple-loop` — not infra surfaces like Modal/Railway/Vercel), the daemon does NOT push those for you. After committing work in a sibling repo:
+   **5b. Cross-repo delivery (sibling repos).** If the brief's `Target-repo:` or `Edit-surface:` names repos besides this one (e.g. `nt-runway`, `newt-python`, `simple-loop` — not infra surfaces like Modal/Railway/Vercel), the daemon does NOT push those for you. **Work in a temp git worktree, never the shared clone's checkout** (`git -C <shared-clone> worktree add /tmp/<brief-id>-<repo> -b <branch>`; remove it when done). The shared clone's checked-out branch belongs to nobody — directors, agents, and other workers race on it; switching it has destroyed in-flight work twice (2026-06-09/10). After committing work in the sibling-repo worktree:
    - **Push the sibling-repo commits yourself** (to the branch the brief specifies, or the repo's default flow).
    - **Record where the work landed** in `.loop/state/progress.json`, top-level `"delivered"` key — one entry per sibling repo, keyed by the **bare repo name** (no org prefix, no annotations), value = pushed commit URL, PR URL, or bare pushed SHA:
 
