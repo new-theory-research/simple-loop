@@ -75,20 +75,39 @@ def _config_remote(project_dir):
 
 # ─── Auto-merge primitives ───────────────────────────────────────────
 
-AUTO_MERGE_LINE_RE = re.compile(r"^\s*\*\*Auto-merge:\*\*\s*(\S+)", re.IGNORECASE)
+# Match both YAML-frontmatter form (`Auto-merge: true`) and legacy bold-markdown
+# form (`**Auto-merge:** true`). Pre-fix this only matched the bold form, so every
+# YAML-frontmatter card (brief-108+ convention) silently fell through to flag=False.
+# Live receipt: brief-250 frontmatter `Auto-merge: true`, running.json dispatch
+# record carried auto_merge:false — routed to awaiting_review instead of auto-merge.
+AUTO_MERGE_LINE_RE = re.compile(
+    r"^\s*(?:\*\*Auto-merge:\*\*|Auto-merge:)\s*(\S+)", re.IGNORECASE
+)
 
 
 def parse_auto_merge_flag(brief_content):
-    """Return True iff brief text has `**Auto-merge:** true` in frontmatter.
+    """Return True iff brief text has `Auto-merge: true` (YAML or bold-markdown form).
 
-    Absent or any non-`true` value → False. Case-insensitive on the key and value.
+    Parses YAML-frontmatter form (`Auto-merge: true`) first; legacy bold-markdown
+    form (`**Auto-merge:** true`) is accepted as fallback. Both forms are matched by
+    AUTO_MERGE_LINE_RE. Absent or any non-`true` value → False. Case-insensitive on
+    key and value. Unrecognized non-boolean value emits a loud stderr warning.
     """
     if not brief_content:
         return False
     for line in brief_content.splitlines():
         m = AUTO_MERGE_LINE_RE.match(line)
         if m:
-            return m.group(1).strip().lower().strip('"').strip("'") == "true"
+            val = m.group(1).strip().lower().strip('"').strip("'")
+            if val in ("true", "false"):
+                return val == "true"
+            # Unrecognized value — warn loudly; treat as False
+            print(
+                f"WARNING: unrecognized Auto-merge value '{val}'; "
+                f"expected true/false; treating as false",
+                file=sys.stderr,
+            )
+            return False
     return False
 
 

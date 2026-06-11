@@ -25,12 +25,24 @@ import time
 
 
 REVIEW_CYCLE_RE = re.compile(r"-cycle-(\d+)\.md$")
-AUTO_MERGE_LINE_RE = re.compile(r"^\s*\*\*Auto-merge:\*\*\s*(\S+)", re.IGNORECASE)
-# Brief-014: capture everything after **Depends-on:** so comma-separated lists
+# Each key below matches both YAML-frontmatter form (`Key: value`) and legacy
+# bold-markdown form (`**Key:** value`). Pre-fix these only matched the bold form,
+# silently misparsing every YAML-frontmatter card (brief-108+ convention). Same
+# dual-format fix applied to all `**Key:**` parsers in this module.
+AUTO_MERGE_LINE_RE = re.compile(
+    r"^\s*(?:\*\*Auto-merge:\*\*|Auto-merge:)\s*(\S+)", re.IGNORECASE
+)
+# Brief-014: capture everything after Depends-on: so comma-separated lists
 # parse. `(.+)` (not `(\S+)`) picks up the full value; splitting happens below.
-DEPENDS_ON_LINE_RE = re.compile(r"^\s*\*\*Depends-on:\*\*\s*(.+?)\s*$", re.IGNORECASE)
-DEPENDS_ON_SECRETS_LINE_RE = re.compile(r"^\s*\*\*Depends-on-secrets:\*\*\s*(.+?)\s*$", re.IGNORECASE)
-CYCLE_WALL_TIME_SECS_LINE_RE = re.compile(r"^\s*\*\*Cycle-wall-time-secs:\*\*\s*(\d+)\s*$", re.IGNORECASE)
+DEPENDS_ON_LINE_RE = re.compile(
+    r"^\s*(?:\*\*Depends-on:\*\*|Depends-on:)\s*(.+?)\s*$", re.IGNORECASE
+)
+DEPENDS_ON_SECRETS_LINE_RE = re.compile(
+    r"^\s*(?:\*\*Depends-on-secrets:\*\*|Depends-on-secrets:)\s*(.+?)\s*$", re.IGNORECASE
+)
+CYCLE_WALL_TIME_SECS_LINE_RE = re.compile(
+    r"^\s*(?:\*\*Cycle-wall-time-secs:\*\*|Cycle-wall-time-secs:)\s*(\d+)\s*$", re.IGNORECASE
+)
 # Brief-id shape: `brief-NNN` or `brief-NNN-slug` (slug may itself contain hyphens),
 # with an optional single letter-suffix on the number for sibling briefs
 # (`brief-108a`, `brief-253a-nt0-rename-producer`) — an established portal
