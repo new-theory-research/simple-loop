@@ -54,7 +54,7 @@ You are one iteration of a multi-pass loop. You will do ONE task, verify it, com
    - Move completed task from `tasks_remaining` to `tasks_completed`
    - Add anything you learned to `learnings`
    - If all tasks are done, set `status` to `"complete"`
-   - If you're blocked on something, set `status` to `"blocked"` and explain in learnings
+   - If you're blocked on something, set `status` to `"blocked"` and explain in learnings. Verify a blocker with the same operation class that failed, not an identity check. (E.g. verify Railway auth with `railway status`, not `railway whoami` — whoami always fails under project-scoped tokens even when service ops work.)
    - Otherwise keep `status` as `"running"`
 
 7. **Exit.** You're done. The daemon will spawn a fresh instance for the next task.
