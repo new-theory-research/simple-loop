@@ -317,6 +317,109 @@ class TestProjectRunningJson(unittest.TestCase):
             self.assertEqual(result[k], [])
 
 
+# ── Re-queue generation scoping (brief-249 re-queue bounce) ──────────
+#
+# Completed/approved events from BEFORE the latest dispatched event are a
+# previous generation. A re-dispatched brief must project as active — not get
+# re-bucketed into awaiting_review by its own stale completion, which leaves
+# the daemon seeing no active brief and never spawning a worker.
+
+class TestRequeueGenerationScoping(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_redispatch_after_completion_projects_active_not_awaiting_review(self):
+        # brief-249 shape: completed blocked-on-human, human cleared it,
+        # card re-queued, daemon re-dispatched. Stale completed event must
+        # not pull the fresh dispatch back into awaiting_review.
+        _make_project(
+            self.tmp,
+            cards=[("brief-249", "active")],
+            events=[
+                {"ts": "T1", "event": "dispatched", "brief": "brief-249",
+                 "branch": "brief-249", "worker_slot": 0},
+                {"ts": "T2", "event": "completed", "brief": "brief-249",
+                 "kind": "blocked-on-human",
+                 "reason": "needs a human to provision the API key"},
+                {"ts": "T3", "event": "dispatched", "brief": "brief-249",
+                 "branch": "brief-249", "worker_slot": 1},
+            ],
+        )
+        result = project_running_json(self.tmp)
+        self.assertEqual(result["awaiting_review"], [])
+        self.assertEqual(result["pending_merges"], [])
+        self.assertEqual(len(result["active"]), 1)
+        e = result["active"][0]
+        self.assertEqual(e["brief"], "brief-249")
+        # Active entry reflects the CURRENT generation's dispatch.
+        self.assertEqual(e["dispatched_at"], "T3")
+        self.assertEqual(e["worker_slot"], 1)
+
+    def test_second_generation_completion_carries_second_reason(self):
+        _make_project(
+            self.tmp,
+            cards=[("brief-249", "active")],
+            events=[
+                {"ts": "T1", "event": "dispatched", "brief": "brief-249"},
+                {"ts": "T2", "event": "completed", "brief": "brief-249",
+                 "kind": "blocked-on-human", "reason": "first-generation reason"},
+                {"ts": "T3", "event": "dispatched", "brief": "brief-249"},
+                {"ts": "T4", "event": "completed", "brief": "brief-249",
+                 "kind": "complete", "reason": "second-generation reason"},
+            ],
+        )
+        result = project_running_json(self.tmp)
+        self.assertEqual(result["active"], [])
+        self.assertEqual(len(result["awaiting_review"]), 1)
+        e = result["awaiting_review"][0]
+        self.assertEqual(e["completed_at"], "T4")
+        self.assertEqual(e["kind"], "complete")
+        self.assertEqual(e["reason"], "second-generation reason")
+
+    def test_approval_within_same_generation_still_pending_merges(self):
+        _make_project(
+            self.tmp,
+            cards=[("brief-013", "active")],
+            events=[
+                {"ts": "T1", "event": "dispatched", "brief": "brief-013"},
+                {"ts": "T2", "event": "completed", "brief": "brief-013",
+                 "kind": "complete", "auto_merge": False},
+                {"ts": "T3", "event": "approved", "brief": "brief-013"},
+            ],
+        )
+        result = project_running_json(self.tmp)
+        self.assertEqual(result["active"], [])
+        self.assertEqual(result["awaiting_review"], [])
+        self.assertEqual(len(result["pending_merges"]), 1)
+        self.assertEqual(result["pending_merges"][0]["approved_at"], "T3")
+
+    def test_stale_approval_from_previous_generation_ignored(self):
+        # Approval before the re-dispatch belongs to the old generation —
+        # the new run's completion must land in awaiting_review, not get
+        # auto-promoted to pending_merges by the stale approval.
+        _make_project(
+            self.tmp,
+            cards=[("brief-014", "active")],
+            events=[
+                {"ts": "T1", "event": "dispatched", "brief": "brief-014"},
+                {"ts": "T2", "event": "completed", "brief": "brief-014",
+                 "kind": "complete"},
+                {"ts": "T3", "event": "approved", "brief": "brief-014"},
+                {"ts": "T4", "event": "dispatched", "brief": "brief-014"},
+                {"ts": "T5", "event": "completed", "brief": "brief-014",
+                 "kind": "complete"},
+            ],
+        )
+        result = project_running_json(self.tmp)
+        self.assertEqual(result["pending_merges"], [])
+        self.assertEqual(len(result["awaiting_review"]), 1)
+        self.assertEqual(result["awaiting_review"][0]["completed_at"], "T5")
+
+
 # ── Append-event tests ────────────────────────────────────────────────
 
 class TestAppendEvent(unittest.TestCase):

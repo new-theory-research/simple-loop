@@ -184,23 +184,43 @@ def _canonical_brief_file(brief_id):
     return f"wiki/briefs/cards/{brief_id}/index.md"
 
 
+def _current_generation(events_for_brief):
+    """Suffix of events starting at the LAST `dispatched` event — the current
+    generation. A re-queued brief gets a fresh `dispatched` event; completed/
+    approved events from before it belong to a previous generation and must not
+    bucket the new run (brief-249 re-queue bounce, 2026-06-11: stale completed
+    event projected a freshly re-dispatched brief into awaiting_review, so the
+    worker never spawned). No `dispatched` event → full history (backfill).
+    """
+    last = None
+    for i, e in enumerate(events_for_brief):
+        if e.get("event") == "dispatched":
+            last = i
+    if last is None:
+        return events_for_brief
+    return events_for_brief[last:]
+
+
 def _dispatched_event(events_for_brief):
+    # Last dispatched event = the current generation's dispatch (re-queued
+    # briefs are dispatched more than once).
+    last = None
     for e in events_for_brief:
         if e.get("event") == "dispatched":
-            return e
-    return None
+            last = e
+    return last
 
 
 def _completed_event(events_for_brief):
     last = None
-    for e in events_for_brief:
+    for e in _current_generation(events_for_brief):
         if e.get("event") == "completed":
             last = e
     return last
 
 
 def _approved_event(events_for_brief):
-    for e in events_for_brief:
+    for e in _current_generation(events_for_brief):
         if e.get("event") == "approved":
             return e
     return None
