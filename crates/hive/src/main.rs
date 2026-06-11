@@ -479,6 +479,60 @@ fn render_hive<'a>(app: &App) -> Text<'a> {
         }
     }
 
+    // External commits on main row.
+    {
+        let em = &h.external_main;
+        let ext_line = if em.error {
+            Line::from(vec![
+                Span::styled("External on main: ", Style::default().fg(MUTED)),
+                Span::styled("?", Style::default().fg(MUTED)),
+            ])
+        } else if em.count_external == 0 {
+            let mut spans = vec![
+                Span::styled("External on main: ", Style::default().fg(MUTED)),
+                Span::styled("0", Style::default().fg(MUTED)),
+            ];
+            if em.allowlist_defaults_only {
+                spans.push(Span::styled(
+                    " (allowlist=defaults-only)",
+                    Style::default().fg(MUTED),
+                ));
+            }
+            Line::from(spans)
+        } else {
+            let mut spans = vec![
+                Span::styled("External on main: ", Style::default().fg(MUTED)),
+                Span::styled(
+                    em.count_external.to_string(),
+                    Style::default().fg(CORAL).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if let Some(last) = &em.last_external {
+                spans.push(Span::styled(" (last: ", Style::default().fg(MUTED)));
+                spans.push(Span::styled(
+                    last.sha_short.clone(),
+                    Style::default().fg(GOLD),
+                ));
+                spans.push(Span::styled(" ", Style::default().fg(MUTED)));
+                spans.push(Span::styled(
+                    last.author.clone(),
+                    Style::default().fg(CORAL),
+                ));
+                spans.push(Span::styled(" \u{2014} ", Style::default().fg(MUTED)));
+                spans.push(Span::styled(last.subject.clone(), Style::default().fg(MUTED)));
+                spans.push(Span::styled(")", Style::default().fg(MUTED)));
+            }
+            if em.allowlist_defaults_only {
+                spans.push(Span::styled(
+                    " (allowlist=defaults-only)",
+                    Style::default().fg(MUTED),
+                ));
+            }
+            Line::from(spans)
+        };
+        lines.push(ext_line);
+    }
+
     Text::from(lines)
 }
 

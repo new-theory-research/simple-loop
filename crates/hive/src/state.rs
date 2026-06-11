@@ -3490,6 +3490,7 @@ mod tests {
             interval_mode: IntervalMode::Idle,
             daemon_started_at: None,
             requeued_briefs: vec![],
+            external_main: ExternalMain { count_external: 0, last_external: None, error: false, allowlist_defaults_only: false },
         };
         let c = hs.heartbeat_countdown().expect("should produce countdown");
         assert!(c.starts_with("next ~"), "got: {}", c);
@@ -3507,6 +3508,7 @@ mod tests {
             interval_mode: IntervalMode::Idle,
             daemon_started_at: None,
             requeued_briefs: vec![],
+            external_main: ExternalMain { count_external: 0, last_external: None, error: false, allowlist_defaults_only: false },
         };
         let c = hs.heartbeat_countdown().expect("should produce countdown");
         assert!(c.starts_with("overdue"), "got: {}", c);
@@ -3524,6 +3526,7 @@ mod tests {
             interval_mode: IntervalMode::Active,
             daemon_started_at: None,
             requeued_briefs: vec![],
+            external_main: ExternalMain { count_external: 0, last_external: None, error: false, allowlist_defaults_only: false },
         };
         let c = hs.heartbeat_countdown().expect("should produce countdown");
         assert_eq!(c, "busy cycling");
@@ -3539,6 +3542,7 @@ mod tests {
             interval_mode: IntervalMode::Unknown,
             daemon_started_at: None,
             requeued_briefs: vec![],
+            external_main: ExternalMain { count_external: 0, last_external: None, error: false, allowlist_defaults_only: false },
         };
         assert!(hs.heartbeat_countdown().is_none());
     }
