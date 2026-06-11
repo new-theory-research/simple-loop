@@ -344,7 +344,16 @@ run_worker_iteration() {
     daemon_log "WORKER: starting iteration for $brief_id in worktree"
 
     # Pull latest into worktree (doesn't touch main tree)
-    git -C "$WORKTREE_DIR" pull --ff-only "$GIT_REMOTE" "$branch" -q 2>/dev/null || true
+    if ! git -C "$WORKTREE_DIR" pull --ff-only "$GIT_REMOTE" "$branch" -q 2>/dev/null; then
+        # Issue #19: don't swallow a diverged worktree. No auto-heal here —
+        # the cycle-start rebase below handles staleness; this is visibility.
+        # A missing remote ref (fresh branch, never pushed) stays quiet.
+        local _wt_counts
+        _wt_counts=$(git -C "$WORKTREE_DIR" rev-list --left-right --count "HEAD...${GIT_REMOTE}/${branch}" 2>/dev/null) || _wt_counts=""
+        if [ -n "$_wt_counts" ]; then
+            daemon_log "WORKER: SYNC FAILED for $branch worktree — diverged ($(printf '%s' "$_wt_counts" | awk '{print $1}') ahead / $(printf '%s' "$_wt_counts" | awk '{print $2}') behind)"
+        fi
+    fi
 
     # ── Snapshot dirty progress.json before rebase (issue #5) ────────────────
     # Workers sometimes leave .loop/state/progress.json uncommitted at cycle
@@ -603,7 +612,14 @@ run_validator_iteration() {
     fi
 
     # Pull latest into worktree
-    git -C "$WORKTREE_DIR" pull --ff-only "$GIT_REMOTE" "$branch" -q 2>/dev/null || true
+    if ! git -C "$WORKTREE_DIR" pull --ff-only "$GIT_REMOTE" "$branch" -q 2>/dev/null; then
+        # Issue #19: same loud-log as the worker pull site; no auto-heal here.
+        local _wt_counts
+        _wt_counts=$(git -C "$WORKTREE_DIR" rev-list --left-right --count "HEAD...${GIT_REMOTE}/${branch}" 2>/dev/null) || _wt_counts=""
+        if [ -n "$_wt_counts" ]; then
+            daemon_log "VALIDATOR: SYNC FAILED for $branch worktree — diverged ($(printf '%s' "$_wt_counts" | awk '{print $1}') ahead / $(printf '%s' "$_wt_counts" | awk '{print $2}') behind)"
+        fi
+    fi
 
     local PROGRESS_FILE="$WORKTREE_DIR/.loop/state/progress.json"
     if [ ! -f "$PROGRESS_FILE" ]; then
@@ -1144,6 +1160,94 @@ write_heartbeat('$HEARTBEAT_FILE', pid=$$, last_event='$event')
 " 2>/dev/null || true
 }
 
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Project-dir sync (issue #19)                                    ║
+# ╚══════════════════════════════════════════════════════════════════╝
+#
+# The per-tick sync of the daemon's project checkout used to be
+# `git pull --ff-only ... || true`. One silently-failed bookkeeping push
+# left a local commit stranded; from then on the ff-only pull failed
+# silently every tick and the daemon projected the whole queue from a
+# frozen checkout (2026-06-11 portal: ghost-active brief ~40 min after
+# its card was parked on origin). Cards are the daemon's source of truth
+# — sync failures must be loud.
+#
+#   1. ff-only pull succeeds → reset failure counter, done.
+#   2. Diverged and ALL local-ahead commits carry the `loop:` prefix
+#      (pure daemon bookkeeping) → auto-heal: stash tracked changes,
+#      pull --rebase, push, pop. Abort-safe: any rebase failure aborts
+#      and falls through to (3).
+#   3. Otherwise: log `SYNC FAILED: diverged (N ahead / M behind)` every
+#      tick it persists; after 3 consecutive failures write escalate.json
+#      (same shape as actions.py push_with_escalate) instead of ticking
+#      silently on stale cards.
+#
+# Runs with cwd = PROJECT_DIR, on the main branch (caller checks), after
+# fetch. Tested by lib/tests/sync-diverged-checkout.sh, which extracts
+# this function verbatim — keep its closing brace as the only column-0 `}`.
+
+SYNC_FAIL_COUNT=0
+
+sync_project_checkout() {
+    if git pull --ff-only "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null; then
+        SYNC_FAIL_COUNT=0
+        return 0
+    fi
+
+    local upstream="${GIT_REMOTE}/${GIT_MAIN_BRANCH}"
+    local counts ahead behind
+    counts=$(git rev-list --left-right --count "HEAD...$upstream" 2>/dev/null) || counts=""
+    ahead=$(printf '%s' "$counts" | awk '{print $1}')
+    behind=$(printf '%s' "$counts" | awk '{print $2}')
+    case "$ahead" in ''|*[!0-9]*) ahead=0 ;; esac
+    case "$behind" in ''|*[!0-9]*) behind=0 ;; esac
+
+    # Auto-heal the common case: every local-ahead commit is daemon
+    # bookkeeping (`loop:` prefix) — replaying those onto origin is safe.
+    local non_loop=1
+    if [ "$ahead" -gt 0 ]; then
+        non_loop=$(git log --format=%s "$upstream..HEAD" 2>/dev/null | grep -v '^loop:' | grep -c . || true)
+    fi
+    if [ "$ahead" -gt 0 ] && [ "$non_loop" -eq 0 ]; then
+        local stashed=false
+        if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+            git stash push -q -m "loop: sync auto-heal stash (issue #19)" 2>/dev/null && stashed=true
+        fi
+        if git pull --rebase "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null; then
+            if [ "$stashed" = true ]; then git stash pop -q 2>/dev/null || true; fi
+            if git push "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null; then
+                daemon_log "GIT SYNC: auto-healed — rebased $ahead loop: commit(s) onto $upstream and pushed"
+            else
+                daemon_log "GIT SYNC: rebased $ahead loop: commit(s) but push failed — checkout fresh, will retry push next tick"
+            fi
+            SYNC_FAIL_COUNT=0
+            return 0
+        fi
+        git rebase --abort 2>/dev/null || true
+        if [ "$stashed" = true ]; then git stash pop -q 2>/dev/null || true; fi
+        daemon_log "GIT SYNC: rebase auto-heal failed — aborted, falling through to loud failure"
+    fi
+
+    SYNC_FAIL_COUNT=$((SYNC_FAIL_COUNT + 1))
+    daemon_log "SYNC FAILED: diverged ($ahead ahead / $behind behind) — daemon checkout is stale (consecutive: $SYNC_FAIL_COUNT)"
+    if [ "$SYNC_FAIL_COUNT" -ge 3 ] && [ ! -f "$SIGNALS_DIR/escalate.json" ]; then
+        mkdir -p "$SIGNALS_DIR"
+        printf '%s\n' \
+            '{' \
+            '  "type": "sync_failed",' \
+            '  "reason": "project_dir_sync_diverged",' \
+            "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"," \
+            "  \"remote\": \"$GIT_REMOTE\"," \
+            "  \"branch\": \"$GIT_MAIN_BRANCH\"," \
+            "  \"ahead\": $ahead," \
+            "  \"behind\": $behind," \
+            "  \"consecutive_failures\": $SYNC_FAIL_COUNT" \
+            '}' > "$SIGNALS_DIR/escalate.json"
+        daemon_log "GIT SYNC: escalate.json written after $SYNC_FAIL_COUNT consecutive failed syncs"
+    fi
+    return 1
+}
+
 while true; do
     TURN=$((TURN + 1))
     write_heartbeat "tick_start"
@@ -1223,8 +1327,9 @@ while true; do
 
     CURRENT_BRANCH=$(git branch --show-current 2>/dev/null)
     if [ "$CURRENT_BRANCH" = "$GIT_MAIN_BRANCH" ]; then
-        # Only pull if we're on main — don't disturb user's branch
-        git pull --ff-only "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
+        # Only pull if we're on main — don't disturb user's branch.
+        # Issue #19: loud + self-healing; never `|| true` the truth surface.
+        sync_project_checkout || true
     else
         daemon_log "GIT SYNC: main tree on '$CURRENT_BRANCH' (not $GIT_MAIN_BRANCH) — fetch only"
     fi
