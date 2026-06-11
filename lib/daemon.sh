@@ -458,13 +458,25 @@ with open('$PROGRESS_FILE', 'w') as f:
     fi
 
     # Tier: worker = per-brief (see top-of-file model tier policy).
-    # Default sonnet; override from brief frontmatter **Model:** line (e.g. "opus").
+    # Default sonnet; override from brief frontmatter Model: line (YAML) or
+    # **Model:** line (legacy bold-markdown).  The Python parser handles both;
+    # bash grep below is a compat fallback for the bold form only.
+    # Receipt 2026-06-11: bash grep matched only bold form, silently ignoring
+    # every YAML-frontmatter card (brief-249 `Model: opus` ran sonnet worker).
     local WORKER_MODEL="sonnet"
     local brief_file_path
     brief_file_path=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('brief_file', ''))" 2>/dev/null)
     if [ -n "$brief_file_path" ] && [ -f "$WORKTREE_DIR/$brief_file_path" ]; then
         local brief_model
-        brief_model=$(grep -m1 '^\*\*Model:\*\*' "$WORKTREE_DIR/$brief_file_path" 2>/dev/null | sed 's/.*\*\*Model:\*\*[[:space:]]*//' | awk '{print $1}' | cut -d'(' -f1 | cut -d',' -f1 | tr '[:upper:]' '[:lower:]')
+        # Primary: Python parser — handles both `Model: opus` (YAML frontmatter)
+        # and `**Model:** opus` (bold-markdown).  Validates against allowed set;
+        # emits a warning and falls back to sonnet on unrecognized values.
+        brief_model=$(python3 "$DAEMON_LIB_DIR/actions.py" parse-worker-model "$WORKTREE_DIR/$brief_file_path" 2>/dev/null)
+        # Fallback: legacy bash grep for bold-markdown form (defensive; Python
+        # already covers this, but keeps the old path alive in case of import error).
+        if [ -z "$brief_model" ]; then
+            brief_model=$(grep -m1 '^\*\*Model:\*\*' "$WORKTREE_DIR/$brief_file_path" 2>/dev/null | sed 's/.*\*\*Model:\*\*[[:space:]]*//' | awk '{print $1}' | cut -d'(' -f1 | cut -d',' -f1 | tr '[:upper:]' '[:lower:]')
+        fi
         if [ -n "$brief_model" ]; then
             WORKER_MODEL="$brief_model"
             if [ "$brief_model" != "sonnet" ]; then

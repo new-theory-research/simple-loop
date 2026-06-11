@@ -135,6 +135,13 @@ def load_running(paths):
 PARALLEL_SAFE_LINE_RE = re.compile(r"^\s*(?:\*\*Parallel-safe:\*\*|Parallel-safe:)\s*(\S+)", re.IGNORECASE)
 EDIT_SURFACE_LINE_RE = re.compile(r"^\s*(?:\*\*Edit-surface:\*\*|Edit-surface:)\s*(.*?)\s*$", re.IGNORECASE)
 TARGET_REPO_LINE_RE = re.compile(r"^\s*(?:\*\*Target-repo:\*\*|Target-repo:)\s*(.*?)\s*$", re.IGNORECASE)
+# Match both YAML-frontmatter form (`Model: opus`) and legacy bold-markdown form
+# (`**Model:** opus`). YAML form was added with the brief-108 card collapse; the
+# original bash grep only matched the bold form, silently ignoring every YAML card
+# (live receipt 2026-06-11: brief-249 frontmatter `Model: opus`, worker ran sonnet).
+MODEL_LINE_RE = re.compile(r"^\s*(?:\*\*Model:\*\*|Model:)\s*(\S+)", re.IGNORECASE)
+_ALLOWED_WORKER_MODELS = {"sonnet", "opus", "haiku"}
+_DEFAULT_WORKER_MODEL = "sonnet"
 
 
 def _normalize_surface_path(p):
@@ -2015,6 +2022,46 @@ def check_depends_on_secrets(paths):
 _DEFAULT_CYCLE_WALL_TIME_SECS = 5400
 
 
+def parse_worker_model(brief_file_path):
+    """Read the Model: frontmatter field from a brief card.
+
+    Matches both YAML-frontmatter form (`Model: opus`) and legacy bold-markdown
+    form (`**Model:** opus`), normalises to lowercase, validates against the
+    allowed set {sonnet, opus, haiku}.
+
+    Prints the resolved model name — callers use the printed value.
+    Unrecognized value: prints 'sonnet' and emits a warning to stderr so a
+    typo'd card never silently invokes the wrong model (issue #21 enum lesson).
+    Prints nothing (empty) if no Model line is present; caller uses its default.
+
+    Called by daemon.sh as:
+        python3 actions.py parse-worker-model <absolute_brief_path>
+    """
+    if not brief_file_path or not os.path.exists(brief_file_path):
+        return True
+    try:
+        with open(brief_file_path) as f:
+            for line in f:
+                m = MODEL_LINE_RE.match(line)
+                if m:
+                    raw = m.group(1).strip().lower()
+                    # Strip trailing punctuation artefacts (parens, commas)
+                    raw = raw.split("(")[0].split(",")[0].strip()
+                    if raw in _ALLOWED_WORKER_MODELS:
+                        print(raw)
+                    else:
+                        print(_DEFAULT_WORKER_MODEL)
+                        print(
+                            f"WARNING: unrecognized Model value '{raw}' in {brief_file_path}; "
+                            f"allowed: {sorted(_ALLOWED_WORKER_MODELS)}; falling back to {_DEFAULT_WORKER_MODEL}",
+                            file=sys.stderr,
+                        )
+                    return True
+    except (IOError, OSError) as e:
+        print(f"parse-worker-model error: {e}", file=sys.stderr)
+    return True
+
+
 def parse_cycle_wall_time_secs(paths):
     """Read Cycle-wall-time-secs frontmatter from pending-dispatch brief.
 
@@ -2090,6 +2137,13 @@ def ensure_progress_for_brief(progress_file: str, brief_id: str, brief_file: str
 # ─── Main ─────────────────────────────────────────────────────────────
 
 def main():
+    # parse-worker-model takes a single brief file path, not a project_dir.
+    # Handle before the generic argc guard to avoid confusing error output.
+    if len(sys.argv) >= 2 and sys.argv[1] == "parse-worker-model":
+        brief_path = sys.argv[2] if len(sys.argv) >= 3 else ""
+        parse_worker_model(brief_path)
+        sys.exit(0)
+
     BRIEF_ACTIONS = ("move-to-eval", "move-to-pending-merges", "move-to-awaiting-review",
                      "approve-brief", "reject-brief", "close-brief", "ensure-progress-for-brief")
 
