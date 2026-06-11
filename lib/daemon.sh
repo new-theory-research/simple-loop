@@ -271,8 +271,12 @@ Trigger reason: $reason" \
             fi
         fi
 
-        # Push after queen (it may have committed state changes)
-        git -C "$PROJECT_DIR" push "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
+        # Push after queen (it may have committed state changes). Non-fatal
+        # but never silent (issue #19): a swallowed failure here strands a
+        # loop: commit and the divergence only surfaces as next-tick SYNC
+        # FAILED lines with no root cause attached.
+        git -C "$PROJECT_DIR" push "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null \
+            || daemon_log "QUEEN: state push failed — loop: commit stranded; next-tick sync will log/auto-heal"
     fi
 
     return 0

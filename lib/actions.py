@@ -1392,7 +1392,7 @@ def dispatch(paths):
         os.path.join(project_dir, ".loop", "state", "runtime-events.jsonl"), check=False)
     git(project_dir, "commit", "-m", f"loop: project running.json (dispatch {brief})", check=False)
 
-    git(project_dir, "push", remote, main_branch, check=False)
+    push_bookkeeping(paths, remote, main_branch, f"dispatch {brief}")
 
     # Remove queue file
     os.remove(paths["pending_dispatch"])
@@ -1573,7 +1573,7 @@ def merge(paths):
     # --- End producer-side cleanup ---
 
     signal_dedup_clear(paths, brief)
-    git(project_dir, "push", remote, main_branch, check=False)
+    push_bookkeeping(paths, remote, main_branch, f"post-merge cleanup {brief}")
 
     # Remove queue file
     os.remove(paths["pending_merge"])
@@ -1631,6 +1631,42 @@ def cleanup_worktrees(paths):
 
     log_action(paths, "cleanup", {"cleaned": cleaned})
     return True
+
+
+# ─── Bookkeeping push: non-fatal but never silent (issue #19) ────────
+#
+# Dispatch/merge bookkeeping pushes (`loop:` commits) stay non-fatal — the
+# daemon's per-tick sync_project_checkout auto-heals a stranded commit and
+# escalates after 3 consecutive failures, so failing the whole action here
+# would be worse than the disease. But silence is what let one failed push
+# freeze the daemon's checkout for 40 minutes with zero log signal: the
+# divergence only became visible when a human noticed state that "can't be."
+# Log the failure at the moment it happens, with the actual stderr, so the
+# later SYNC FAILED lines have a paper trail pointing at root cause.
+
+def push_bookkeeping(paths, remote, branch, context):
+    """Push bookkeeping commits to remote; log loudly on failure, never raise.
+
+    Returns True on success, False on failure (failure already logged to
+    stderr + log.jsonl as `push_failed_bookkeeping`).
+    """
+    r = git(paths["project_dir"], "push", remote, branch, check=False)
+    if r.returncode == 0:
+        return True
+    redacted = redact_secrets((r.stderr or "").strip())
+    print(
+        f"push failed ({context}): rc={r.returncode} {redacted} "
+        f"— local loop: commit stranded; daemon sync will log/auto-heal",
+        file=sys.stderr,
+    )
+    try:
+        log_action(paths, "push_failed_bookkeeping", {
+            "context": context, "remote": remote, "branch": branch,
+            "returncode": r.returncode, "stderr": redacted,
+        })
+    except Exception:
+        pass  # don't let a logging failure compound a push failure
+    return False
 
 
 # ─── Push with escalate-on-failure (brief-014 fix 3) ────────────────
