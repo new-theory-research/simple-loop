@@ -8,8 +8,12 @@ queue position. Returns a structured list of dispatchable brief dicts.
 CLI:
     python3 lib/queue.py <project_dir>
     Prints JSON array to stdout.
+
+    python3 lib/queue.py <project_dir> --fingerprint
+    Prints a short queue-state fingerprint (issue #17 — queen dedup key).
 """
 
+import hashlib
 import json
 import os
 import re
@@ -115,9 +119,39 @@ def enumerate_dispatchable(project_dir, running=None):
     return candidates
 
 
+def queue_fingerprint(project_dir):
+    """Cheap queue-state fingerprint for the daemon's queen dedup key (issue #17).
+
+    The queen dedup key used to be the trigger name alone, so queue mutations
+    during the TTL window were invisible — queued briefs sat undispatched for
+    up to 30 min (portal daemon, 2026-06-11). Folding this fingerprint into
+    the dedup comparison makes any queue change invalidate the dedup.
+
+    Combines goals.md stat (mtime_ns + size — also makes `touch goals.md` a
+    manual dedup-buster) with the ordered dispatchable brief ids from
+    enumerate_dispatchable(), so a new card, a status flip, a running.json
+    change, or a goals.md edit/reorder all change the fingerprint.
+    O(N cards), frontmatter reads only — cheap per daemon tick.
+    """
+    goals_path = os.path.join(project_dir, ".loop", "state", "goals.md")
+    try:
+        st = os.stat(goals_path)
+        goals_sig = "%d:%d" % (st.st_mtime_ns, st.st_size)
+    except OSError:
+        goals_sig = "missing"
+
+    ids = ",".join(c["brief"] for c in enumerate_dispatchable(project_dir))
+    raw = "%s|%s" % (goals_sig, ids)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def main():
-    project_dir = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
-    print(json.dumps(enumerate_dispatchable(project_dir), indent=2))
+    args = [a for a in sys.argv[1:] if a != "--fingerprint"]
+    project_dir = args[0] if args else os.getcwd()
+    if "--fingerprint" in sys.argv[1:]:
+        print(queue_fingerprint(project_dir))
+    else:
+        print(json.dumps(enumerate_dispatchable(project_dir), indent=2))
 
 
 if __name__ == "__main__":

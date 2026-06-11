@@ -14,7 +14,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from queue import enumerate_dispatchable
+from queue import enumerate_dispatchable, queue_fingerprint
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -212,6 +212,75 @@ class TestEnumerateDispatchable(unittest.TestCase):
         result = enumerate_dispatchable(self.tmp)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["brief"], "brief-080-queued")
+
+
+class TestQueueFingerprint(unittest.TestCase):
+    """queue_fingerprint feeds the daemon's queen dedup key (issue #17).
+
+    WHY: the dedup key was the trigger name alone, so queue mutations during
+    the TTL window were invisible — queued briefs sat undispatched for up to
+    30 min until TTL expiry or a daemon restart (portal, 2026-06-11). Every
+    test here encodes "this queue change MUST change the fingerprint" (so the
+    dedup breaks and the queen wakes) or "no change MUST keep it stable" (so
+    idle ticks stay deduped and queen-spam stays impossible).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_stable_when_nothing_changes(self):
+        """Idle daemon, untouched queue → same fingerprint, dedup holds."""
+        _make_project(self.tmp, cards=[("brief-001-foo", "queued")],
+                      goals_order=["brief-001-foo"])
+        self.assertEqual(queue_fingerprint(self.tmp), queue_fingerprint(self.tmp))
+
+    def test_new_queued_card_changes_fingerprint(self):
+        """Filing a brief while deduped must wake the queen next tick."""
+        _make_project(self.tmp, cards=[("brief-001-foo", "queued")],
+                      goals_order=["brief-001-foo"])
+        before = queue_fingerprint(self.tmp)
+        cards_dir = os.path.join(self.tmp, "wiki", "briefs", "cards")
+        _make_card(cards_dir, "brief-002-bar", "queued")
+        self.assertNotEqual(before, queue_fingerprint(self.tmp))
+
+    def test_status_flip_to_queued_changes_fingerprint(self):
+        """The 2026-06-11 incident shape: draft cards flipped to queued."""
+        _make_project(self.tmp, cards=[("brief-003-draft", "draft")],
+                      goals_order=["brief-003-draft"])
+        before = queue_fingerprint(self.tmp)
+        cards_dir = os.path.join(self.tmp, "wiki", "briefs", "cards")
+        _make_card(cards_dir, "brief-003-draft", "queued")
+        self.assertNotEqual(before, queue_fingerprint(self.tmp))
+
+    def test_goals_md_edit_changes_fingerprint(self):
+        """goals.md mutation (the daemon's poll surface) busts the dedup."""
+        _make_project(self.tmp, cards=[("brief-001-foo", "queued")],
+                      goals_order=["brief-001-foo"])
+        before = queue_fingerprint(self.tmp)
+        goals = os.path.join(self.tmp, ".loop", "state", "goals.md")
+        with open(goals, "a") as f:
+            f.write("2. **brief-004-new** — queued by hand\n")
+        self.assertNotEqual(before, queue_fingerprint(self.tmp))
+
+    def test_dispatch_changes_fingerprint(self):
+        """A brief leaving the dispatchable set (now in active) is a queue change."""
+        _make_project(self.tmp, cards=[("brief-001-foo", "queued")],
+                      goals_order=["brief-001-foo"])
+        before = queue_fingerprint(self.tmp)
+        running_path = os.path.join(self.tmp, ".loop", "state", "running.json")
+        with open(running_path, "w") as f:
+            json.dump({"active": [{"brief": "brief-001-foo"}]}, f)
+        self.assertNotEqual(before, queue_fingerprint(self.tmp))
+
+    def test_missing_goals_md_does_not_crash(self):
+        """Fingerprint must never take the daemon down — degrade, don't raise."""
+        os.makedirs(os.path.join(self.tmp, "wiki", "briefs", "cards"), exist_ok=True)
+        fp = queue_fingerprint(self.tmp)
+        self.assertTrue(fp)
+        self.assertEqual(fp, queue_fingerprint(self.tmp))
 
 
 if __name__ == "__main__":

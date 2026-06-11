@@ -1092,6 +1092,7 @@ notify "Daemon started (PID $$)"
 TURN=0
 LAST_CONDUCTOR_TRIGGER=""
 LAST_CONDUCTOR_TRIGGER_TS=0
+LAST_QUEUE_FP=""
 LAST_ESCALATE_PRESENT=false
 HEARTBEAT_FILE="$STATE_DIR/heartbeat.json"
 
@@ -1247,6 +1248,19 @@ while true; do
                 _SHOULD_DEDUP=true
             fi
 
+            # Queue fingerprint in the dedup key (issue #17). The trigger name
+            # alone can't see queue mutations — three briefs flipped to queued
+            # on 2026-06-11 sat undispatched for ~25 min while dedup skipped on
+            # an unchanged `no_active`. Fold a cheap queue-state fingerprint
+            # (goals.md stat + ordered dispatchable ids, see queue.py) into
+            # the comparison: any queue change invalidates the dedup and the
+            # next tick invokes the queen.
+            _QUEUE_FP=$(python3 "$DAEMON_LIB_DIR/queue.py" "$PROJECT_DIR" --fingerprint 2>/dev/null || echo "fp-unavailable")
+            if [ "$_SHOULD_DEDUP" = "true" ] && [ "$_QUEUE_FP" != "$LAST_QUEUE_FP" ]; then
+                daemon_log "QUEEN: dedup invalidated — queue fingerprint changed (${LAST_QUEUE_FP:-none} → ${_QUEUE_FP})"
+                _SHOULD_DEDUP=false
+            fi
+
             # Queue-aware dedup bypass (portal-obs P1 companion). The
             # `no_active` trigger reason ignores the dispatchable queue —
             # filing a new brief while the daemon is idle doesn't change the
@@ -1275,6 +1289,10 @@ while true; do
                 CONDUCTOR_FIRED_THIS_TICK=$((CONDUCTOR_FIRED_THIS_TICK + 1))
                 LAST_CONDUCTOR_TRIGGER="$CONDUCTOR_TRIGGER"
                 LAST_CONDUCTOR_TRIGGER_TS="$_NOW"
+                # Re-stat the queue AFTER the queen ran: she may have dispatched
+                # (mutating the queue herself); stamping the post-queen state
+                # keeps her own dispatch from busting the dedup next tick.
+                LAST_QUEUE_FP=$(python3 "$DAEMON_LIB_DIR/queue.py" "$PROJECT_DIR" --fingerprint 2>/dev/null || echo "fp-unavailable")
                 DID_WORK=true
 
                 # Re-assess after queen
