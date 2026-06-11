@@ -17,7 +17,7 @@ What's the situation?
 
 - **Brief complete?** → Evaluate it. Read the diff (`git diff <main_branch>...<branch> --stat`), check quality, write evaluation to `.loop/evaluations/`. Decide: merge, fix, or escalate.
 - **Brief active and running?** → The daemon handles worker iterations. No action needed unless it's blocked.
-- **Brief blocked?** → Read the learnings. Can you unblock it, or does the human need to intervene? If stuck, write `.loop/state/signals/escalate.json`.
+- **Brief blocked?** → Read the learnings. Can you unblock it, or does the human need to intervene? If stuck, write `.loop/state/signals/escalate.json`. Re-verify a blocker with the same operation class that failed, not an identity check. (E.g. verify Railway auth with `railway status`, not `railway whoami` — whoami always fails under project-scoped tokens even when service ops work.)
 - **No active brief?** → Check goals.md for what to do next. Run `python3 ~/.local/share/simple-loop/lib/queue.py .` to get the dispatchable queue; dispatch the queue head.
 - **Nothing to do?** → Idle. That's fine.
 
