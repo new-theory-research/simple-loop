@@ -282,6 +282,28 @@ Trigger reason: $reason" \
 # ║  Worker Iteration                                               ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
+# ── WIP auto-commit (issue #18) ──────────────────────────────────────────────
+# A worker iteration that ends with uncommitted changes (wall-time kill, error,
+# or a worker that simply didn't commit) leaves the worktree dirty — and a
+# dirty worktree fails the NEXT dispatch's cycle-start rebase unconditionally,
+# routing the brief to awaiting_review for state the harness itself created
+# (brief-250, 2026-06-11: one uncommitted file, zero real conflicts). Commit
+# the dirt to the brief branch as a labeled WIP commit; the next cycle's
+# worker sees its own WIP in history and continues.
+commit_worktree_wip() {
+    local worktree_dir="$1"
+    local brief_id="$2"
+    local label="${3:-at iteration end}"
+    [ -d "$worktree_dir" ] || return 0
+    if [ -n "$(git -C "$worktree_dir" status --porcelain 2>/dev/null)" ]; then
+        git -C "$worktree_dir" add -A 2>/dev/null
+        if git -C "$worktree_dir" commit -m "[loop] $brief_id WIP auto-commit $label" -q 2>/dev/null; then
+            daemon_log "WORKER: WIP auto-commit for $brief_id ($label) — worktree was dirty"
+        fi
+    fi
+    return 0
+}
+
 run_worker_iteration() {
     local brief_id="$1"
     local branch="$2"
@@ -337,6 +359,11 @@ run_worker_iteration() {
             daemon_log "WORKER: snapshotted dirty progress.json before rebase for $brief_id"
         fi
     fi
+
+    # Belt-and-suspenders for issue #18: any remaining dirt (not just
+    # progress.json) also fails the rebase below before a real conflict is
+    # even evaluated. Commit it rather than manufacturing a rebase-block.
+    commit_worktree_wip "$WORKTREE_DIR" "$brief_id" "before cycle-start rebase"
     # ─────────────────────────────────────────────────────────────────────────
 
     # ── Rebase onto main (cycle-start, Phase 1 of brief-061) ─────────────────
@@ -502,10 +529,18 @@ with open('$PROGRESS_FILE', 'w') as f:
 
     cd "$PROJECT_DIR"
 
+    # Issue #18: every exit path (timeout, failure, success) leaves the
+    # worktree clean. Uncommitted worker WIP becomes a labeled commit on the
+    # brief branch — never a landmine for the next dispatch's rebase. On the
+    # success path below this lands in the normal push; on the timeout path
+    # it preserves mid-flight work that was previously lost.
+    commit_worktree_wip "$WORKTREE_DIR" "$brief_id" "at iteration end"
+
     # ── Timeout path ──────────────────────────────────────────────────────────
     # Watchdog touched WORKER_TIMEOUT_FLAG when the budget expired. Route to
-    # awaiting_review so a human investigates before redispatching. Already-
-    # committed work on the brief branch is preserved; mid-flight work is lost.
+    # awaiting_review so a human investigates before redispatching. Work on
+    # the brief branch is preserved — including mid-flight dirt, which the
+    # WIP auto-commit above just committed (issue #18).
     if [ -f "$WORKER_TIMEOUT_FLAG" ]; then
         rm -f "$WORKER_TIMEOUT_FLAG"
         daemon_log "WORKER: cycle wall-time exceeded ${CYCLE_WALL_TIME_SECS}s — killed worker for $brief_id cycle $iteration"
