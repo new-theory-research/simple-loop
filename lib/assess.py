@@ -31,10 +31,13 @@ AUTO_MERGE_LINE_RE = re.compile(r"^\s*\*\*Auto-merge:\*\*\s*(\S+)", re.IGNORECAS
 DEPENDS_ON_LINE_RE = re.compile(r"^\s*\*\*Depends-on:\*\*\s*(.+?)\s*$", re.IGNORECASE)
 DEPENDS_ON_SECRETS_LINE_RE = re.compile(r"^\s*\*\*Depends-on-secrets:\*\*\s*(.+?)\s*$", re.IGNORECASE)
 CYCLE_WALL_TIME_SECS_LINE_RE = re.compile(r"^\s*\*\*Cycle-wall-time-secs:\*\*\s*(\d+)\s*$", re.IGNORECASE)
-# Brief-id shape: `brief-NNN` or `brief-NNN-slug` (slug may itself contain hyphens).
+# Brief-id shape: `brief-NNN` or `brief-NNN-slug` (slug may itself contain hyphens),
+# with an optional single letter-suffix on the number for sibling briefs
+# (`brief-108a`, `brief-253a-nt0-rename-producer`) — an established portal
+# convention the parser was silently dropping from Depends-on (2026-06-11).
 # Shared by lib/lint.py — the linter's check_depends_on imports this so the daemon's
 # parser and the author-time linter agree on what counts as a real brief id.
-BRIEF_ID_RE = re.compile(r"^brief-\d+(-[\w-]+)?$")
+BRIEF_ID_RE = re.compile(r"^brief-\d+[a-z]?(-[\w-]+)?$")
 
 
 def parse_depends_on_value(raw, validate_brief_id=True):
