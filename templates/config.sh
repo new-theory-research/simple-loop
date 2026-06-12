@@ -13,3 +13,13 @@ NTFY_TOPIC=""                 # ntfy.sh topic (empty = no push notifications)
 VERIFY_CMD=""                 # Command to run after each task (e.g. npm test, cargo build)
 GIT_REMOTE="origin"
 GIT_MAIN_BRANCH="main"       # "main" or "master"
+
+# ── Concurrency (all off by default → serial, single-flight behavior) ─────────
+THROTTLE=1                    # Max concurrent in-flight briefs. 1 = serial.
+WORKER_PARALLEL=false         # true = run up to THROTTLE worker iterations
+                              # concurrently (non-blocking tick + reaper).
+                              # Requires THROTTLE>1 to overlap anything.
+SOLO_DRAIN_AFTER_SECS=0       # 0 = off. When >0 and a parallel-safe:false brief
+                              # has sat at the queue head longer than this many
+                              # seconds, hold other dispatches so the board
+                              # drains and the solo brief runs next.

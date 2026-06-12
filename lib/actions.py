@@ -1275,6 +1275,44 @@ def dispatch(paths):
     active = rc.get("active", [])
     in_flight = len(active)
 
+    # ── Drain-for-solo gate (SOLO_DRAIN_AFTER_SECS; default off/0) ────
+    # When the dispatch queue HEAD is a parallel-safe:false brief that has
+    # waited longer than the threshold, stop feeding OTHER briefs past it so
+    # the board drains and the solo head runs next. Closes the brief-253a
+    # starvation (a solo head sat at position 1 for hours while parallel
+    # briefs dispatched past it). Deterministic code gate — not the queen's
+    # judgment. The drained head itself is still allowed through (it dispatches
+    # once the board is empty).
+    try:
+        drain_secs = int(str(config.get("SOLO_DRAIN_AFTER_SECS", "0")).split("#", 1)[0].strip() or "0")
+    except (ValueError, TypeError):
+        drain_secs = 0
+    if drain_secs > 0 and active:
+        # lib/queue.py collides with stdlib `queue`, so load it by explicit
+        # path via importlib rather than `import queue` (which could resolve to
+        # the stdlib module if it were ever pre-imported). No sys.modules
+        # collision; no dependency on cwd or sys.path ordering.
+        import importlib.util
+        _qpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue.py")
+        _spec = importlib.util.spec_from_file_location("loop_queue", _qpath)
+        _loop_queue = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_loop_queue)
+        decision = _loop_queue.head_solo_drain(project_dir, drain_secs, running=rc)
+        if decision["drain"] and decision["brief"] != brief:
+            log_action(paths, "solo_drain_hold", {
+                "brief": brief,
+                "draining_for": decision["brief"],
+                "waited_secs": round(decision["waited"], 1),
+                "threshold_secs": drain_secs,
+            })
+            print(
+                f"DRAIN: holding dispatches for {decision['brief']} "
+                f"(solo, waited {int(decision['waited'])}s) — {brief} deferred",
+                file=sys.stderr,
+            )
+            os.remove(paths["pending_dispatch"])
+            return False
+
     if in_flight >= throttle:
         log_action(paths, "throttle_reached", {
             "brief": brief,

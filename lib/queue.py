@@ -17,10 +17,17 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 
 
 _BRIEF_ID_RE = re.compile(r"brief-\d+(?:-[\w-]+)?")
+# Match both YAML (`Parallel-safe: true`) and prose (`**Parallel-safe:** true`)
+# forms — same dual-format the rest of the harness parses.
+_PARALLEL_SAFE_RE = re.compile(
+    r"^\s*(?:\*\*Parallel-safe:\*\*|Parallel-safe:)\s*(\S+)", re.IGNORECASE
+)
 
 
 def _parse_card_status(card_path):
@@ -117,6 +124,84 @@ def enumerate_dispatchable(project_dir, running=None):
     candidates.sort(key=lambda c: rank.get(c["brief"], len(order)))
 
     return candidates
+
+
+def _card_is_solo(card_path):
+    """True if the card declares Parallel-safe:false (or omits it → default).
+
+    Mirrors actions.parse_concurrency_frontmatter's solo semantics without the
+    import: a card with no Parallel-safe line, or any value that isn't `true`,
+    runs alone. Returns True (solo) on read error — fail-safe.
+    """
+    try:
+        with open(card_path) as f:
+            for line in f:
+                m = _PARALLEL_SAFE_RE.match(line)
+                if m:
+                    val = m.group(1).strip().strip('"').strip("'").lower()
+                    return val != "true"
+    except (IOError, OSError):
+        return True
+    return True  # no Parallel-safe line → default solo
+
+
+def _card_queued_age_secs(project_dir, card_rel_path, now=None):
+    """Seconds since the card's most recent git commit, or 0.0 if unknown.
+
+    The card's last commit time is a deterministic, already-present proxy for
+    "how long has this been sitting at queue head" — the Status: queued flip is
+    itself a commit. Uncommitted/untracked cards (no git time) return 0.0 so
+    they never trip the drain. `now` is injectable for tests.
+    """
+    if now is None:
+        now = time.time()
+    try:
+        r = subprocess.run(
+            ["git", "-C", project_dir, "log", "-1", "--format=%ct", "--", card_rel_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return 0.0
+        committed = float(r.stdout.strip())
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return 0.0
+    age = now - committed
+    return age if age > 0 else 0.0
+
+
+def head_solo_drain(project_dir, threshold_secs, running=None, now=None):
+    """Drain-for-solo decision (SOLO_DRAIN_AFTER_SECS).
+
+    Returns a dict {"drain": bool, "brief": <head id or "">, "waited": <secs>}.
+
+    `drain` is True when ALL hold:
+      - threshold_secs > 0 (feature on),
+      - the dispatch queue HEAD is a solo (parallel-safe:false) brief,
+      - that head has been queued longer than threshold_secs.
+
+    When True, the daemon/dispatch should stop feeding parallel briefs past the
+    head and let the board drain so the solo brief runs next (closes the
+    live brief-253a starvation: a solo head sat at position 1 for hours while
+    parallel briefs dispatched past it). Pure read — no state mutation.
+    """
+    if not threshold_secs or threshold_secs <= 0:
+        return {"drain": False, "brief": "", "waited": 0.0}
+
+    candidates = enumerate_dispatchable(project_dir, running=running)
+    if not candidates:
+        return {"drain": False, "brief": "", "waited": 0.0}
+
+    head = candidates[0]
+    card_path = os.path.join(project_dir, head["brief_file"])
+    if not _card_is_solo(card_path):
+        return {"drain": False, "brief": head["brief"], "waited": 0.0}
+
+    waited = _card_queued_age_secs(project_dir, head["brief_file"], now=now)
+    return {
+        "drain": waited > threshold_secs,
+        "brief": head["brief"],
+        "waited": waited,
+    }
 
 
 def queue_fingerprint(project_dir):
