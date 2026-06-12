@@ -751,9 +751,11 @@ reap_parallel_workers() {
             daemon_log "WORKER[$brief]: reaped — iteration FAILED (exit $rc, consecutive=$CONSECUTIVE_WORKER_FAILURES)"
         fi
     done
-    # Reassign registry to only the still-live entries. Guard the empty case:
-    # `arr=("${empty[@]}")` under `set -u` would error, but this daemon does
-    # not set -u; the explicit reset keeps it robust regardless.
+    # Reassign registry to only the still-live entries. This daemon runs under
+    # `set -uo pipefail` (top of file), and in bash 3.2 `arr=("${empty[@]}")`
+    # on an empty array trips "unbound variable". The explicit empty-case reset
+    # avoids that expansion. (The `${!arr[@]}` index loops above are already
+    # set-u-safe on empty arrays — only the `${arr[@]}` value form is not.)
     if [ "${#new_pids[@]}" -eq 0 ]; then
         WP_PIDS=()
         WP_BRIEFS=()

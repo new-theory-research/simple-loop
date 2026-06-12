@@ -134,6 +134,23 @@ reap_parallel_workers
     || fail "reaper should keep the live worker, got ${#WP_PIDS[@]} entries"
 kill "$STILL" 2>/dev/null; wait "$STILL" 2>/dev/null
 
+# ── set -u safety on EMPTY registry (bash 3.2 wedge guard) ────────────────────
+# The daemon runs under `set -uo pipefail`. In bash 3.2, `"${arr[@]}"` on an
+# empty array errors "unbound variable" and would wedge the whole tick. The
+# helpers must tolerate an empty registry. Run each under `set -u` with the
+# arrays empty and assert no error.
+(
+  set -uo pipefail
+  WP_PIDS=()
+  WP_BRIEFS=()
+  CONSECUTIVE_WORKER_FAILURES=0
+  worker_already_running "brief-x" || true
+  _c=$(live_worker_count)
+  solo_worker_live || true
+  reap_parallel_workers
+) && pass "helpers are set -u safe on an empty registry" \
+  || fail "a helper tripped under set -u with an empty registry"
+
 echo ""
 echo "  $PASSED passed, $FAILED failed"
 [ "$FAILED" -eq 0 ]
