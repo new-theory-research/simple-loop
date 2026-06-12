@@ -188,6 +188,101 @@ def max_review_cycle(project_dir, ref, brief_id):
     return best
 
 
+def read_config_value(loop_dir, key, default=""):
+    """Read a single `KEY=value` from config.sh (and config.local.sh overlay).
+
+    Mirrors the bash sourcing precedence used by daemon.sh: config.local.sh
+    wins over config.sh. Strips inline `# comment`, surrounding quotes, and
+    whitespace. Returns `default` if the key is absent in both files.
+
+    Used for WORKER_PARALLEL / THROTTLE so assess.py's worker-target emission
+    matches the daemon's flag state without re-sourcing bash.
+    """
+    value = default
+    for fname in ("config.sh", "config.local.sh"):
+        path = os.path.join(loop_dir, fname)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as f:
+                for line in f:
+                    s = line.strip()
+                    if s.startswith(key + "="):
+                        raw = s.split("=", 1)[1]
+                        raw = raw.split("#", 1)[0].strip()
+                        value = raw.strip('"').strip("'")
+        except (IOError, OSError):
+            pass
+    return value
+
+
+def _worker_parallel_enabled(loop_dir):
+    return read_config_value(loop_dir, "WORKER_PARALLEL", "false").strip().lower() == "true"
+
+
+def _throttle(loop_dir):
+    try:
+        t = int(read_config_value(loop_dir, "THROTTLE", "1") or "1")
+    except (ValueError, TypeError):
+        t = 1
+    return t if t >= 1 else 1
+
+
+def last_iteration_ts(project_dir, brief_id):
+    """Most-recent worker-log mtime for a brief, or 0.0 if none.
+
+    Worker iterations write `.loop/logs/worker_<brief>_<YYYYmmdd_HHMMSS>.log`
+    in the daemon's main checkout (run_worker_iteration). The newest such
+    file's mtime is a cheap, already-present proxy for "when did this brief
+    last iterate" — no new event emission, readable from the main checkout
+    where assess.py runs. Briefs that never iterated (no log) return 0.0 and
+    therefore sort FIRST under least-recently-iterated ordering (#24: a brief
+    that has never run must not starve behind one that just ran).
+    """
+    log_dir = os.path.join(project_dir, ".loop", "logs")
+    if not os.path.isdir(log_dir):
+        return 0.0
+    prefix = "worker_%s_" % brief_id
+    best = 0.0
+    try:
+        for name in os.listdir(log_dir):
+            if name.startswith(prefix) and name.endswith(".log"):
+                try:
+                    m = os.path.getmtime(os.path.join(log_dir, name))
+                except OSError:
+                    continue
+                if m > best:
+                    best = m
+    except OSError:
+        return 0.0
+    return best
+
+
+def order_worker_targets(primary, candidates, throttle):
+    """Return the extra worker lines to emit (lines 4+), capped by THROTTLE.
+
+    `primary` is the line already printed on line 2 (walk-order-first; pinned
+    so the flag-off / byte-identical contract holds). `candidates` is a list
+    of (last_iter_ts, "WORKER:brief,branch") for every running brief. Extras
+    are ordered least-recently-iterated first (oldest mtime; never-iterated =
+    0.0 sorts first — #24), deduped against `primary`, and limited so the
+    TOTAL number of worker targets (primary + extras) never exceeds throttle.
+
+    Pure function → unit-testable without git/running.json fixtures.
+    """
+    if throttle < 1:
+        throttle = 1
+    ordered = sorted(candidates, key=lambda c: (c[0], c[1]))
+    extras = []
+    for _ts, line in ordered:
+        if line == primary:
+            continue
+        if 1 + len(extras) + 1 > throttle:
+            break
+        extras.append(line)
+    return extras
+
+
 def latest_review_verdict(project_dir, ref, brief_id, cycle):
     """Read the most recent review's `verdict:` frontmatter field from ref."""
     path = f".loop/modules/validator/state/reviews/{brief_id}-cycle-{cycle}.md"
@@ -220,6 +315,15 @@ def main():
     conductor = "NONE"
     worker = "NONE"
     validator = "NONE"
+
+    # WORKER_PARALLEL (default off): when on, emit up to THROTTLE worker
+    # targets (least-recently-iterated first) instead of just the first
+    # running brief in walk order (#24 starvation). The output stays
+    # line-compatible: flag-off emits exactly one WORKER line as before;
+    # flag-on may emit multiple, and the daemon reads all of them.
+    worker_parallel = _worker_parallel_enabled(loop_dir)
+    throttle = _throttle(loop_dir)
+    worker_candidates = []  # list of (last_iter_ts, "WORKER:brief,branch")
 
     if not os.path.exists(running_file):
         print("CONDUCTOR:no_state")
@@ -312,8 +416,15 @@ def main():
             if conductor == "NONE":
                 conductor = f"CONDUCTOR:brief_blocked:{brief_id}"
         elif status == "running" and branch_exists:
+            # Flag-off: first running brief in walk order wins (legacy).
+            # Flag-on: collect all, order/emit below.
             if worker == "NONE":
                 worker = f"WORKER:{brief_id},{branch}"
+            if worker_parallel:
+                worker_candidates.append(
+                    (last_iteration_ts(project_dir, brief_id),
+                     f"WORKER:{brief_id},{branch}")
+                )
         elif not branch_exists:
             if conductor == "NONE":
                 conductor = f"CONDUCTOR:stale_brief:{brief_id}"
@@ -344,6 +455,17 @@ def main():
     print(conductor)
     print(worker)
     print(validator)
+
+    # WORKER_PARALLEL: emit any ADDITIONAL worker targets as lines 4+ (the
+    # primary worker already occupies line 2; the 3-line conductor/worker/
+    # validator contract is preserved so existing `sed -n 2p`/`sed -n 3p`
+    # daemon reads are byte-unchanged). Ordering: least-recently-iterated
+    # first (oldest log mtime; never-iterated = 0.0 sorts first). Cap the
+    # TOTAL number of worker targets (line 2 + extras) at THROTTLE so the
+    # daemon never spawns more concurrent workers than the configured cap.
+    if worker_parallel and len(worker_candidates) > 1:
+        for line in order_worker_targets(worker, worker_candidates, throttle):
+            print(line)
 
 
 if __name__ == "__main__":
