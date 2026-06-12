@@ -56,9 +56,29 @@ WORKER_KILL_GRACE_SECS="${WORKER_KILL_GRACE_SECS:-10}"
 # within a normal scout/conductor cadence while bounding worst-case stuck time.
 CONDUCTOR_DEDUP_TTL_SECS="${CONDUCTOR_DEDUP_TTL_SECS:-1800}"
 
+# Parallel worker execution (off by default → byte-identical legacy behavior).
+# When "true", the tick spawns workers in the background and a reaper harvests
+# finished ones at the start of each tick, so THROTTLE briefs iterate
+# concurrently instead of alternating. THROTTLE caps concurrent workers.
+WORKER_PARALLEL="${WORKER_PARALLEL:-false}"
+THROTTLE="${THROTTLE:-1}"
+# Strip any inline comment / non-digits a quoted config value may carry, then
+# floor at 1 (matches actions.py dispatch throttle parsing).
+THROTTLE="${THROTTLE%%#*}"
+THROTTLE="$(printf '%s' "$THROTTLE" | tr -cd '0-9')"
+[ -z "$THROTTLE" ] && THROTTLE=1
+[ "$THROTTLE" -lt 1 ] && THROTTLE=1
+
 # Tracking
 CONSECUTIVE_SKIPS=0
 CONSECUTIVE_WORKER_FAILURES=0
+
+# Parallel-worker registry (daemon-process lifetime; reaped at each tick
+# start). Parallel indexed arrays — bash 3.2 has no associative arrays and no
+# `wait -n`, so the reaper polls PID liveness with `kill -0`. WP_PIDS[i] is the
+# backgrounded `run_worker_iteration` subshell PID; WP_BRIEFS[i] its brief id.
+WP_PIDS=()
+WP_BRIEFS=()
 
 # Find lib directory (co-located with this script)
 DAEMON_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -109,6 +129,22 @@ daemon_log() {
     # (and stderr) to daemon.log. `tee -a` here would double-write each line,
     # which made `loop logs -f` print every entry twice.
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+# Worker-scoped log line. Flag-off: emits the message verbatim (byte-identical
+# to the legacy `daemon_log "WORKER: ..."` calls). Flag-on: rewrites a leading
+# `WORKER:` token to `WORKER[<brief>]:` so interleaved background-worker output
+# stays attributable. `_WLOG_BRIEF` is set at run_worker_iteration entry.
+_WLOG_BRIEF=""
+wlog() {
+    if [ "$WORKER_PARALLEL" = "true" ] && [ -n "$_WLOG_BRIEF" ]; then
+        case "$1" in
+            WORKER:*) daemon_log "WORKER[$_WLOG_BRIEF]:${1#WORKER:}" ;;
+            *)        daemon_log "$1" ;;
+        esac
+    else
+        daemon_log "$1"
+    fi
 }
 
 notify() {
@@ -311,12 +347,15 @@ commit_worktree_wip() {
 run_worker_iteration() {
     local brief_id="$1"
     local branch="$2"
+    # Tag this function's WORKER: log lines with the brief id under
+    # WORKER_PARALLEL (see wlog). No-op for the flag-off serial path.
+    _WLOG_BRIEF="$brief_id"
 
     # Resolve worktree — create if needed
     local WORKTREE_DIR="$PROJECT_DIR/.loop/worktrees/$brief_id"
 
     if [ ! -d "$WORKTREE_DIR" ]; then
-        daemon_log "WORKER: creating worktree for $brief_id"
+        wlog "WORKER: creating worktree for $brief_id"
         mkdir -p "$PROJECT_DIR/.loop/worktrees"
 
         if git -C "$PROJECT_DIR" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
@@ -326,7 +365,7 @@ run_worker_iteration() {
             git -C "$PROJECT_DIR" fetch "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
             STALE_COUNT=$(git -C "$PROJECT_DIR" rev-list --count "$branch".."${GIT_REMOTE}/${GIT_MAIN_BRANCH}" 2>/dev/null || echo "0")
             if [ "$STALE_COUNT" -ge "$MAX_COMMITS_BEHIND" ]; then
-                daemon_log "WORKER: stale-branch refused — $branch is $STALE_COUNT commits behind ${GIT_REMOTE}/${GIT_MAIN_BRANCH} (threshold $MAX_COMMITS_BEHIND) — deleting and recreating from main"
+                wlog "WORKER: stale-branch refused — $branch is $STALE_COUNT commits behind ${GIT_REMOTE}/${GIT_MAIN_BRANCH} (threshold $MAX_COMMITS_BEHIND) — deleting and recreating from main"
                 git -C "$PROJECT_DIR" branch -D "$branch" -q 2>/dev/null || true
                 git -C "$PROJECT_DIR" worktree add -b "$branch" "$WORKTREE_DIR" "${GIT_REMOTE}/${GIT_MAIN_BRANCH}" -q 2>/dev/null
             else
@@ -335,17 +374,17 @@ run_worker_iteration() {
         elif git -C "$PROJECT_DIR" show-ref --verify --quiet "refs/remotes/${GIT_REMOTE}/$branch" 2>/dev/null; then
             git -C "$PROJECT_DIR" worktree add "$WORKTREE_DIR" "$branch" -q 2>/dev/null
         else
-            daemon_log "WORKER: creating branch $branch from $GIT_MAIN_BRANCH"
+            wlog "WORKER: creating branch $branch from $GIT_MAIN_BRANCH"
             git -C "$PROJECT_DIR" worktree add -b "$branch" "$WORKTREE_DIR" "$GIT_MAIN_BRANCH" -q 2>/dev/null
         fi
 
         if [ ! -d "$WORKTREE_DIR" ]; then
-            daemon_log "WORKER ERROR: failed to create worktree for $branch"
+            wlog "WORKER ERROR: failed to create worktree for $branch"
             return 1
         fi
     fi
 
-    daemon_log "WORKER: starting iteration for $brief_id in worktree"
+    wlog "WORKER: starting iteration for $brief_id in worktree"
 
     # Pull latest into worktree (doesn't touch main tree)
     if ! git -C "$WORKTREE_DIR" pull --ff-only "$GIT_REMOTE" "$branch" -q 2>/dev/null; then
@@ -355,7 +394,7 @@ run_worker_iteration() {
         local _wt_counts
         _wt_counts=$(git -C "$WORKTREE_DIR" rev-list --left-right --count "HEAD...${GIT_REMOTE}/${branch}" 2>/dev/null) || _wt_counts=""
         if [ -n "$_wt_counts" ]; then
-            daemon_log "WORKER: SYNC FAILED for $branch worktree — diverged ($(printf '%s' "$_wt_counts" | awk '{print $1}') ahead / $(printf '%s' "$_wt_counts" | awk '{print $2}') behind)"
+            wlog "WORKER: SYNC FAILED for $branch worktree — diverged ($(printf '%s' "$_wt_counts" | awk '{print $1}') ahead / $(printf '%s' "$_wt_counts" | awk '{print $2}') behind)"
         fi
     fi
 
@@ -369,7 +408,7 @@ run_worker_iteration() {
        ! git -C "$WORKTREE_DIR" diff --quiet HEAD -- .loop/state/progress.json 2>/dev/null; then
         git -C "$WORKTREE_DIR" add .loop/state/progress.json 2>/dev/null
         if git -C "$WORKTREE_DIR" commit -m "loop: snapshot progress.json before cycle-start rebase" -q 2>/dev/null; then
-            daemon_log "WORKER: snapshotted dirty progress.json before rebase for $brief_id"
+            wlog "WORKER: snapshotted dirty progress.json before rebase for $brief_id"
         fi
     fi
 
@@ -386,10 +425,10 @@ run_worker_iteration() {
     git -C "$WORKTREE_DIR" fetch "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
     COMMITS_BEHIND_BEFORE=$(git -C "$WORKTREE_DIR" rev-list --count HEAD.."${GIT_REMOTE}/${GIT_MAIN_BRANCH}" 2>/dev/null || echo "0")
     if git -C "$WORKTREE_DIR" rebase "${GIT_REMOTE}/${GIT_MAIN_BRANCH}" -q 2>/dev/null; then
-        daemon_log "WORKER: rebased $branch onto ${GIT_REMOTE}/${GIT_MAIN_BRANCH} ($COMMITS_BEHIND_BEFORE commits)"
+        wlog "WORKER: rebased $branch onto ${GIT_REMOTE}/${GIT_MAIN_BRANCH} ($COMMITS_BEHIND_BEFORE commits)"
     else
         git -C "$WORKTREE_DIR" rebase --abort 2>/dev/null || true
-        daemon_log "WORKER: rebase failed for $branch (conflicts) → routed to awaiting_review"
+        wlog "WORKER: rebase failed for $branch (conflicts) → routed to awaiting_review"
         python3 "$DAEMON_LIB_DIR/actions.py" move-to-awaiting-review "$brief_id" "$PROJECT_DIR" \
             rebase-blocked "rebase conflict against main — human resolution required" \
             2>>"$LOG_DIR/daemon.log" || true
@@ -419,7 +458,7 @@ for b in rc.get('active', []):
 " 2>/dev/null)
 
         if [ -z "$brief_file" ] || [ ! -f "$WORKTREE_DIR/$brief_file" ]; then
-            daemon_log "WORKER: no brief file found for $brief_id — skipping"
+            wlog "WORKER: no brief file found for $brief_id — skipping"
             return 0
         fi
 
@@ -427,10 +466,10 @@ for b in rc.get('active', []):
             "$brief_id" "$PROJECT_DIR" "$brief_file" "$PROGRESS_FILE" 2>/dev/null || echo "initialized")
         case "$RESET_RESULT" in
             initialized)
-                daemon_log "WORKER: initialized progress.json for $brief_id"
+                wlog "WORKER: initialized progress.json for $brief_id"
                 ;;
             reset:*)
-                daemon_log "WORKER: reset progress.json for $brief_id (was: ${RESET_RESULT#reset:} — rebase inheritance)"
+                wlog "WORKER: reset progress.json for $brief_id (was: ${RESET_RESULT#reset:} — rebase inheritance)"
                 ;;
         esac
         git -C "$WORKTREE_DIR" add ".loop/state/progress.json"
@@ -441,7 +480,7 @@ for b in rc.get('active', []):
     local iteration
     iteration=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('iteration', 0))" 2>/dev/null || echo "0")
     if [ "$iteration" -ge "$MAX_ITERATIONS" ]; then
-        daemon_log "WORKER: max iterations ($MAX_ITERATIONS) reached — marking blocked"
+        wlog "WORKER: max iterations ($MAX_ITERATIONS) reached — marking blocked"
         python3 -c "
 import json
 with open('$PROGRESS_FILE') as f:
@@ -480,7 +519,7 @@ with open('$PROGRESS_FILE', 'w') as f:
         if [ -n "$brief_model" ]; then
             WORKER_MODEL="$brief_model"
             if [ "$brief_model" != "sonnet" ]; then
-                daemon_log "WORKER: using model '$brief_model' (from brief)"
+                wlog "WORKER: using model '$brief_model' (from brief)"
             fi
         fi
     fi
@@ -495,7 +534,7 @@ with open('$PROGRESS_FILE', 'w') as f:
             | grep -oE '^[0-9]+')
         if [ -n "$brief_cycle_secs" ]; then
             CYCLE_WALL_TIME_SECS="$brief_cycle_secs"
-            daemon_log "WORKER: Cycle-wall-time-secs=$brief_cycle_secs (from brief)"
+            wlog "WORKER: Cycle-wall-time-secs=$brief_cycle_secs (from brief)"
         fi
     fi
 
@@ -568,7 +607,7 @@ with open('$PROGRESS_FILE', 'w') as f:
     # WIP auto-commit above just committed (issue #18).
     if [ -f "$WORKER_TIMEOUT_FLAG" ]; then
         rm -f "$WORKER_TIMEOUT_FLAG"
-        daemon_log "WORKER: cycle wall-time exceeded ${CYCLE_WALL_TIME_SECS}s — killed worker for $brief_id cycle $iteration"
+        wlog "WORKER: cycle wall-time exceeded ${CYCLE_WALL_TIME_SECS}s — killed worker for $brief_id cycle $iteration"
         notify "$brief_id: cycle wall-time exceeded (${CYCLE_WALL_TIME_SECS}s) — routed to awaiting_review"
         parse_metrics "$WORKER_JSON" "$WORKER_LOG" "worker" "{'brief': '$brief_id', 'model': '$WORKER_MODEL', 'exit_code': $WORKER_EXIT, 'timed_out': True}"
         rm -f "$WORKER_JSON"
@@ -585,12 +624,12 @@ with open('$PROGRESS_FILE', 'w') as f:
 
     # Push results from worktree
     if [ "$WORKER_EXIT" -eq 0 ]; then
-        git -C "$WORKTREE_DIR" push -u --force-with-lease "$GIT_REMOTE" "$branch" 2>&1 || daemon_log "WORKER: push failed (non-fatal)"
-        daemon_log "WORKER: iteration complete (${WORKER_DURATION}s), pushed to $branch"
+        git -C "$WORKTREE_DIR" push -u --force-with-lease "$GIT_REMOTE" "$branch" 2>&1 || wlog "WORKER: push failed (non-fatal)"
+        wlog "WORKER: iteration complete (${WORKER_DURATION}s), pushed to $branch"
         notify "$brief_id: iteration done (${WORKER_DURATION}s)"
         CONSECUTIVE_WORKER_FAILURES=0
     else
-        daemon_log "WORKER: iteration FAILED (exit $WORKER_EXIT, ${WORKER_DURATION}s)"
+        wlog "WORKER: iteration FAILED (exit $WORKER_EXIT, ${WORKER_DURATION}s)"
         notify "$brief_id: worker FAILED (exit $WORKER_EXIT)"
         CONSECUTIVE_WORKER_FAILURES=$((CONSECUTIVE_WORKER_FAILURES + 1))
 
@@ -603,6 +642,141 @@ with open('$PROGRESS_FILE', 'w') as f:
     # No checkout needed — main tree was never touched
 
     return $WORKER_EXIT
+}
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Parallel worker execution (WORKER_PARALLEL=true)               ║
+# ╚══════════════════════════════════════════════════════════════════╝
+#
+# Legacy (flag off): Phase 3 calls run_worker_iteration synchronously and the
+# tick BLOCKS on its `wait "$WORKER_PID"`. Even with THROTTLE=2 and two active
+# briefs, iterations alternate instead of overlapping.
+#
+# Flag on: spawn_parallel_worker backgrounds the WHOLE run_worker_iteration in
+# a subshell (its wall-time watchdog, WIP-auto-commit, metrics, completion
+# routing, and push all preserved) and records (PID, brief) in the WP_* tick-
+# spanning registry. reap_parallel_workers (start of each tick) harvests any
+# finished subshell, mapping its exit code to the parent's consecutive-failure
+# counter — the one piece a subshell can't mutate in-place.
+#
+# Single-flight invariants preserved (see the gating in Phase 3): one worker
+# per brief at a time; a parallel-safe:false brief runs ALONE; concurrency
+# never exceeds THROTTLE.
+
+# True if a backgrounded worker for this brief is still live in the registry.
+worker_already_running() {
+    local brief_id="$1"
+    local i
+    for i in "${!WP_PIDS[@]}"; do
+        if [ "${WP_BRIEFS[$i]}" = "$brief_id" ] && kill -0 "${WP_PIDS[$i]}" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# True if a brief is solo — i.e. parallel_safe:false in running.json.active[].
+# A brief absent from active[] (shouldn't happen for a worker target) is
+# treated as solo (fail-safe: when in doubt, run it alone).
+brief_is_solo() {
+    local brief_id="$1"
+    python3 -c "
+import json, sys
+try:
+    with open('$RUNNING_FILE') as f:
+        rc = json.load(f)
+except Exception:
+    sys.exit(0)  # solo (fail-safe)
+for b in rc.get('active', []):
+    if b.get('brief') == '$brief_id':
+        sys.exit(1 if b.get('parallel_safe', False) else 0)
+sys.exit(0)  # not found → solo (fail-safe)
+" 2>/dev/null
+    # exit 0 → solo (true); exit 1 → parallel-safe (false)
+    [ $? -eq 0 ]
+}
+
+# True if any currently-live background worker belongs to a solo brief.
+solo_worker_live() {
+    local i brief
+    for i in "${!WP_PIDS[@]}"; do
+        if kill -0 "${WP_PIDS[$i]}" 2>/dev/null; then
+            brief="${WP_BRIEFS[$i]}"
+            if brief_is_solo "$brief"; then
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+# Count of live backgrounded workers.
+live_worker_count() {
+    local n=0 i
+    for i in "${!WP_PIDS[@]}"; do
+        if kill -0 "${WP_PIDS[$i]}" 2>/dev/null; then
+            n=$((n + 1))
+        fi
+    done
+    printf '%s' "$n"
+}
+
+# Reaper: harvest finished backgrounded workers. For each registry entry whose
+# PID is no longer alive, `wait` it (returns its exit code immediately since it
+# already exited), route the exit code through the SAME consecutive-failure
+# accounting the synchronous path uses, then drop it from the registry. Live
+# entries are retained for the next tick. Runs at the START of every tick.
+reap_parallel_workers() {
+    [ "${#WP_PIDS[@]}" -eq 0 ] && return 0
+    local new_pids=() new_briefs=()
+    local i pid brief rc
+    for i in "${!WP_PIDS[@]}"; do
+        pid="${WP_PIDS[$i]}"
+        brief="${WP_BRIEFS[$i]}"
+        if kill -0 "$pid" 2>/dev/null; then
+            # Still running — keep in registry for a later tick.
+            new_pids+=("$pid")
+            new_briefs+=("$brief")
+            continue
+        fi
+        # Finished — harvest exit code. `wait` on an already-exited child
+        # returns its status; on an unknown pid returns 127 (treated as failure).
+        wait "$pid" 2>/dev/null
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            CONSECUTIVE_WORKER_FAILURES=0
+            daemon_log "WORKER[$brief]: reaped — iteration ok (exit 0)"
+        else
+            CONSECUTIVE_WORKER_FAILURES=$((CONSECUTIVE_WORKER_FAILURES + 1))
+            daemon_log "WORKER[$brief]: reaped — iteration FAILED (exit $rc, consecutive=$CONSECUTIVE_WORKER_FAILURES)"
+        fi
+    done
+    # Reassign registry to only the still-live entries. Guard the empty case:
+    # `arr=("${empty[@]}")` under `set -u` would error, but this daemon does
+    # not set -u; the explicit reset keeps it robust regardless.
+    if [ "${#new_pids[@]}" -eq 0 ]; then
+        WP_PIDS=()
+        WP_BRIEFS=()
+    else
+        WP_PIDS=("${new_pids[@]}")
+        WP_BRIEFS=("${new_briefs[@]}")
+    fi
+    return 0
+}
+
+# Spawn one backgrounded worker for (brief, branch) and register it. The whole
+# run_worker_iteration runs in a subshell; its stdout/stderr already land in
+# the per-worker log via the function's internal redirects, and the daemon.log
+# lines are brief-tagged via wlog so interleaved parallel output stays readable.
+# Caller (Phase 3) owns the single-flight + solo + THROTTLE gating.
+spawn_parallel_worker() {
+    local brief_id="$1"
+    local branch="$2"
+    run_worker_iteration "$brief_id" "$branch" &
+    local pid=$!
+    WP_PIDS+=("$pid")
+    WP_BRIEFS+=("$brief_id")
+    daemon_log "WORKER[$brief_id]: spawned background iteration (pid $pid, live=$(live_worker_count)/$THROTTLE)"
 }
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -1276,6 +1450,12 @@ while true; do
     WORKER_FIRED_THIS_TICK=0
     VALIDATOR_FIRED_THIS_TICK=0
 
+    # Reap finished background workers from prior ticks (WORKER_PARALLEL only;
+    # no-op when the registry is empty, so flag-off ticks are unchanged).
+    if [ "$WORKER_PARALLEL" = "true" ]; then
+        reap_parallel_workers
+    fi
+
     # --- Escalate-resolved detection (breaks dedup on stale triggers) ---
     # When the queen writes escalate.json, subsequent ticks with the same
     # trigger de-dup and the daemon goes silent. If a human (or scav) clears
@@ -1669,27 +1849,87 @@ except: print(0)
     # ┌─────────────────────────────────────┐
     # │  Phase 3: Worker (if active brief)  │
     # └─────────────────────────────────────┘
-    case "$WORKER_TARGET" in
-        WORKER:*)
-            IFS=',' read -r BRIEF_ID BRIEF_BRANCH <<< "${WORKER_TARGET#WORKER:}"
+    if [ "$WORKER_PARALLEL" = "true" ]; then
+        # ── Parallel path ────────────────────────────────────────────────────
+        # assess.py (flag-on) emits the primary worker on line 2 and any extras
+        # on lines 4+. Collect ALL WORKER: lines, then spawn each in the
+        # background subject to the single-flight + solo + THROTTLE gates.
+        WORKER_LINES=$(printf '%s\n' "$ASSESS_OUTPUT" | grep '^WORKER:' || true)
 
-            if [ "$CONSECUTIVE_WORKER_FAILURES" -ge 3 ]; then
-                daemon_log "WORKER: 3 consecutive failures — escalating to queen"
-                notify "3 worker failures on $BRIEF_ID — escalating"
-                write_heartbeat "phase3_queen_escalate:$BRIEF_ID"
-                invoke_conductor "worker_failures_${BRIEF_ID}"
-                CONDUCTOR_FIRED_THIS_TICK=$((CONDUCTOR_FIRED_THIS_TICK + 1))
-                CONSECUTIVE_WORKER_FAILURES=0
-            else
+        if [ "$CONSECUTIVE_WORKER_FAILURES" -ge 3 ] && [ -n "$WORKER_LINES" ]; then
+            # Same escalation gate as the serial path, evaluated once per tick.
+            _ESC_BRIEF=$(printf '%s\n' "$WORKER_LINES" | head -1 | sed 's/^WORKER://' | cut -d',' -f1)
+            daemon_log "WORKER: 3 consecutive failures — escalating to queen"
+            notify "3 worker failures on $_ESC_BRIEF — escalating"
+            write_heartbeat "phase3_queen_escalate:$_ESC_BRIEF"
+            invoke_conductor "worker_failures_${_ESC_BRIEF}"
+            CONDUCTOR_FIRED_THIS_TICK=$((CONDUCTOR_FIRED_THIS_TICK + 1))
+            CONSECUTIVE_WORKER_FAILURES=0
+        elif [ -n "$WORKER_LINES" ]; then
+            while IFS= read -r _wline; do
+                [ -z "$_wline" ] && continue
+                IFS=',' read -r BRIEF_ID BRIEF_BRANCH <<< "${_wline#WORKER:}"
+                [ -z "$BRIEF_ID" ] && continue
+
+                # Invariant 1: one worker per brief at a time. Never spawn a
+                # second iteration of a brief that already has a live worker.
+                if worker_already_running "$BRIEF_ID"; then
+                    daemon_log "WORKER[$BRIEF_ID]: already running in background — skip respawn"
+                    continue
+                fi
+
+                _LIVE=$(live_worker_count)
+
+                # Invariant 2: THROTTLE cap on concurrent workers.
+                if [ "$_LIVE" -ge "$THROTTLE" ]; then
+                    daemon_log "WORKER[$BRIEF_ID]: throttle reached (live=$_LIVE/$THROTTLE) — deferring to a later tick"
+                    break
+                fi
+
+                # Invariant 3: solo (parallel-safe:false) briefs run ALONE.
+                # If a solo worker is already live, spawn nothing else; if this
+                # brief is solo and anything is live, hold it until they drain.
+                if solo_worker_live; then
+                    daemon_log "WORKER[$BRIEF_ID]: a solo worker is live — spawning nothing else this tick"
+                    break
+                fi
+                if brief_is_solo "$BRIEF_ID" && [ "$_LIVE" -gt 0 ]; then
+                    daemon_log "WORKER[$BRIEF_ID]: solo (parallel-safe:false) — holding until $_LIVE live worker(s) drain"
+                    continue
+                fi
+
                 write_heartbeat "phase3_worker:$BRIEF_ID"
-                run_worker_iteration "$BRIEF_ID" "$BRIEF_BRANCH"
+                spawn_parallel_worker "$BRIEF_ID" "$BRIEF_BRANCH"
                 WORKER_FIRED_THIS_TICK=$((WORKER_FIRED_THIS_TICK + 1))
                 DID_WORK=true
                 LAST_CONDUCTOR_TRIGGER=""
                 LAST_CONDUCTOR_TRIGGER_TS=0
-            fi
-            ;;
-    esac
+            done <<< "$WORKER_LINES"
+        fi
+    else
+        # ── Serial path (legacy; byte-identical to pre-WORKER_PARALLEL) ───────
+        case "$WORKER_TARGET" in
+            WORKER:*)
+                IFS=',' read -r BRIEF_ID BRIEF_BRANCH <<< "${WORKER_TARGET#WORKER:}"
+
+                if [ "$CONSECUTIVE_WORKER_FAILURES" -ge 3 ]; then
+                    daemon_log "WORKER: 3 consecutive failures — escalating to queen"
+                    notify "3 worker failures on $BRIEF_ID — escalating"
+                    write_heartbeat "phase3_queen_escalate:$BRIEF_ID"
+                    invoke_conductor "worker_failures_${BRIEF_ID}"
+                    CONDUCTOR_FIRED_THIS_TICK=$((CONDUCTOR_FIRED_THIS_TICK + 1))
+                    CONSECUTIVE_WORKER_FAILURES=0
+                else
+                    write_heartbeat "phase3_worker:$BRIEF_ID"
+                    run_worker_iteration "$BRIEF_ID" "$BRIEF_BRANCH"
+                    WORKER_FIRED_THIS_TICK=$((WORKER_FIRED_THIS_TICK + 1))
+                    DID_WORK=true
+                    LAST_CONDUCTOR_TRIGGER=""
+                    LAST_CONDUCTOR_TRIGGER_TS=0
+                fi
+                ;;
+        esac
+    fi
 
     # ┌─────────────────────────────────────┐
     # │  Phase 4: Notifications             │
