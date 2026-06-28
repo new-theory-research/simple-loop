@@ -2,71 +2,7 @@
   "active": [],
   "completed_pending_eval": [],
   "pending_merges": [],
-  "awaiting_review": [
-    {
-      "brief": "brief-144-loop-init-scaffolds-prompts",
-      "branch": "brief-144-loop-init-scaffolds-prompts",
-      "brief_file": "wiki/briefs/cards/brief-144-loop-init-scaffolds-prompts/index.md",
-      "dispatched_at": "2026-05-05T20:04:50Z",
-      "parallel_safe": true,
-      "edit_surface": [
-        "bin/loop"
-      ],
-      "worker_slot": 0,
-      "completed_at": "2026-05-05T20:13:50Z",
-      "auto_merge": false,
-      "kind": "complete"
-    },
-    {
-      "brief": "brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces",
-      "branch": "brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces",
-      "brief_file": "wiki/briefs/cards/brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces/index.md",
-      "dispatched_at": "2026-05-08T19:19:10Z",
-      "parallel_safe": true,
-      "edit_surface": [
-        "lib/daemon.sh",
-        "bin/loop"
-      ],
-      "worker_slot": 0,
-      "completed_at": "2026-05-08T19:31:40Z",
-      "auto_merge": false,
-      "kind": "complete"
-    },
-    {
-      "brief": "brief-149-loop-info-command",
-      "branch": "brief-149-loop-info-command",
-      "brief_file": "wiki/briefs/cards/brief-149-loop-info-command/index.md",
-      "dispatched_at": "2026-05-08T19:41:08Z",
-      "parallel_safe": true,
-      "edit_surface": [
-        "bin/loop",
-        "install.sh",
-        ".loop/config.json"
-      ],
-      "worker_slot": 0,
-      "completed_at": "2026-05-08T19:54:53Z",
-      "auto_merge": false,
-      "kind": "complete"
-    },
-    {
-      "brief": "brief-150-daemon-state-writes-to-main-redo",
-      "branch": "brief-150-daemon-state-writes-to-main-redo",
-      "brief_file": "wiki/briefs/cards/brief-150-daemon-state-writes-to-main-redo/index.md",
-      "dispatched_at": "2026-05-08T18:34:24Z",
-      "parallel_safe": true,
-      "edit_surface": [
-        "lib/daemon.sh",
-        "lib/actions.py",
-        "lib/_set_card_status.py",
-        "lib/git_plumbing.py (new)",
-        "install.sh"
-      ],
-      "worker_slot": 0,
-      "completed_at": "2026-05-08T19:01:13Z",
-      "auto_merge": false,
-      "kind": "complete"
-    }
-  ],
+  "awaiting_review": [],
   "history": [
     {
       "brief": "brief-151-lane-lock-and-claim",
@@ -121,6 +57,81 @@
       "status": "merged",
       "merge_sha": "9284186",
       "merged_at": "2026-06-28T22:06:54Z"
+    },
+    {
+      "brief": "brief-150-daemon-state-writes-to-main-redo",
+      "branch": "brief-150-daemon-state-writes-to-main-redo",
+      "brief_file": "wiki/briefs/cards/brief-150-daemon-state-writes-to-main-redo/index.md",
+      "dispatched_at": "2026-05-08T18:34:24Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "lib/daemon.sh",
+        "lib/actions.py",
+        "lib/_set_card_status.py",
+        "lib/git_plumbing.py (new)",
+        "install.sh"
+      ],
+      "worker_slot": 0,
+      "completed_at": "2026-05-08T19:01:13Z",
+      "auto_merge": false,
+      "kind": "complete",
+      "status": "merged",
+      "merge_sha": "b16e75b",
+      "merged_at": "2026-06-28T22:29:00Z"
+    },
+    {
+      "brief": "brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces",
+      "branch": "brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces",
+      "brief_file": "wiki/briefs/cards/brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces/index.md",
+      "dispatched_at": "2026-05-08T19:19:10Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "lib/daemon.sh",
+        "bin/loop"
+      ],
+      "worker_slot": 0,
+      "completed_at": "2026-05-08T19:31:40Z",
+      "auto_merge": false,
+      "kind": "complete",
+      "status": "merged",
+      "merge_sha": "b69ded9",
+      "merged_at": "2026-06-28T22:37:46Z"
+    },
+    {
+      "brief": "brief-149-loop-info-command",
+      "branch": "brief-149-loop-info-command",
+      "brief_file": "wiki/briefs/cards/brief-149-loop-info-command/index.md",
+      "dispatched_at": "2026-05-08T19:41:08Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "bin/loop",
+        "install.sh",
+        ".loop/config.json"
+      ],
+      "worker_slot": 0,
+      "completed_at": "2026-05-08T19:54:53Z",
+      "auto_merge": false,
+      "kind": "complete",
+      "status": "merged",
+      "merge_sha": "8453fcd",
+      "merged_at": "2026-06-28T22:41:03Z"
+    },
+    {
+      "brief": "brief-144-loop-init-scaffolds-prompts",
+      "branch": "brief-144-loop-init-scaffolds-prompts",
+      "brief_file": "wiki/briefs/cards/brief-144-loop-init-scaffolds-prompts/index.md",
+      "dispatched_at": "2026-05-05T20:04:50Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "bin/loop"
+      ],
+      "worker_slot": 0,
+      "completed_at": "2026-05-05T20:13:50Z",
+      "auto_merge": false,
+      "kind": "complete",
+      "status": "merged",
+      "merge_sha": "28f1d4f",
+      "merged_at": "2026-06-28T22:47:16Z"
     }
   ]
 }
