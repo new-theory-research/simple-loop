@@ -3942,6 +3942,52 @@ assert_eq "brief-148: cmd_status error block suppressed when >1h old and success
 
 rm -rf "$STATUS_ERR_SCRATCH"
 
+# ── Tests 131-134 (brief-144): loop init scaffolds .loop/prompts/{queen,worker}.md ──
+
+echo ""
+echo "=== Tests 131-134: loop init scaffolds .loop/prompts/queen.md + worker.md (brief-144) ==="
+
+# Test 131-132: --minimal mode copies both daemon prompts.
+INIT_MIN_SCRATCH=$(mktemp -d)
+(cd "$INIT_MIN_SCRATCH" && "$SCRIPT_DIR/../bin/loop" init --minimal) > /dev/null 2>&1
+
+if [ -f "$INIT_MIN_SCRATCH/.loop/prompts/queen.md" ]; then
+    pass "loop init --minimal creates .loop/prompts/queen.md"
+else
+    fail "loop init --minimal creates .loop/prompts/queen.md"
+fi
+
+if [ -f "$INIT_MIN_SCRATCH/.loop/prompts/worker.md" ]; then
+    pass "loop init --minimal creates .loop/prompts/worker.md"
+else
+    fail "loop init --minimal creates .loop/prompts/worker.md"
+fi
+
+rm -rf "$INIT_MIN_SCRATCH"
+
+# Test 133: --wiki-full mode also scaffolds the queen prompt (brief-144's named criterion).
+INIT_WIKI_SCRATCH=$(mktemp -d)
+(cd "$INIT_WIKI_SCRATCH" && "$SCRIPT_DIR/../bin/loop" init --wiki-full) > /dev/null 2>&1
+if [ -f "$INIT_WIKI_SCRATCH/.loop/prompts/queen.md" ] && [ -f "$INIT_WIKI_SCRATCH/.loop/prompts/worker.md" ]; then
+    pass "loop init --wiki-full creates .loop/prompts/{queen,worker}.md"
+else
+    fail "loop init --wiki-full creates .loop/prompts/{queen,worker}.md"
+fi
+rm -rf "$INIT_WIKI_SCRATCH"
+
+# Test 134: idempotency — a pre-existing custom queen.md is not clobbered by the copy guard.
+# Drive the exact guard inline (re-running `init` itself is blocked by the .loop/ exists check).
+INIT_IDEM_SCRATCH=$(mktemp -d)
+mkdir -p "$INIT_IDEM_SCRATCH/.loop/prompts"
+echo "custom-content" > "$INIT_IDEM_SCRATCH/.loop/prompts/queen.md"
+_SL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [ ! -f "$INIT_IDEM_SCRATCH/.loop/prompts/queen.md" ] && [ -f "$_SL_ROOT/templates/prompts/queen.md" ]; then
+    cp "$_SL_ROOT/templates/prompts/queen.md" "$INIT_IDEM_SCRATCH/.loop/prompts/queen.md"
+fi
+assert_eq "loop init prompts: pre-existing queen.md not overwritten (idempotency guard)" \
+    "$(cat "$INIT_IDEM_SCRATCH/.loop/prompts/queen.md")" "custom-content"
+rm -rf "$INIT_IDEM_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""

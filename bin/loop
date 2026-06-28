@@ -152,6 +152,8 @@ cmd_init() {
             echo "  .loop/state/stewardship-log.md"
             echo "  .loop/signals/"
             echo "  .loop/config.json"
+            echo "  .loop/prompts/queen.md"
+            echo "  .loop/prompts/worker.md"
             if [ "$_init_mode" = "wiki-full" ]; then
                 echo "  wiki/soul.md"
                 echo "  wiki/CLAUDE.md"
@@ -167,7 +169,19 @@ cmd_init() {
             return 0
         fi
 
-        mkdir -p .loop/state .loop/signals
+        mkdir -p .loop/state .loop/signals .loop/prompts
+
+        # Scaffold the daemon's queen + worker prompts so the first tick can find
+        # them at .loop/prompts/{queen,worker}.md (the path daemon.sh expects).
+        # Idempotent — never clobber a prompt the user already customized.
+        local _sl_root
+        _sl_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        if [ ! -f ".loop/prompts/queen.md" ] && [ -f "$_sl_root/templates/prompts/queen.md" ]; then
+            cp "$_sl_root/templates/prompts/queen.md" .loop/prompts/queen.md
+        fi
+        if [ ! -f ".loop/prompts/worker.md" ] && [ -f "$_sl_root/templates/prompts/worker.md" ]; then
+            cp "$_sl_root/templates/prompts/worker.md" .loop/prompts/worker.md
+        fi
 
         cat > .loop/state/running.json <<'JSON'
 {"active": [], "completed_pending_eval": [], "pending_merges": [], "awaiting_review": []}
@@ -207,8 +221,6 @@ CJSON
         # ── Wiki-full scaffold ────────────────────────────────────
         if [ "$_init_mode" = "wiki-full" ]; then
             mkdir -p wiki/briefs/cards wiki/operating-docs wiki/decisions wiki/riffs
-            local _sl_root
-            _sl_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
             if [ -f "$_sl_root/docs/templates/soul-template.md" ]; then
                 cp "$_sl_root/docs/templates/soul-template.md" wiki/soul.md
@@ -694,18 +706,18 @@ CONF
     if [ -d "$TEMPLATES_DIR" ]; then
         # From installed location
         cp "$TEMPLATES_DIR/prompts/worker.md" .loop/prompts/worker.md
-        cp "$TEMPLATES_DIR/prompts/conductor.md" .loop/prompts/conductor.md
+        cp "$TEMPLATES_DIR/prompts/queen.md" .loop/prompts/queen.md
     else
         # Running from source — look relative to this script
         local script_dir
         script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
         if [ -d "$script_dir/templates" ]; then
             cp "$script_dir/templates/prompts/worker.md" .loop/prompts/worker.md
-            cp "$script_dir/templates/prompts/conductor.md" .loop/prompts/conductor.md
+            cp "$script_dir/templates/prompts/queen.md" .loop/prompts/queen.md
         else
             echo "  Warning: template directory not found. Creating minimal templates."
             echo "# Worker Prompt — edit this" > .loop/prompts/worker.md
-            echo "# Conductor Prompt — edit this" > .loop/prompts/conductor.md
+            echo "# Queen Prompt — edit this" > .loop/prompts/queen.md
         fi
     fi
 
