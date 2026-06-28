@@ -40,6 +40,8 @@
         <string>{{HOME}}</string>
         <key>PATH</key>
         <string>{{PATH}}</string>
+        <key>GIT_MAIN_BRANCH</key>
+        <string>{{GIT_MAIN_BRANCH}}</string>
     </dict>
 </dict>
 </plist>

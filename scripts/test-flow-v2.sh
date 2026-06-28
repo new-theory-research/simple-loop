@@ -3805,6 +3805,51 @@ assert_eq "non-status frontmatter fields preserved verbatim after merge (brief-1
 
 rm -rf "$CLEANUP_SCRATCH"
 
+# ── Test: install-service reads GIT_MAIN_BRANCH from config.json (brief-145) ─
+
+IS_SCRATCH=$(mktemp -d)
+IS_PROJECT="$IS_SCRATCH/myproject"
+
+# Mock launchctl that does nothing (avoids actual daemon loading)
+IS_BIN="$IS_SCRATCH/bin"
+mkdir -p "$IS_BIN"
+printf '#!/bin/bash\nexit 0\n' > "$IS_BIN/launchctl"
+chmod +x "$IS_BIN/launchctl"
+
+# Fixture project: config.json with master as main branch
+mkdir -p "$IS_PROJECT/.loop/state" "$IS_PROJECT/.loop/logs"
+cat > "$IS_PROJECT/.loop/config.json" <<'EOF'
+{
+  "project_name": "myproject",
+  "git": {
+    "remote": "origin",
+    "main_branch": "master"
+  }
+}
+EOF
+
+IS_PLIST="$HOME/Library/LaunchAgents/com.scaviefae.simpleloop.myproject.plist"
+rm -f "$IS_PLIST"
+
+(cd "$IS_PROJECT" && PATH="$IS_BIN:$PATH" SIMPLE_LOOP_HOME="$SCRIPT_DIR/.." bash "$SCRIPT_DIR/../bin/loop" install-service >/dev/null 2>&1)
+
+if [ -f "$IS_PLIST" ]; then
+    IS_BRANCH=$(python3 -c "
+import plistlib
+with open('$IS_PLIST', 'rb') as f:
+    pl = plistlib.load(f)
+env = pl.get('EnvironmentVariables', {})
+print(env.get('GIT_MAIN_BRANCH', '__MISSING__'))
+" 2>/dev/null)
+    assert_eq "install-service writes GIT_MAIN_BRANCH from config.json (brief-145)" \
+        "$IS_BRANCH" "master"
+    rm -f "$IS_PLIST"
+else
+    fail "install-service did not write plist to $IS_PLIST (brief-145)"
+fi
+
+rm -rf "$IS_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""
