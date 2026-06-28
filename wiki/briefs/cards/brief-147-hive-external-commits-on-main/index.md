@@ -1,7 +1,7 @@
 ---
 ID: brief-147-hive-external-commits-on-main
 Branch: brief-147-hive-external-commits-on-main
-Status: active
+Status: merged
 Model: sonnet
 Auto-merge: false
 Validator: core/agents/reviewer.md
