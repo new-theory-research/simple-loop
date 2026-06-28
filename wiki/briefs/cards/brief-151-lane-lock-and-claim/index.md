@@ -1,7 +1,7 @@
 ---
 ID: brief-151-lane-lock-and-claim
 Branch: brief-151-lane-lock-and-claim
-Status: queued
+Status: active
 Model: opus
 Auto-merge: false
 Validator: core/agents/reviewer.md
