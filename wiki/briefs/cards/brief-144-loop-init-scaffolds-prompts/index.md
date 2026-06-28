@@ -1,7 +1,7 @@
 ---
 ID: brief-144-loop-init-scaffolds-prompts
 Branch: brief-144-loop-init-scaffolds-prompts
-Status: active
+Status: merged
 Model: sonnet
 Auto-merge: false
 Validator: core/agents/reviewer.md

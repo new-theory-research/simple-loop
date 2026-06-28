@@ -25,3 +25,4 @@
 {"ts": "2026-06-28T22:29:00Z", "event": "merged", "brief": "brief-150-daemon-state-writes-to-main-redo", "merge_sha": "b16e75b", "merged_at": "2026-06-28T22:29:00Z"}
 {"ts": "2026-06-28T22:37:46Z", "event": "merged", "brief": "brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces", "merge_sha": "b69ded9", "merged_at": "2026-06-28T22:37:46Z"}
 {"ts": "2026-06-28T22:41:03Z", "event": "merged", "brief": "brief-149-loop-info-command", "merge_sha": "8453fcd", "merged_at": "2026-06-28T22:41:03Z"}
+{"ts": "2026-06-28T22:47:16Z", "event": "merged", "brief": "brief-144-loop-init-scaffolds-prompts", "merge_sha": "28f1d4f", "merged_at": "2026-06-28T22:47:16Z"}
