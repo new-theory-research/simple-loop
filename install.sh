@@ -53,14 +53,14 @@ import json, datetime
 data = {
     'source_repo': '$SCRIPT_DIR',
     'source_commit': '$SOURCE_COMMIT',
-    'source_dirty': $SOURCE_DIRTY,
+    'source_dirty': '$SOURCE_DIRTY' == 'true',
     'version': '0.2.0',
     'installed_at': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
 }
 with open('$INSTALL_DIR/PROVENANCE.json', 'w') as f:
     json.dump(data, f, indent=2)
     f.write('\n')
-"
+" || echo "  warning: PROVENANCE.json generation failed (non-fatal; 'loop info' will show 'unknown' provenance)"
 
 # Copy lib (daemon runtime)
 cp "$SCRIPT_DIR/lib/daemon.sh" "$INSTALL_DIR/lib/"
