@@ -42,11 +42,17 @@ Branch `brief-151-lane-lock-and-claim`, target `ScavieFae/simple-loop master`.
   **190 passed** (12 new + the existing suite incl. `test_dispatch_idempotency`
   which exercises the modified dispatch path). ✅
 - **Regression — test-flow-v2.sh:** `bash scripts/test-flow-v2.sh` →
-  **152 passed, 54 failed**. The 54 failures are **pre-existing and unrelated**:
-  verified by stashing `lib/claim.py` and re-running — identical 152/54 on the
-  committed cycle-2 state. They are sandbox-environment failures (symlink removal,
-  merge-to-main ops). The brief criterion is "baseline pass count unchanged" —
-  **152 passed, unchanged**. ✅
+  **154 passed, 52 failed**, matching the master baseline. **Correction:** this
+  brief initially regressed test-flow-v2 to 152/54 — two concurrency gate tests
+  (`empty active THROTTLE=1 → gate_pass` and `THROTTLE=2 + disjoint surfaces →
+  gate_pass`) failed because the `cc_run_gate` harness helper mocked
+  `ensure_worktree`/`A.git` but not the new `claim_brief`. The unmocked claim push
+  hit a real `git push` to a nonexistent remote, fail-loud-raised, and `dispatch()`
+  returned False before reaching the `gate_pass` sentinel. Fixed this cycle by
+  stubbing `claim.claim_brief = lambda *a, **kw: True` in `cc_run_gate` (production
+  claim is unchanged; 12 unit tests + the mutation test prove it against a real
+  remote). The remaining 52 failures are pre-existing sandbox-environment failures
+  (symlink removal, merge-to-main ops), unrelated to this brief. ✅
 - **Escalation triggers:** none fired. No two-winners / zero-winners (lease
   correct); `--force-with-lease` empty-expect portable on git 2.50.1; no
   test-flow regression; golden iii snapshot equality holds.
