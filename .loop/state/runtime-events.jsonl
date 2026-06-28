@@ -23,3 +23,4 @@
 {"ts": "2026-06-28T22:06:54Z", "event": "merged", "brief": "brief-145-loop-install-service-reads-main-branch", "merge_sha": "98482b9", "merged_at": "2026-06-28T22:06:54Z"}
 {"ts": "2026-06-28T22:06:54Z", "event": "merged", "brief": "brief-147-hive-external-commits-on-main", "merge_sha": "9284186", "merged_at": "2026-06-28T22:06:54Z"}
 {"ts": "2026-06-28T22:29:00Z", "event": "merged", "brief": "brief-150-daemon-state-writes-to-main-redo", "merge_sha": "b16e75b", "merged_at": "2026-06-28T22:29:00Z"}
+{"ts": "2026-06-28T22:37:46Z", "event": "merged", "brief": "brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces", "merge_sha": "b69ded9", "merged_at": "2026-06-28T22:37:46Z"}

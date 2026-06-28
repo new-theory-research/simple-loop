@@ -1,7 +1,7 @@
 ---
 ID: brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces
 Branch: brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces
-Status: active
+Status: merged
 Model: sonnet
 Auto-merge: false
 Validator: core/agents/reviewer.md
