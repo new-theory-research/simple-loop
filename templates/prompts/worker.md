@@ -68,6 +68,7 @@ You are one iteration of a multi-pass loop. You will do ONE task, verify it, com
 - If you're genuinely stuck, set status to "blocked" rather than spinning.
 - Before writing a new utility or helper, check if it already exists.
 - Keep it simple. Solve the task, don't gold-plate.
+- **Never invent plausible values for missing inputs** — no identity matrices, zero-fills, or shaped-right defaults standing in for data the caller didn't send. A substitution is either a deliberate, declared decision the caller can see, or an error — never a silent courtesy.
 
 ## Important
 
