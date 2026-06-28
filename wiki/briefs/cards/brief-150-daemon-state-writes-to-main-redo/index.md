@@ -1,7 +1,7 @@
 ---
 ID: brief-150-daemon-state-writes-to-main-redo
 Branch: brief-150-daemon-state-writes-to-main-redo
-Status: active
+Status: merged
 Model: opus
 Auto-merge: false
 Validator: core/agents/reviewer.md
