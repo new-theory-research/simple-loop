@@ -1,5 +1,22 @@
 {
-  "active": [],
+  "active": [
+    {
+      "brief": "brief-151-lane-lock-and-claim",
+      "branch": "brief-151-lane-lock-and-claim",
+      "brief_file": "wiki/briefs/cards/brief-151-lane-lock-and-claim/index.md",
+      "dispatched_at": "2026-06-28T21:02:16Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "lib/queue.py",
+        "lib/daemon.sh",
+        "lib/actions.py",
+        "lib/claim.py (new)",
+        "lib/tests/test_lane_and_claim.py (new)",
+        "install.sh"
+      ],
+      "worker_slot": 0
+    }
+  ],
   "completed_pending_eval": [],
   "pending_merges": [],
   "awaiting_review": [
