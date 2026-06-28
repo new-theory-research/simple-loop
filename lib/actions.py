@@ -997,6 +997,11 @@ def move_to_awaiting_review(paths, brief_id, kind, reason=""):
     project_running(paths)
 
     signal_dedup_clear(paths, brief_id)
+    # brief-151: the brief has left active execution for the human gate
+    # (taste-gate, escalation, or structural failure). Card Status stays
+    # `active` so no other daemon re-dispatches it; release the claim ref so a
+    # human re-queue (Status → queued) is re-claimable. Best-effort.
+    _release_claim_quiet(paths, brief_id)
     log_action(paths, "move-to-awaiting-review", {"brief": brief_id, "kind": kind, "reason": reason})
     print(f"Moved {brief_id} to awaiting_review (kind={kind})")
     return True
@@ -1096,6 +1101,9 @@ def reject_brief(paths, brief_id, reason=""):
 
     project_running(paths)
     signal_dedup_clear(paths, brief_id)
+    # brief-151: rejected is terminal — release the claim so a re-queue can
+    # re-claim. Best-effort.
+    _release_claim_quiet(paths, brief_id)
     log_action(paths, "reject-brief", {"brief": brief_id, "reason": reason})
     print(f"Rejected {brief_id}: card Status → rejected")
     return True
@@ -1174,6 +1182,8 @@ def close_as_delivered(paths, brief_id, delivered_via, reason=""):
     remove_worktree(paths, brief_id)
 
     signal_dedup_clear(paths, brief_id)
+    # brief-151: delivered-elsewhere is terminal — release the claim.
+    _release_claim_quiet(paths, brief_id)
     log_action(paths, "close-as-delivered", {
         "brief": brief_id, "delivered_via": delivered_via, "reason": reason or "",
     })
@@ -1236,6 +1246,23 @@ def _init_commit_already_landed(wt_dir, brief):
     expected = f"Initialize brief {brief}"
     head = git(wt_dir, "log", "-1", "--format=%s", check=False)
     return head.returncode == 0 and head.stdout.strip() == expected
+
+
+def _release_claim_quiet(paths, brief_id):
+    """brief-151: best-effort delete of refs/claims/<brief_id> on a terminal/exit
+    transition (merge, reject, superseded, awaiting-review/escalate) so a
+    re-queued brief is re-claimable. Non-fatal: a failed release only leaks a
+    ref (Residue: stale-claim reaper is a follow-up) and must never break the
+    state transition."""
+    try:
+        config = read_config(paths["loop_dir"])
+        remote = config["GIT_REMOTE"]
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from claim import release_claim
+        if release_claim(paths["project_dir"], brief_id, remote):
+            log_action(paths, "claim_released", {"brief": brief_id})
+    except Exception as e:
+        print(f"release_claim: {brief_id} non-fatal failure: {e}", file=sys.stderr)
 
 
 def dispatch(paths):
@@ -1371,6 +1398,27 @@ def dispatch(paths):
     # ── Proceed with dispatch ────────────────────────────────────────
     # Fetch latest (no checkout needed — main tree untouched)
     git(project_dir, "fetch", remote, check=False)
+
+    # brief-151: atomic cross-box claim BEFORE any worktree exists. Two daemons
+    # sharing this repo+lane race to push refs/claims/<brief>; exactly one wins.
+    # On contention (another daemon holds it) skip cleanly; on a real push error
+    # (auth/network) fail loud and create NO branch/worktree (engineering rule
+    # 10 — claim-first is the whole point, anti-pattern: never push after).
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from claim import claim_brief
+    try:
+        claimed = claim_brief(project_dir, brief, remote)
+    except Exception as e:
+        log_action(paths, "claim_error", {"brief": brief, "error": str(e)})
+        print(f"dispatch: claim push for {brief} failed (fail-loud, no worktree): {e}",
+              file=sys.stderr)
+        os.remove(paths["pending_dispatch"])
+        return False
+    if not claimed:
+        log_action(paths, "claim_skip", {"brief": brief})
+        print(f"loop: brief {brief} already claimed — skipping", file=sys.stderr)
+        os.remove(paths["pending_dispatch"])
+        return False
 
     # Create worktree with new branch
     wt_dir = ensure_worktree(paths, brief, branch, config)
@@ -1623,6 +1671,10 @@ def merge(paths):
 
     signal_dedup_clear(paths, brief)
     push_bookkeeping(paths, remote, main_branch, f"post-merge cleanup {brief}")
+
+    # brief-151: brief is delivered — release the claim so a future re-queue is
+    # re-claimable. Best-effort; never blocks the completed merge.
+    _release_claim_quiet(paths, brief)
 
     # Remove queue file
     os.remove(paths["pending_merge"])
