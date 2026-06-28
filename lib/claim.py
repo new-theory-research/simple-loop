@@ -19,9 +19,20 @@ contention in lib/tests/test_lane_and_claim.py, golden ii):
      brief's top escalation trigger). ``_mint_claim_object`` fabricates a
      per-call commit so the pushed value always differs and the lease always
      fires.
-  2. A lease rejection prints "stale info" and exits non-zero — that is the
-     ONLY non-zero outcome we read as "already claimed" (return ``False``). ANY
-     other failure (auth, network, bad refspec) is fail-loud: it raises, so
+  2. Contention shows up as one of TWO non-zero rejections, depending on race
+     timing, and BOTH mean "the ref already exists — someone else claimed it"
+     (return ``False``):
+       - "stale info": the lease check itself fails because this clone's
+         remote-tracking ref already shows the claim ref present (the
+         sequential / already-fetched case).
+       - "reference already exists" / "failed to update ref": under TRUE
+         concurrency both pushes pass the empty-lease check optimistically (the
+         ref looked absent when each read it), then git's server-side ref lock
+         serializes them — the winner creates the ref and the loser fails at
+         LOCK time with this message. This is the COMMON path for two daemons
+         racing in real time (proven by golden ii's interleaved-threads test),
+         not an edge case. It is still atomically exactly-one-winner.
+     ANY other failure (auth, network, bad refspec) is fail-loud: it raises, so
      dispatch aborts and never falls through to worktree creation on an
      unverified claim (engineering rule 10).
 """
@@ -95,8 +106,17 @@ def claim_brief(project_dir, brief_id, remote):
     if result.returncode == 0:
         return True
     combined = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
-    # Lease rejection: the ref already existed — another daemon claimed it first.
-    if "stale info" in combined:
+    # Both rejections below mean the ref already existed — another daemon claimed
+    # it first. "stale info" is the lease check failing (sequential/fetched
+    # case); "reference already exists" / "failed to update ref" is the lock-time
+    # failure under true concurrency, where both pushes passed the empty lease
+    # optimistically and the server's ref lock let exactly one win (see module
+    # docstring point 2; golden ii interleaved-threads test).
+    if (
+        "stale info" in combined
+        or "reference already exists" in combined
+        or "failed to update ref" in combined
+    ):
         return False
     # Anything else (auth, network, bad refspec) is fail-loud — never silently
     # treat an unverified push as "someone else has it" (engineering rule 10).

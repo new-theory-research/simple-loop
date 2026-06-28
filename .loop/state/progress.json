@@ -1,15 +1,14 @@
 {
   "brief": "brief-151-lane-lock-and-claim",
   "brief_file": "wiki/briefs/cards/brief-151-lane-lock-and-claim/index.md",
-  "iteration": 2,
-  "status": "running",
+  "iteration": 3,
+  "status": "complete",
   "tasks_completed": [
     "Cycle 1: lane partition in queue.py (_parse_card_program + enumerate_dispatchable(lane=)) and --lane/LOOP_LANE threading through daemon.sh + actions.py drain gate",
-    "Cycle 2: lib/claim.py (claim_brief/release_claim via refs/claims/<id> --force-with-lease empty-expect) + claim-before-worktree in actions.py dispatch() + release on 4 exit transitions + install.sh copy"
+    "Cycle 2: lib/claim.py (claim_brief/release_claim via refs/claims/<id> --force-with-lease empty-expect) + claim-before-worktree in actions.py dispatch() + release on 4 exit transitions + install.sh copy",
+    "Cycle 3: lib/tests/test_lane_and_claim.py (3 goldens incl. load-bearing barrier-synchronized contention) + claim.py contention-classification fix + review.md/closeout.md"
   ],
-  "tasks_remaining": [
-    "Cycle 3: lib/tests/test_lane_and_claim.py — golden i (lane filter), golden ii (contention, load-bearing), golden iii (lane=None byte-for-byte equality)"
-  ],
+  "tasks_remaining": [],
   "learnings": [
     "queue.py: lane=None is the additive-invariant path — _parse_card_program is never called and the fingerprint string keeps its legacy 'goals_sig|ids' shape; a lane only adds a 'lane=<x>' namespace segment. Verified: 28 existing queue_test.py pass + golden i/iii spot-checks pass.",
     "Fail-closed lane rule confirmed: a card with no Program: field is EXCLUDED from any lane-filtered enumeration (returns Program '' which never equals a real lane key). Tested with an unlabeled card absent from both alpha and beta.",
@@ -18,6 +17,9 @@
     "Cycle 2 LOAD-BEARING git finding (verified live, git 2.50.1): claim_brief MUST push a UNIQUE minted commit object, NOT the shared HEAD. Pushing HEAD when the remote claim ref already points at HEAD makes git short-circuit to 'Everything up-to-date' (exit 0) WITHOUT evaluating --force-with-lease — so a 2nd claimer reading exit 0 wrongly believes it won (the brief's #1 escalation trigger: two True winners). Fix: _mint_claim_object uses `git mktree </dev/null` + `git -c user.name=... -c user.email=... commit-tree <empty-tree> -m 'claim <id> <host>:<pid>:<ns>'` so the pushed value always differs and the lease always fires. The empty-expect form is `--force-with-lease=refs/claims/<id>:` (trailing colon, no value).",
     "Cycle 2: lease rejection prints '[rejected] ... (stale info)' to stderr and exits non-zero — that string is the ONLY non-zero outcome read as 'already claimed' (return False). Every other non-zero (auth/network/bad refspec) raises RuntimeError → dispatch fail-loud, no worktree. Verified: contention one-True/one-False, release+re-claim, and RuntimeError on a bogus file:// remote.",
     "Cycle 2: release_claim wired via _release_claim_quiet (reads remote from config, imports claim by sys.path) at 4 active-exit transitions: merge(), reject_brief(), close_as_delivered(), move_to_awaiting_review(). Safe to release at awaiting_review because card Status stays 'active' there (only Status:queued is dispatchable) so no daemon re-grabs it; release makes a later human re-queue (Status→queued) re-claimable. Best-effort/non-fatal everywhere.",
-    "Cycle 2 verify: no .loop/config.sh in this project (no VERIFY_CMD); ran `python3 -m pytest lib/tests/ -q` = 150 passed (incl. test_dispatch_idempotency.py which exercises the modified dispatch path). Cycle 3 should add the contention suite + run test-flow-v2.sh as the regression gate."
+    "Cycle 2 verify: no .loop/config.sh in this project (no VERIFY_CMD); ran `python3 -m pytest lib/tests/ -q` = 150 passed (incl. test_dispatch_idempotency.py which exercises the modified dispatch path). Cycle 3 should add the contention suite + run test-flow-v2.sh as the regression gate.",
+    "Cycle 3 LOAD-BEARING finding: the contention test caught a real cycle-2 bug in claim.py. Under TRUE concurrency (barrier-synchronized threads, not sequential) the losing push does NOT print 'stale info' — it prints 'cannot lock ref ...: reference already exists' / 'failed to update ref'. Both pushes pass the empty --force-with-lease check optimistically (ref looked absent when each read), then git's server-side ref lock serializes them: winner creates the ref, loser fails AT LOCK TIME. Cycle 2 classified that message as fail-loud RuntimeError. Lease was still atomically correct (exactly one winner, no escalation trigger) but the loser raised instead of returning False — in prod the first real race would log claim_error not the clean claim_skip. FIX: claim.py now treats 'reference already exists'/'failed to update ref' as contention (return False) alongside 'stale info'. Sequential tests alone would never expose this.",
+    "Cycle 3 verify: python3 -m pytest lib/tests/test_lane_and_claim.py -v = 12 passed; python3 -m pytest lib/tests/ lib/queue_test.py -q = 190 passed. test-flow-v2.sh = 152 passed / 54 failed — the 54 are PRE-EXISTING (verified: stashed lib/claim.py, re-ran, identical 152/54 on committed cycle-2 state; failures are sandbox symlink/merge-to-main env issues, not brief-151). Brief criterion 'baseline pass count unchanged' holds: 152 passed unchanged. No escalation triggers fired.",
+    "Test-fixture note: golden ii interleaved test uses a fresh UNRELEASED bid per round, so claim refs accumulate on the bare remote across rounds. Per-round assertion must check the winner's ref is PRESENT, not that it's the only ref ever minted."
   ]
 }
