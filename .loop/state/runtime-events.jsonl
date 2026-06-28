@@ -26,3 +26,4 @@
 {"ts": "2026-06-28T22:37:46Z", "event": "merged", "brief": "brief-148-daemon-errors-bypass-dedup-and-loop-status-surfaces", "merge_sha": "b69ded9", "merged_at": "2026-06-28T22:37:46Z"}
 {"ts": "2026-06-28T22:41:03Z", "event": "merged", "brief": "brief-149-loop-info-command", "merge_sha": "8453fcd", "merged_at": "2026-06-28T22:41:03Z"}
 {"ts": "2026-06-28T22:47:16Z", "event": "merged", "brief": "brief-144-loop-init-scaffolds-prompts", "merge_sha": "28f1d4f", "merged_at": "2026-06-28T22:47:16Z"}
+{"ts": "2026-06-28T23:57:10Z", "event": "dispatched", "brief": "brief-152-queen-lane-wiring", "branch": "brief-152-queen-lane-wiring", "brief_file": "wiki/briefs/cards/brief-152-queen-lane-wiring/index.md", "worker_slot": 0, "throttle": 1, "parallel_safe": false, "edit_surface": ["templates/prompts/queen.md", "lib/queue.py", "bin/loop", "lib/tests/test_lane_and_claim.py"]}
