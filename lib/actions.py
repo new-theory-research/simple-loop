@@ -1297,7 +1297,11 @@ def dispatch(paths):
         _spec = importlib.util.spec_from_file_location("loop_queue", _qpath)
         _loop_queue = importlib.util.module_from_spec(_spec)
         _spec.loader.exec_module(_loop_queue)
-        decision = _loop_queue.head_solo_drain(project_dir, drain_secs, running=rc)
+        # brief-151: when this daemon is lane-partitioned (LOOP_LANE exported by
+        # daemon.sh), the drain gate must consider only this lane's queue head —
+        # otherwise a solo brief in another lane could wrongly hold our dispatch.
+        _lane = os.environ.get("LOOP_LANE") or None
+        decision = _loop_queue.head_solo_drain(project_dir, drain_secs, running=rc, lane=_lane)
         if decision["drain"] and decision["brief"] != brief:
             log_action(paths, "solo_drain_hold", {
                 "brief": brief,

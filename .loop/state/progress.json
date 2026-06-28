@@ -1,9 +1,19 @@
 {
   "brief": "brief-151-lane-lock-and-claim",
   "brief_file": "wiki/briefs/cards/brief-151-lane-lock-and-claim/index.md",
-  "iteration": 0,
+  "iteration": 1,
   "status": "running",
-  "tasks_completed": [],
-  "tasks_remaining": [],
-  "learnings": []
+  "tasks_completed": [
+    "Cycle 1: lane partition in queue.py (_parse_card_program + enumerate_dispatchable(lane=)) and --lane/LOOP_LANE threading through daemon.sh + actions.py drain gate"
+  ],
+  "tasks_remaining": [
+    "Cycle 2: lib/claim.py (claim_brief/release_claim via refs/claims/<id> --force-with-lease) + claim-before-worktree in actions.py dispatch() + release on terminal states + install.sh copy",
+    "Cycle 3: lib/tests/test_lane_and_claim.py — golden i (lane filter), golden ii (contention, load-bearing), golden iii (lane=None byte-for-byte equality)"
+  ],
+  "learnings": [
+    "queue.py: lane=None is the additive-invariant path — _parse_card_program is never called and the fingerprint string keeps its legacy 'goals_sig|ids' shape; a lane only adds a 'lane=<x>' namespace segment. Verified: 28 existing queue_test.py pass + golden i/iii spot-checks pass.",
+    "Fail-closed lane rule confirmed: a card with no Program: field is EXCLUDED from any lane-filtered enumeration (returns Program '' which never equals a real lane key). Tested with an unlabeled card absent from both alpha and beta.",
+    "daemon.sh: --lane is parsed from args-after-project_dir (shift then while-case) so the optional heartbeat positional still works in any order; CLI --lane wins over env/config LOOP_LANE; LOOP_LANE is exported so actions.py reads it via os.environ for the head_solo_drain gate. _LANE_OPT uses unquoted word-split (not an array) to dodge the bash-3.2 empty-array set -u trap — safe because lane names are space-free program slugs.",
+    "Cycle 2 anchor: dispatch() creates the worktree at the `ensure_worktree(paths, brief, branch, config)` call (actions.py ~line 1369, just after `git fetch`). claim_brief MUST be called BEFORE that line; on claim failure log + skip + create NO worktree."
+  ]
 }
