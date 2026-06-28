@@ -12,6 +12,47 @@ import os
 import sys
 
 
+def transform_card_status_content(content, status):
+    """Update Status: field in YAML frontmatter. Pure string transform.
+
+    Returns (new_content, changed). changed is False when content has no
+    frontmatter, frontmatter is unclosed, or Status is already the target.
+    """
+    lines = content.splitlines(keepends=True)
+
+    if not lines or lines[0].strip() != "---":
+        return (content, False)
+
+    fm_end = -1
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            fm_end = i
+            break
+
+    if fm_end == -1:
+        return (content, False)
+
+    new_lines = list(lines)
+    status_found = False
+
+    for i in range(1, fm_end):
+        stripped = lines[i].lstrip()
+        if stripped.lower().startswith("status:"):
+            existing_val = stripped[len("status:"):].strip()
+            if existing_val == status:
+                return (content, False)  # already the target — no-op
+            leading = lines[i][: len(lines[i]) - len(lines[i].lstrip())]
+            key = "Status" if stripped.startswith("S") else "status"
+            new_lines[i] = f"{leading}{key}: {status}\n"
+            status_found = True
+            break
+
+    if not status_found:
+        new_lines.insert(1, f"Status: {status}\n")
+
+    return ("".join(new_lines), True)
+
+
 def set_card_status(card_path, status):
     """Set the Status: field in YAML frontmatter.
 
@@ -26,7 +67,6 @@ def set_card_status(card_path, status):
         return False
 
     lines = content.splitlines(keepends=True)
-
     if not lines or lines[0].strip() != "---":
         print(f"set_card_status: no frontmatter in {card_path} — skipping", file=sys.stderr)
         return False
@@ -36,35 +76,17 @@ def set_card_status(card_path, status):
         if lines[i].strip() == "---":
             fm_end = i
             break
-
     if fm_end == -1:
         print(f"set_card_status: unclosed frontmatter in {card_path} — skipping", file=sys.stderr)
         return False
 
-    new_lines = list(lines)
-    status_found = False
-
-    for i in range(1, fm_end):
-        stripped = lines[i].lstrip()
-        key_lower = stripped.lower()
-        if key_lower.startswith("status:"):
-            existing_val = stripped[len("status:"):].strip()
-            if existing_val == status:
-                return False  # already the target — no-op
-            # Preserve leading whitespace; match original key casing
-            leading = lines[i][: len(lines[i]) - len(lines[i].lstrip())]
-            key = "Status" if stripped.startswith("S") else "status"
-            new_lines[i] = f"{leading}{key}: {status}\n"
-            status_found = True
-            break
-
-    if not status_found:
-        # No Status: line — insert after opening ---
-        new_lines.insert(1, f"Status: {status}\n")
+    new_content, changed = transform_card_status_content(content, status)
+    if not changed:
+        return False
 
     try:
         with open(card_path, "w") as f:
-            f.write("".join(new_lines))
+            f.write(new_content)
         return True
     except (IOError, OSError) as e:
         print(f"set_card_status: cannot write {card_path}: {e}", file=sys.stderr)
