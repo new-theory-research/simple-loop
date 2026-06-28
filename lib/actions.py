@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 
 
@@ -1470,24 +1471,53 @@ def dispatch(paths):
     )
 
     # Update card Status → active (card-is-truth: queued → active on dispatch)
-    _card_path = os.path.join(project_dir, "wiki", "briefs", "cards", brief, "index.md")
-    if os.path.exists(_card_path):
-        try:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from _set_card_status import set_card_status as _set_card_status_fn
-            _changed = _set_card_status_fn(_card_path, "active")
-            if _changed:
-                git(project_dir, "add", _card_path, check=False)
-                git(project_dir, "commit", "-m", f"loop: card status → active for {brief}", check=False)
-                log_action(paths, "card_status_set_active", {"brief": brief})
-        except Exception as e:
-            print(f"dispatch: card status update failed for {brief}: {e} (non-fatal)", file=sys.stderr)
+    # Uses plumbing: reads from main, transforms in memory, commits to main.
+    # Working tree is never touched — immune to worktree branch drift.
+    _card_repo_path = f"wiki/briefs/cards/{brief}/index.md"
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from _set_card_status import transform_card_status_content as _transform_fn
+        from git_plumbing import (
+            read_file_at_branch as _read_branch,
+            commit_file_to_branch as _commit_file,
+        )
+        _card_content = _read_branch(project_dir, _card_repo_path, main_branch)
+        _new_content, _changed = _transform_fn(_card_content, "active")
+        if _changed:
+            _tmp_fd, _tmp_path = tempfile.mkstemp(prefix="card-status-", suffix=".md")
+            try:
+                os.write(_tmp_fd, _new_content.encode())
+                os.close(_tmp_fd)
+                _commit_file(project_dir, _tmp_path, _card_repo_path, main_branch,
+                             f"loop: card status → active for {brief}")
+            finally:
+                try:
+                    os.unlink(_tmp_path)
+                except OSError:
+                    pass
+            log_action(paths, "card_status_set_active", {"brief": brief})
+    except Exception as e:
+        print(f"dispatch: card status update failed for {brief}: {e} (non-fatal)", file=sys.stderr)
 
     # brief-108-d: project running.json from cards + events. Single-write owner.
     project_running(paths)
-    git(project_dir, "add", paths["running_file"],
-        os.path.join(project_dir, ".loop", "state", "runtime-events.jsonl"), check=False)
-    git(project_dir, "commit", "-m", f"loop: project running.json (dispatch {brief})", check=False)
+    # Commit state files to main via plumbing — immune to worktree branch drift.
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from git_plumbing import commit_files_to_branch as _commit_files_fn
+        _events_path = os.path.join(project_dir, ".loop", "state", "runtime-events.jsonl")
+        _state_files = [(paths["running_file"],
+                         os.path.relpath(paths["running_file"], project_dir))]
+        if os.path.exists(_events_path):
+            _state_files.append((_events_path,
+                                  os.path.relpath(_events_path, project_dir)))
+        _commit_files_fn(
+            project_dir, _state_files, main_branch,
+            f"loop: project running.json (dispatch {brief})",
+        )
+    except Exception as e:
+        print(f"dispatch: running.json plumbing commit failed for {brief}: {e} (non-fatal)",
+              file=sys.stderr)
 
     push_bookkeeping(paths, remote, main_branch, f"dispatch {brief}")
 
