@@ -44,6 +44,24 @@ mkdir -p "$INSTALL_DIR"/{lib,templates/prompts}
 mkdir -p "$INSTALL_DIR"/core/{agents,skills,templates}
 mkdir -p "$BIN_DIR"
 
+# Record source provenance for `loop info`
+SOURCE_COMMIT=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+_sl_dirty_check=$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null | head -1)
+if [ -n "$_sl_dirty_check" ]; then SOURCE_DIRTY="true"; else SOURCE_DIRTY="false"; fi
+python3 -c "
+import json, datetime
+data = {
+    'source_repo': '$SCRIPT_DIR',
+    'source_commit': '$SOURCE_COMMIT',
+    'source_dirty': $SOURCE_DIRTY,
+    'version': '0.2.0',
+    'installed_at': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+}
+with open('$INSTALL_DIR/PROVENANCE.json', 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+"
+
 # Copy lib (daemon runtime)
 cp "$SCRIPT_DIR/lib/daemon.sh" "$INSTALL_DIR/lib/"
 cp "$SCRIPT_DIR/lib/actions.py" "$INSTALL_DIR/lib/"
