@@ -88,6 +88,153 @@ pub fn pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+// ── external commits on main ──────────────────────────────────────────────────
+
+pub struct ExternalCommit {
+    pub sha_short: String,
+    pub author: String,
+    pub subject: String,
+}
+
+pub struct ExternalMain {
+    pub count_external: usize,
+    pub last_external: Option<ExternalCommit>,
+    /// True when `git log` against the remote branch failed (not fetched yet,
+    /// remote not configured, etc.). Hive renders `?` instead of a count.
+    pub error: bool,
+    /// True when no `git config user.email` was found and only the static
+    /// defaults are in use. Surface as an allowlist warning in the render.
+    pub allowlist_defaults_only: bool,
+}
+
+/// Build the daemon-author allowlist from static defaults + local git config
+/// + `HIVE_DAEMON_AUTHORS` env override. Returns (allowlist, defaults_only).
+fn resolve_daemon_authors(project_dir: &Path) -> (Vec<String>, bool) {
+    let mut allowlist: Vec<String> = vec![
+        "scaviefae".to_string(),
+        "claude-bot".to_string(),
+        "noreply@anthropic".to_string(),
+    ];
+    let mut defaults_only = true;
+
+    let local_email = std::process::Command::new("git")
+        .args([
+            "-C",
+            project_dir.to_str().unwrap_or("."),
+            "config",
+            "--get",
+            "user.email",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(email) = local_email {
+        allowlist.push(email);
+        defaults_only = false;
+    }
+
+    if let Ok(env_val) = std::env::var("HIVE_DAEMON_AUTHORS") {
+        for part in env_val.split(',') {
+            let p = part.trim().to_string();
+            if !p.is_empty() {
+                allowlist.push(p);
+                defaults_only = false;
+            }
+        }
+    }
+
+    (allowlist, defaults_only)
+}
+
+pub fn read_external_commits_on_main(project_dir: &Path) -> ExternalMain {
+    let (allowlist, defaults_only) = resolve_daemon_authors(project_dir);
+
+    let remote = std::env::var("GIT_REMOTE").unwrap_or_else(|_| "origin".to_string());
+    let main_branch = std::env::var("GIT_MAIN_BRANCH").unwrap_or_else(|_| "main".to_string());
+    let ref_spec = format!("{}/{}", remote, main_branch);
+
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            project_dir.to_str().unwrap_or("."),
+            "log",
+            "--format=%H|%an|%ae|%s",
+            &ref_spec,
+            "-n",
+            "50",
+        ])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => {
+            eprintln!("hive: git log {ref_spec} failed — showing External on main: ?");
+            return ExternalMain {
+                count_external: 0,
+                last_external: None,
+                error: true,
+                allowlist_defaults_only: defaults_only,
+            };
+        }
+    };
+
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(s) => s,
+        Err(_) => {
+            return ExternalMain {
+                count_external: 0,
+                last_external: None,
+                error: true,
+                allowlist_defaults_only: defaults_only,
+            };
+        }
+    };
+
+    let is_daemon = |name: &str, email: &str| -> bool {
+        let name_lc = name.to_lowercase();
+        let email_lc = email.to_lowercase();
+        allowlist
+            .iter()
+            .any(|a| {
+                let a_lc = a.to_lowercase();
+                name_lc.contains(&a_lc) || email_lc.contains(&a_lc)
+            })
+    };
+
+    let mut count_external = 0usize;
+    let mut last_external: Option<ExternalCommit> = None;
+
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.splitn(4, '|').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let (sha, name, email, subject) = (parts[0], parts[1], parts[2], parts[3]);
+
+        if !is_daemon(name, email) {
+            count_external += 1;
+            if last_external.is_none() {
+                last_external = Some(ExternalCommit {
+                    sha_short: sha.chars().take(7).collect(),
+                    author: email.to_string(),
+                    subject: subject.to_string(),
+                });
+            }
+        }
+    }
+
+    ExternalMain {
+        count_external,
+        last_external,
+        error: false,
+        allowlist_defaults_only: defaults_only,
+    }
+}
+
 // ── log.jsonl parsing ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -342,6 +489,9 @@ pub struct HiveState {
     /// Briefs waiting to re-dispatch once a precondition clears.
     /// Parsed from goals.md `**Blocked-on:**` markers. Empty = section hidden.
     pub requeued_briefs: Vec<ReQueuedBrief>,
+    /// Commits on `${GIT_REMOTE}/${GIT_MAIN_BRANCH}` whose author is not in
+    /// the daemon-author allowlist. Computed at each refresh tick.
+    pub external_main: ExternalMain,
 }
 
 impl HiveState {
@@ -442,6 +592,8 @@ impl HiveState {
         let goals_path = Path::new(".loop/state/goals.md");
         let requeued_briefs = parse_requeued_goals_md(goals_path, &merged_briefs);
 
+        let external_main = read_external_commits_on_main(Path::new("."));
+
         HiveState {
             pid,
             pid_alive,
@@ -450,6 +602,7 @@ impl HiveState {
             interval_mode,
             daemon_started_at,
             requeued_briefs,
+            external_main,
         }
     }
 }
@@ -3337,6 +3490,7 @@ mod tests {
             interval_mode: IntervalMode::Idle,
             daemon_started_at: None,
             requeued_briefs: vec![],
+            external_main: ExternalMain { count_external: 0, last_external: None, error: false, allowlist_defaults_only: false },
         };
         let c = hs.heartbeat_countdown().expect("should produce countdown");
         assert!(c.starts_with("next ~"), "got: {}", c);
@@ -3354,6 +3508,7 @@ mod tests {
             interval_mode: IntervalMode::Idle,
             daemon_started_at: None,
             requeued_briefs: vec![],
+            external_main: ExternalMain { count_external: 0, last_external: None, error: false, allowlist_defaults_only: false },
         };
         let c = hs.heartbeat_countdown().expect("should produce countdown");
         assert!(c.starts_with("overdue"), "got: {}", c);
@@ -3371,6 +3526,7 @@ mod tests {
             interval_mode: IntervalMode::Active,
             daemon_started_at: None,
             requeued_briefs: vec![],
+            external_main: ExternalMain { count_external: 0, last_external: None, error: false, allowlist_defaults_only: false },
         };
         let c = hs.heartbeat_countdown().expect("should produce countdown");
         assert_eq!(c, "busy cycling");
@@ -3386,6 +3542,7 @@ mod tests {
             interval_mode: IntervalMode::Unknown,
             daemon_started_at: None,
             requeued_briefs: vec![],
+            external_main: ExternalMain { count_external: 0, last_external: None, error: false, allowlist_defaults_only: false },
         };
         assert!(hs.heartbeat_countdown().is_none());
     }
