@@ -2121,7 +2121,13 @@ cc_run_gate() {
 import sys, os
 sys.path.insert(0, '$LIB_DIR')
 import actions as A
+import claim as C
 paths = A.init_paths('$CC_SCRATCH')
+# brief-151: dispatch() does 'from claim import claim_brief' at call-time and
+# claim_brief uses its OWN subprocess git push (not A.git), so without this stub
+# the in-test claim hits a real 'git push' to a nonexistent remote and fails loud.
+# Stub it to report this daemon won the claim, so dispatch proceeds to the gate.
+C.claim_brief = lambda *a, **kw: True
 # Short-circuit after the gate passes: raise before any git operation.
 def stop_here(*a, **kw):
     raise SystemExit('__gate_pass__')

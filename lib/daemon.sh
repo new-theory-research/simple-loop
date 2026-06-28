@@ -30,6 +30,32 @@ LOOP_DIR="$PROJECT_DIR/.loop"
 [ -f "$LOOP_DIR/config.sh" ] && source "$LOOP_DIR/config.sh"
 [ -f "$LOOP_DIR/config.local.sh" ] && source "$LOOP_DIR/config.local.sh"
 
+# brief-151: optional program-lane partition. `--lane <name>` (or the LOOP_LANE
+# env / config var) restricts this daemon to dispatching briefs whose card
+# Program: matches <name>. Unset/empty → no lane filter → single-daemon
+# behavior byte-for-byte unchanged. Scan the args after project_dir so the
+# optional heartbeat positional still works alongside --lane in any order; CLI
+# --lane wins over the env/config LOOP_LANE.
+shift || true
+_CLI_LANE=""
+_HEARTBEAT_ARG=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --lane)   shift; _CLI_LANE="${1:-}" ;;
+        --lane=*) _CLI_LANE="${1#--lane=}" ;;
+        *)        [ -z "$_HEARTBEAT_ARG" ] && _HEARTBEAT_ARG="$1" ;;
+    esac
+    shift
+done
+LOOP_LANE="${_CLI_LANE:-${LOOP_LANE:-}}"
+export LOOP_LANE
+# Reusable CLI fragment for lane-aware queue.py invocations. Empty (expands to
+# nothing) when no lane is set; word-splits into `--lane <name>` otherwise.
+# Lane names are program slugs with no spaces, so unquoted expansion is safe and
+# sidesteps the bash-3.2 empty-array `set -u` trap.
+_LANE_OPT=""
+[ -n "$LOOP_LANE" ] && _LANE_OPT="--lane $LOOP_LANE"
+
 STATE_DIR="$LOOP_DIR/state"
 SIGNALS_DIR="$STATE_DIR/signals"
 LOG_DIR="$LOOP_DIR/logs"
@@ -41,7 +67,7 @@ WORKER_PROMPT="$LOOP_DIR/prompts/worker.md"
 # Validator default agent spec (per-brief **Validator:** override lands in task 5).
 VALIDATOR_AGENT_DEFAULT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/core/agents/reviewer.md"
 
-HEARTBEAT_INTERVAL="${2:-${HEARTBEAT_INTERVAL:-300}}"
+HEARTBEAT_INTERVAL="${_HEARTBEAT_ARG:-${HEARTBEAT_INTERVAL:-300}}"
 WORKER_COOLDOWN="${WORKER_COOLDOWN:-30}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-20}"
 NTFY_TOPIC="${SIMPLE_LOOP_NTFY_TOPIC:-${NTFY_TOPIC:-}}"
@@ -1593,7 +1619,7 @@ while true; do
             # (goals.md stat + ordered dispatchable ids, see queue.py) into
             # the comparison: any queue change invalidates the dedup and the
             # next tick invokes the queen.
-            _QUEUE_FP=$(python3 "$DAEMON_LIB_DIR/queue.py" "$PROJECT_DIR" --fingerprint 2>/dev/null || echo "fp-unavailable")
+            _QUEUE_FP=$(python3 "$DAEMON_LIB_DIR/queue.py" "$PROJECT_DIR" --fingerprint $_LANE_OPT 2>/dev/null || echo "fp-unavailable")
             if [ "$_SHOULD_DEDUP" = "true" ] && [ "$_QUEUE_FP" != "$LAST_QUEUE_FP" ]; then
                 daemon_log "QUEEN: dedup invalidated — queue fingerprint changed (${LAST_QUEUE_FP:-none} → ${_QUEUE_FP})"
                 _SHOULD_DEDUP=false
@@ -1607,7 +1633,7 @@ while true; do
             # filesystem scan via queue.py; if there's anything dispatchable,
             # bypass the dedup so the queen sees the new work this tick.
             if [ "$_SHOULD_DEDUP" = "true" ] && [ "$REASON" = "no_active" ]; then
-                _DISPATCH_COUNT=$(python3 "$DAEMON_LIB_DIR/queue.py" "$PROJECT_DIR" 2>/dev/null \
+                _DISPATCH_COUNT=$(python3 "$DAEMON_LIB_DIR/queue.py" "$PROJECT_DIR" $_LANE_OPT 2>/dev/null \
                     | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null \
                     || echo "0")
                 if [ "${_DISPATCH_COUNT:-0}" -gt 0 ]; then
@@ -1630,7 +1656,7 @@ while true; do
                 # Re-stat the queue AFTER the queen ran: she may have dispatched
                 # (mutating the queue herself); stamping the post-queen state
                 # keeps her own dispatch from busting the dedup next tick.
-                LAST_QUEUE_FP=$(python3 "$DAEMON_LIB_DIR/queue.py" "$PROJECT_DIR" --fingerprint 2>/dev/null || echo "fp-unavailable")
+                LAST_QUEUE_FP=$(python3 "$DAEMON_LIB_DIR/queue.py" "$PROJECT_DIR" --fingerprint $_LANE_OPT 2>/dev/null || echo "fp-unavailable")
                 DID_WORK=true
 
                 # Re-assess after queen

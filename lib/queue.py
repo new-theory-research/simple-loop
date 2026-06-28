@@ -50,6 +50,33 @@ def _parse_card_status(card_path):
     return ""
 
 
+def _parse_card_program(card_path):
+    """Return lowercased Program: value from YAML frontmatter, or ''.
+
+    Sibling of _parse_card_status — reuses the same frontmatter reader rather
+    than hand-rolling a second YAML parser (brief-151). The Program: field is
+    the program-lane partition key. '' means the card declares no lane, which a
+    lane-filtered enumeration treats fail-closed (excluded — an unlabeled brief
+    is never silently grabbed by a lane queen).
+    """
+    try:
+        with open(card_path) as f:
+            in_fm = False
+            for line in f:
+                stripped = line.strip()
+                if stripped == "---":
+                    if not in_fm:
+                        in_fm = True
+                        continue
+                    else:
+                        break
+                if in_fm and stripped.lower().startswith("program:"):
+                    return stripped.split(":", 1)[1].strip().lower()
+    except (IOError, OSError):
+        pass
+    return ""
+
+
 def _goals_order(goals_path):
     """Return brief IDs in first-appearance order from goals.md."""
     seen = set()
@@ -67,7 +94,7 @@ def _goals_order(goals_path):
     return order
 
 
-def enumerate_dispatchable(project_dir, running=None):
+def enumerate_dispatchable(project_dir, running=None, lane=None):
     """Return dispatchable brief candidates ordered by goals.md queue position.
 
     Scans wiki/briefs/cards/*/index.md, keeps only cards with Status: queued
@@ -79,10 +106,18 @@ def enumerate_dispatchable(project_dir, running=None):
     Args:
         project_dir: project root path (str).
         running: parsed running.json dict, or None to read from disk.
+        lane: optional program-lane partition key (brief-151). When None
+            (default), the card Program: field is never read and every queued
+            card is a candidate — single-daemon behavior byte-for-byte
+            unchanged. When set, only cards whose Program: lowercases to
+            lane.lower() are kept; a card with NO Program: field is EXCLUDED
+            (fail-closed — an unlabeled brief never gets silently grabbed by a
+            lane queen).
 
     Returns:
         List of dicts with keys: brief, branch, brief_file.
     """
+    lane_key = lane.lower() if lane is not None else None
     cards_dir = os.path.join(project_dir, "wiki", "briefs", "cards")
 
     if running is None:
@@ -111,6 +146,8 @@ def enumerate_dispatchable(project_dir, running=None):
             if not os.path.isfile(card_path):
                 continue
             if _parse_card_status(card_path) != "queued":
+                continue
+            if lane_key is not None and _parse_card_program(card_path) != lane_key:
                 continue
             candidates.append({
                 "brief": card_id,
@@ -169,7 +206,7 @@ def _card_queued_age_secs(project_dir, card_rel_path, now=None):
     return age if age > 0 else 0.0
 
 
-def head_solo_drain(project_dir, threshold_secs, running=None, now=None):
+def head_solo_drain(project_dir, threshold_secs, running=None, now=None, lane=None):
     """Drain-for-solo decision (SOLO_DRAIN_AFTER_SECS).
 
     Returns a dict {"drain": bool, "brief": <head id or "">, "waited": <secs>}.
@@ -187,7 +224,7 @@ def head_solo_drain(project_dir, threshold_secs, running=None, now=None):
     if not threshold_secs or threshold_secs <= 0:
         return {"drain": False, "brief": "", "waited": 0.0}
 
-    candidates = enumerate_dispatchable(project_dir, running=running)
+    candidates = enumerate_dispatchable(project_dir, running=running, lane=lane)
     if not candidates:
         return {"drain": False, "brief": "", "waited": 0.0}
 
@@ -204,7 +241,7 @@ def head_solo_drain(project_dir, threshold_secs, running=None, now=None):
     }
 
 
-def queue_fingerprint(project_dir):
+def queue_fingerprint(project_dir, lane=None):
     """Cheap queue-state fingerprint for the daemon's queen dedup key (issue #17).
 
     The queen dedup key used to be the trigger name alone, so queue mutations
@@ -225,18 +262,44 @@ def queue_fingerprint(project_dir):
     except OSError:
         goals_sig = "missing"
 
-    ids = ",".join(c["brief"] for c in enumerate_dispatchable(project_dir))
-    raw = "%s|%s" % (goals_sig, ids)
+    ids = ",".join(c["brief"] for c in enumerate_dispatchable(project_dir, lane=lane))
+    # lane=None keeps the legacy fingerprint string byte-for-byte; a lane-scoped
+    # daemon gets a distinct namespace so two lanes can't collide on identical
+    # id lists (brief-151).
+    if lane is None:
+        raw = "%s|%s" % (goals_sig, ids)
+    else:
+        raw = "%s|lane=%s|%s" % (goals_sig, lane.lower(), ids)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def main():
-    args = [a for a in sys.argv[1:] if a != "--fingerprint"]
-    project_dir = args[0] if args else os.getcwd()
-    if "--fingerprint" in sys.argv[1:]:
-        print(queue_fingerprint(project_dir))
+    argv = sys.argv[1:]
+    fingerprint = False
+    lane = None
+    positional = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--fingerprint":
+            fingerprint = True
+        elif a == "--lane":
+            i += 1
+            lane = argv[i] if i < len(argv) else None
+        elif a.startswith("--lane="):
+            lane = a[len("--lane="):]
+        else:
+            positional.append(a)
+        i += 1
+    # An explicit empty --lane "" is degenerate; treat it as no lane so it can't
+    # accidentally match unlabeled cards (which report Program: "").
+    if lane == "":
+        lane = None
+    project_dir = positional[0] if positional else os.getcwd()
+    if fingerprint:
+        print(queue_fingerprint(project_dir, lane=lane))
     else:
-        print(json.dumps(enumerate_dispatchable(project_dir), indent=2))
+        print(json.dumps(enumerate_dispatchable(project_dir, lane=lane), indent=2))
 
 
 if __name__ == "__main__":

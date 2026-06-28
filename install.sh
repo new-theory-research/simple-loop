@@ -54,6 +54,7 @@ cp "$SCRIPT_DIR/lib/auto_merge.py" "$INSTALL_DIR/lib/"
 cp "$SCRIPT_DIR/lib/startup_repair.py" "$INSTALL_DIR/lib/"
 cp "$SCRIPT_DIR/lib/_set_card_status.py" "$INSTALL_DIR/lib/"
 cp "$SCRIPT_DIR/lib/queue.py" "$INSTALL_DIR/lib/"
+cp "$SCRIPT_DIR/lib/claim.py" "$INSTALL_DIR/lib/"
 cp "$SCRIPT_DIR/lib/state.py" "$INSTALL_DIR/lib/"
 cp "$SCRIPT_DIR/lib/migrate_runtime_events.py" "$INSTALL_DIR/lib/"
 cp "$SCRIPT_DIR/lib/metrics-report.py" "$INSTALL_DIR/lib/" 2>/dev/null || true
