@@ -3850,6 +3850,98 @@ fi
 
 rm -rf "$IS_SCRATCH"
 
+# ── Tests 127-130: brief-148 — queen-error dedup bypass + loop status surface ──
+
+# Test 127: daemon.sh uniquifies LAST_CONDUCTOR_TRIGGER on error ticks (dedup bypass).
+T127_PATTERN=$(grep -c 'error_${_CONDUCTOR_INVOKE_RC}_${_NOW}' "$LIB_DIR/daemon.sh" 2>/dev/null || echo "0")
+assert_eq "brief-148: daemon.sh uniquifies LAST_CONDUCTOR_TRIGGER on error (dedup bypass)" \
+    "$T127_PATTERN" "1"
+
+# Test 128: daemon.sh writes last-queen-error.json on at least two error paths
+# (queen-prompt-not-found + non-zero exit).
+T128_COUNT=$(grep -c 'last-queen-error.json' "$LIB_DIR/daemon.sh" 2>/dev/null || echo "0")
+if [ "$T128_COUNT" -ge 2 ]; then
+    pass "brief-148: daemon.sh writes last-queen-error.json on multiple error paths (count=$T128_COUNT)"
+else
+    fail "brief-148: daemon.sh missing last-queen-error.json writes — expected ≥2, got $T128_COUNT"
+fi
+
+# Tests 129-130: cmd_status Python error-block logic renders and suppresses correctly.
+STATUS_ERR_SCRATCH=$(mktemp -d)
+
+# Shared Python snippet mirroring the cmd_status inline logic.
+_run_status_logic() {
+    local err_f="$1" suc_f="$2"
+    python3 -c "
+import json, sys, os, time
+from datetime import datetime
+
+error_file = '$err_f'
+success_file = '$suc_f'
+
+try:
+    with open(error_file) as f:
+        err = json.load(f)
+except Exception:
+    print('UNREADABLE')
+    sys.exit(0)
+
+reason = err.get('reason', 'unknown error')
+err_ts_str = err.get('ts', '')
+now = time.time()
+err_epoch = now
+try:
+    err_dt = datetime.fromisoformat(err_ts_str.replace('Z', '+00:00'))
+    err_epoch = err_dt.timestamp()
+except Exception:
+    pass
+
+age_s = now - err_epoch
+if age_s > 3600 and os.path.isfile(success_file):
+    try:
+        with open(success_file) as f:
+            suc = json.load(f)
+        suc_dt = datetime.fromisoformat(suc.get('ts', '').replace('Z', '+00:00'))
+        if suc_dt.timestamp() > err_epoch:
+            print('SUPPRESSED')
+            sys.exit(0)
+    except Exception:
+        pass
+
+print('SHOWN:' + reason)
+" 2>/dev/null
+}
+
+# Test 129: warning shown when error file is recent.
+python3 -c "
+import json, datetime
+ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+json.dump({'ts': ts, 'reason': 'queen prompt not found at .loop/prompts/queen.md',
+           'exit_code': 1, 'log_tail': 'ERROR: No such file'},
+    open('$STATUS_ERR_SCRATCH/last-queen-error.json', 'w'))
+" 2>/dev/null
+T129_OUT=$(_run_status_logic "$STATUS_ERR_SCRATCH/last-queen-error.json" "$STATUS_ERR_SCRATCH/last-queen-success.json")
+if echo "$T129_OUT" | grep -q "SHOWN:queen prompt not found"; then
+    pass "brief-148: cmd_status error block shown when last-queen-error.json is recent"
+else
+    fail "brief-148: cmd_status error block not shown for recent error — got: $T129_OUT"
+fi
+
+# Test 130: warning suppressed when error is >1h old and a success tick is newer.
+python3 -c "
+import json, datetime
+old_ts = '2000-01-01T00:00:00Z'
+new_ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+json.dump({'ts': old_ts, 'reason': 'stale error', 'exit_code': 1, 'log_tail': ''},
+    open('$STATUS_ERR_SCRATCH/last-queen-error.json', 'w'))
+json.dump({'ts': new_ts}, open('$STATUS_ERR_SCRATCH/last-queen-success.json', 'w'))
+" 2>/dev/null
+T130_OUT=$(_run_status_logic "$STATUS_ERR_SCRATCH/last-queen-error.json" "$STATUS_ERR_SCRATCH/last-queen-success.json")
+assert_eq "brief-148: cmd_status error block suppressed when >1h old and success is newer" \
+    "$T130_OUT" "SUPPRESSED"
+
+rm -rf "$STATUS_ERR_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""

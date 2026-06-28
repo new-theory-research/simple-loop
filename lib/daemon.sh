@@ -281,6 +281,12 @@ invoke_conductor() {
 
     if [ ! -f "$CONDUCTOR_PROMPT" ]; then
         daemon_log "ERROR: queen prompt not found at $CONDUCTOR_PROMPT"
+        local _qe_tmp _qe_ts
+        _qe_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        _qe_tmp=$(mktemp)
+        python3 -c "import json,sys; json.dump({'ts':sys.argv[1],'reason':sys.argv[2],'exit_code':1,'log_tail':''},sys.stdout)" \
+            "$_qe_ts" "queen prompt not found at $CONDUCTOR_PROMPT" \
+            > "$_qe_tmp" && mv "$_qe_tmp" "$STATE_DIR/last-queen-error.json" || rm -f "$_qe_tmp"
         return 1
     fi
 
@@ -310,12 +316,32 @@ Trigger reason: $reason" \
         daemon_log "QUEEN #$TURN: FAILED (exit $EXIT_CODE, ${TURN_DURATION}s)"
         notify "Queen FAILED (exit $EXIT_CODE)"
 
+        local _qe_tmp _qe_ts
+        _qe_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        _qe_tmp=$(mktemp)
+        python3 -c '
+import json, sys, os
+ts, reason, exit_code, log_file = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+log_tail = ""
+if log_file and os.path.isfile(log_file):
+    with open(log_file) as f:
+        log_tail = "".join(f.readlines()[-10:])[:1900]
+json.dump({"ts": ts, "reason": reason, "exit_code": exit_code, "log_tail": log_tail}, sys.stdout)
+' "$_qe_ts" "claude exit $EXIT_CODE" "$EXIT_CODE" "$TURN_LOG" \
+            > "$_qe_tmp" && mv "$_qe_tmp" "$STATE_DIR/last-queen-error.json" || rm -f "$_qe_tmp"
+
         if [ "$TURN_DURATION" -le 10 ] && grep -q "out of extra usage" "$TURN_LOG" 2>/dev/null; then
             handle_rate_limit "$TURN_LOG"
             return 1
         fi
+        return 1
     else
         daemon_log "QUEEN #$TURN: complete (${TURN_DURATION}s)"
+        rm -f "$STATE_DIR/last-queen-error.json"
+        local _qs_tmp
+        _qs_tmp=$(mktemp)
+        printf '{"ts":"%s"}' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > "$_qs_tmp" && mv "$_qs_tmp" "$STATE_DIR/last-queen-success.json" || rm -f "$_qs_tmp"
 
         # Brief-003 Thread 7: Auto-merge layer.
         # If the queen wrote an `escalate.json` with reason
@@ -1650,8 +1676,16 @@ while true; do
                 fi
                 write_heartbeat "phase2_queen:$REASON"
                 invoke_conductor "$REASON"
+                _CONDUCTOR_INVOKE_RC=$?
                 CONDUCTOR_FIRED_THIS_TICK=$((CONDUCTOR_FIRED_THIS_TICK + 1))
-                LAST_CONDUCTOR_TRIGGER="$CONDUCTOR_TRIGGER"
+                if [ "$_CONDUCTOR_INVOKE_RC" -ne 0 ]; then
+                    # Error tick (brief-148): unique key so next tick's dedup
+                    # doesn't match — a swallowed queen error gets re-evaluated
+                    # next tick instead of cached for up to CONDUCTOR_DEDUP_TTL_SECS.
+                    LAST_CONDUCTOR_TRIGGER="error_${_CONDUCTOR_INVOKE_RC}_${_NOW}"
+                else
+                    LAST_CONDUCTOR_TRIGGER="$CONDUCTOR_TRIGGER"
+                fi
                 LAST_CONDUCTOR_TRIGGER_TS="$_NOW"
                 # Re-stat the queue AFTER the queen ran: she may have dispatched
                 # (mutating the queue herself); stamping the post-queen state
