@@ -1000,6 +1000,65 @@ cmd_status() {
     echo "╚══════════════════════════════════════╝"
     echo ""
 
+    # Queen error — brief-148: surface last queen error if recent and unresolved.
+    # Suppressed when absent, or when >1h old and a success tick has happened since.
+    if [ -f "$STATE_DIR/last-queen-error.json" ]; then
+        python3 -c "
+import json, sys, os, time
+from datetime import datetime
+
+error_file = '$STATE_DIR/last-queen-error.json'
+success_file = '$STATE_DIR/last-queen-success.json'
+
+try:
+    with open(error_file) as f:
+        err = json.load(f)
+except Exception:
+    print('  ⚠ Daemon error (file unreadable; see daemon.log)')
+    print()
+    sys.exit(0)
+
+reason = err.get('reason', 'unknown error')
+err_ts_str = err.get('ts', '')
+log_tail = err.get('log_tail', '')
+
+now = time.time()
+err_epoch = now
+try:
+    err_dt = datetime.fromisoformat(err_ts_str.replace('Z', '+00:00'))
+    err_epoch = err_dt.timestamp()
+except Exception:
+    pass
+
+age_s = now - err_epoch
+
+if age_s > 3600 and os.path.isfile(success_file):
+    try:
+        with open(success_file) as f:
+            suc = json.load(f)
+        suc_dt = datetime.fromisoformat(suc.get('ts', '').replace('Z', '+00:00'))
+        if suc_dt.timestamp() > err_epoch:
+            sys.exit(0)
+    except Exception:
+        pass
+
+if age_s < 60:
+    age_str = f'{int(age_s)}s ago'
+elif age_s < 3600:
+    age_str = f'{int(age_s) // 60}m ago'
+else:
+    age_str = f'{int(age_s) // 3600}h ago'
+
+print(f'  ⚠ Daemon error ({age_str}): {reason}')
+if log_tail:
+    first_line = log_tail.strip().splitlines()[0] if log_tail.strip() else ''
+    if first_line:
+        print(f'    last log: {first_line}')
+print('    fix: see TROUBLESHOOTING.md or daemon.log')
+print()
+" 2>/dev/null
+    fi
+
     # Resolve actions.py once — used for heartbeat check and human_queue_summary.
     local actions_script="$LIB_DIR/actions.py"
     if [ ! -f "$actions_script" ]; then
