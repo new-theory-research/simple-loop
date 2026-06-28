@@ -87,6 +87,39 @@ pid_alive() {
     [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
 }
 
+# Merge simple_loop provenance from PROVENANCE.json into a config.json
+_seed_simple_loop_config() {
+    local config_file="$1"
+    local provenance_file="$SIMPLE_LOOP_HOME/PROVENANCE.json"
+    python3 - "$config_file" "$provenance_file" <<'PYEOF'
+import json, sys, os, datetime
+config_file, provenance_file = sys.argv[1], sys.argv[2]
+try:
+    with open(config_file) as f:
+        config = json.load(f)
+except Exception:
+    sys.exit(0)
+sl = {
+    'commit': 'unknown',
+    'installed_at': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'source_repo': 'unknown'
+}
+if os.path.exists(provenance_file):
+    try:
+        with open(provenance_file) as pf:
+            prov = json.load(pf)
+        sl['commit'] = prov.get('source_commit', 'unknown')
+        sl['installed_at'] = prov.get('installed_at', sl['installed_at'])
+        sl['source_repo'] = prov.get('source_repo', 'unknown')
+    except Exception:
+        pass
+config['simple_loop'] = sl
+with open(config_file, 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+PYEOF
+}
+
 # ── init ─────────────────────────────────────────────────────
 
 cmd_init() {
@@ -169,6 +202,7 @@ MD
   "beehive": {}
 }
 CJSON
+        _seed_simple_loop_config ".loop/config.json"
 
         # ── Wiki-full scaffold ────────────────────────────────────
         if [ "$_init_mode" = "wiki-full" ]; then
@@ -728,6 +762,7 @@ MD
   "modules": []
 }
 CJSON
+    _seed_simple_loop_config ".loop/config.json"
 
     # Create persistent documents
     local core_src
@@ -1622,6 +1657,11 @@ with open('$claude_md', 'w') as f:
         done <<< "$modules"
     fi
 
+    # Re-seed simple_loop provenance in case install was updated
+    if [ -f "$LOOP_DIR/config.json" ]; then
+        _seed_simple_loop_config "$LOOP_DIR/config.json"
+    fi
+
     echo ""
     echo "  ✓ Updated"
     echo ""
@@ -1988,6 +2028,145 @@ cmd_cleanup() {
     echo ""
 }
 
+# ── info ─────────────────────────────────────────────────────
+
+cmd_info() {
+    local install_dir="$SIMPLE_LOOP_HOME"
+    local provenance_file="$install_dir/PROVENANCE.json"
+    local binary_path
+    binary_path=$(command -v loop 2>/dev/null || echo "$HOME/.local/bin/loop")
+    local claude_dir="$HOME/.claude"
+
+    echo ""
+    echo "simple-loop:"
+
+    python3 - "$provenance_file" "$install_dir" "$binary_path" "$claude_dir" <<'PYEOF'
+import json, sys, os
+
+provenance_file, install_dir, binary_path, claude_dir = sys.argv[1:]
+
+source_repo = "unknown"
+source_commit = "unknown"
+source_dirty = "unknown"
+version = "unknown"
+
+if os.path.exists(provenance_file):
+    try:
+        with open(provenance_file) as f:
+            p = json.load(f)
+        source_repo = p.get("source_repo", "unknown")
+        source_commit = p.get("source_commit", "unknown")
+        source_dirty = "dirty" if p.get("source_dirty") else "clean"
+        version = p.get("version", "unknown")
+    except Exception:
+        pass
+
+print(f"  source:    {source_repo}  (commit {source_commit}, {source_dirty})")
+print(f"  install:   {install_dir}  (version {version}, commit {source_commit})")
+print(f"  binary:    {binary_path}")
+
+agents_dir = os.path.join(claude_dir, "agents")
+skills_dir = os.path.join(claude_dir, "skills")
+agent_count = 0
+skill_count = 0
+if os.path.isdir(agents_dir):
+    agent_count = len([f for f in os.listdir(agents_dir) if f.startswith("loop-") and f.endswith(".md")])
+if os.path.isdir(skills_dir):
+    skill_count = len([d for d in os.listdir(skills_dir) if d.startswith("loop-") and os.path.isdir(os.path.join(skills_dir, d))])
+print(f"  agents:    {agents_dir}/loop-*.md  ({agent_count})")
+print(f"  skills:    {skills_dir}/loop-*/    ({skill_count})")
+PYEOF
+
+    # Project section — only when inside a loop project
+    local loop_dir
+    if loop_dir=$(find_loop_dir 2>/dev/null); then
+        local project_dir
+        project_dir="$(dirname "$loop_dir")"
+        local config_file="$loop_dir/config.json"
+
+        # Drift check — captures first failing queued brief or "none"
+        local drift_line=""
+        if [ -f "$LIB_DIR/lint.py" ]; then
+            drift_line=$(cd "$project_dir" && python3 "$LIB_DIR/lint.py" --summary 2>/dev/null) || true
+        fi
+        [ -z "$drift_line" ] && drift_line="none"
+
+        echo ""
+        python3 - "$loop_dir" "$config_file" "$project_dir" "$drift_line" <<'PYEOF'
+import json, sys, os
+
+loop_dir, config_file, project_dir, drift_line = sys.argv[1:]
+config = {}
+if os.path.exists(config_file):
+    try:
+        with open(config_file) as f:
+            config = json.load(f)
+    except Exception:
+        pass
+
+project_name = config.get("project_name", os.path.basename(project_dir))
+version = config.get("version", "unknown")
+sl = config.get("simple_loop", {})
+last_commit = sl.get("commit", "unknown")
+
+print(f"project ({project_name}):")
+print(f"  .loop root:  {loop_dir}")
+print(f"  config:      version {version}, last-installed {last_commit}")
+
+# Brief counts from wiki/briefs/cards/*/index.md YAML frontmatter
+cards_dir = os.path.join(project_dir, "wiki", "briefs", "cards")
+status_counts = {}
+total_briefs = 0
+if os.path.isdir(cards_dir):
+    for card_id in sorted(os.listdir(cards_dir)):
+        if card_id.startswith("."):
+            continue
+        card_path = os.path.join(cards_dir, card_id, "index.md")
+        if not os.path.isfile(card_path):
+            continue
+        status = ""
+        try:
+            with open(card_path) as fh:
+                in_fm = False
+                for line in fh:
+                    stripped = line.strip()
+                    if stripped == "---":
+                        if not in_fm:
+                            in_fm = True
+                            continue
+                        else:
+                            break
+                    if in_fm and stripped.lower().startswith("status:"):
+                        status = stripped.split(":", 1)[1].strip().lower()
+                        break
+        except Exception:
+            pass
+        if status:
+            total_briefs += 1
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+ORDERED = ["active", "awaiting_review", "queued", "draft"]
+parts = []
+for s in ORDERED:
+    n = status_counts.get(s, 0)
+    if n > 0:
+        parts.append(f"{n} {s}")
+for s, n in sorted(status_counts.items()):
+    if s not in ORDERED and n > 0:
+        parts.append(f"{n} {s}")
+
+if parts:
+    print(f"  briefs:      {total_briefs} ({', '.join(parts)})")
+else:
+    print(f"  briefs:      {total_briefs}")
+
+print(f"  drift:       {drift_line}")
+PYEOF
+    fi
+
+    echo ""
+}
+
 # ── help ─────────────────────────────────────────────────────
 
 cmd_help() {
@@ -2011,6 +2190,7 @@ Work:
 
 Monitor:
   status                   Show daemon state, active brief, recent logs
+  info                     Show framework provenance and project state at a glance
   logs [-f]                Show/follow daemon logs
   metrics [--since DATE]   Cost report from metrics
 
@@ -2058,6 +2238,7 @@ case "${1:-help}" in
     start)   shift; cmd_start "$@" ;;
     stop)    cmd_stop ;;
     status)  cmd_status ;;
+    info)    cmd_info ;;
     logs)    shift; cmd_logs "$@" ;;
     pause)   shift; cmd_pause "$@" ;;
     resume)  shift; cmd_resume "$@" ;;

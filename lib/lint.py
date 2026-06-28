@@ -960,6 +960,46 @@ def main(argv: List[str] = None) -> int:
     # Parse flags before positional args
     all_statuses = "--all" in argv
     argv = [a for a in argv if a != "--all"]
+    summary_mode = "--summary" in argv
+    argv = [a for a in argv if a != "--summary"]
+
+    # ── --summary mode: one-line drift check for loop info ───────────────────
+    if summary_mode:
+        if argv:
+            target = Path(argv[0]).resolve()
+            project_root = find_project_root(target) or find_project_root(Path.cwd()) or Path.cwd()
+        else:
+            project_root = find_project_root(Path.cwd()) or Path.cwd()
+            target = project_root / "wiki" / "briefs" / "cards"
+
+        if not target.is_dir():
+            print("none")
+            return 0
+
+        candidates = sorted(target.rglob("index.md"))
+        if not all_statuses:
+            history_ids = _load_history_ids(project_root)
+            filtered = []
+            for bf in candidates:
+                status, brief_id = _brief_meta(bf)
+                if status != "queued":
+                    continue
+                if brief_id and brief_id in history_ids:
+                    continue
+                filtered.append(bf)
+            candidates = filtered
+
+        for bf in candidates:
+            issues = lint_file(bf, project_root)
+            error_count = sum(1 for i in issues if i.severity == ERROR)
+            if error_count:
+                brief_label = bf.parent.name
+                noun = "error" if error_count == 1 else "errors"
+                print(f"{brief_label}: {error_count} {noun}")
+                return 1
+
+        print("none")
+        return 0
 
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
