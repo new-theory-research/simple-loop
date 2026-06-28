@@ -1,40 +1,8 @@
 {
-  "active": [
-    {
-      "brief": "brief-151-lane-lock-and-claim",
-      "branch": "brief-151-lane-lock-and-claim",
-      "brief_file": "wiki/briefs/cards/brief-151-lane-lock-and-claim/index.md",
-      "dispatched_at": "2026-06-28T21:02:16Z",
-      "parallel_safe": true,
-      "edit_surface": [
-        "lib/queue.py",
-        "lib/daemon.sh",
-        "lib/actions.py",
-        "lib/claim.py (new)",
-        "lib/tests/test_lane_and_claim.py (new)",
-        "install.sh"
-      ],
-      "worker_slot": 0
-    }
-  ],
+  "active": [],
   "completed_pending_eval": [],
   "pending_merges": [],
   "awaiting_review": [
-    {
-      "brief": "brief-142-loop-set-status-command",
-      "branch": "brief-142-loop-set-status-command",
-      "brief_file": "wiki/briefs/cards/brief-142-loop-set-status-command/index.md",
-      "dispatched_at": "2026-05-05T19:52:48Z",
-      "parallel_safe": true,
-      "edit_surface": [
-        "bin/loop",
-        "lib/actions.py"
-      ],
-      "worker_slot": 0,
-      "completed_at": "2026-05-05T20:01:57Z",
-      "auto_merge": false,
-      "kind": "complete"
-    },
     {
       "brief": "brief-144-loop-init-scaffolds-prompts",
       "branch": "brief-144-loop-init-scaffolds-prompts",
@@ -46,50 +14,6 @@
       ],
       "worker_slot": 0,
       "completed_at": "2026-05-05T20:13:50Z",
-      "auto_merge": false,
-      "kind": "complete"
-    },
-    {
-      "brief": "brief-145-loop-install-service-reads-main-branch",
-      "branch": "brief-145-loop-install-service-reads-main-branch",
-      "brief_file": "wiki/briefs/cards/brief-145-loop-install-service-reads-main-branch/index.md",
-      "dispatched_at": "2026-05-05T20:16:54Z",
-      "parallel_safe": true,
-      "edit_surface": [
-        "bin/loop"
-      ],
-      "worker_slot": 0,
-      "completed_at": "2026-05-05T20:23:15Z",
-      "auto_merge": false,
-      "kind": "complete"
-    },
-    {
-      "brief": "brief-146-worker-rebase-conflict-escalate",
-      "branch": "brief-146-worker-rebase-conflict-escalate",
-      "brief_file": "wiki/briefs/cards/brief-146-worker-rebase-conflict-escalate/index.md",
-      "dispatched_at": "2026-05-08T19:03:31Z",
-      "parallel_safe": true,
-      "edit_surface": [
-        "lib/daemon.sh",
-        "lib/actions.py"
-      ],
-      "worker_slot": 0,
-      "completed_at": "2026-05-08T19:12:45Z",
-      "auto_merge": false,
-      "kind": "complete"
-    },
-    {
-      "brief": "brief-147-hive-external-commits-on-main",
-      "branch": "brief-147-hive-external-commits-on-main",
-      "brief_file": "wiki/briefs/cards/brief-147-hive-external-commits-on-main/index.md",
-      "dispatched_at": "2026-05-08T19:56:20Z",
-      "parallel_safe": true,
-      "edit_surface": [
-        "crates/hive/src/state.rs",
-        "crates/hive/src/main.rs"
-      ],
-      "worker_slot": 0,
-      "completed_at": "2026-06-11T19:34:41Z",
       "auto_merge": false,
       "kind": "complete"
     },
@@ -143,5 +67,60 @@
       "kind": "complete"
     }
   ],
-  "history": []
+  "history": [
+    {
+      "brief": "brief-151-lane-lock-and-claim",
+      "branch": "brief-151-lane-lock-and-claim",
+      "brief_file": "wiki/briefs/cards/brief-151-lane-lock-and-claim/index.md",
+      "dispatched_at": "2026-06-28T21:02:16Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "lib/queue.py",
+        "lib/daemon.sh",
+        "lib/actions.py",
+        "lib/claim.py (new)",
+        "lib/tests/test_lane_and_claim.py (new)",
+        "install.sh"
+      ],
+      "worker_slot": 0,
+      "status": "merged",
+      "merge_sha": "787615c",
+      "merged_at": "2026-06-28T22:06:54Z"
+    },
+    {
+      "brief": "brief-145-loop-install-service-reads-main-branch",
+      "branch": "brief-145-loop-install-service-reads-main-branch",
+      "brief_file": "wiki/briefs/cards/brief-145-loop-install-service-reads-main-branch/index.md",
+      "dispatched_at": "2026-05-05T20:16:54Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "bin/loop"
+      ],
+      "worker_slot": 0,
+      "completed_at": "2026-05-05T20:23:15Z",
+      "auto_merge": false,
+      "kind": "complete",
+      "status": "merged",
+      "merge_sha": "98482b9",
+      "merged_at": "2026-06-28T22:06:54Z"
+    },
+    {
+      "brief": "brief-147-hive-external-commits-on-main",
+      "branch": "brief-147-hive-external-commits-on-main",
+      "brief_file": "wiki/briefs/cards/brief-147-hive-external-commits-on-main/index.md",
+      "dispatched_at": "2026-05-08T19:56:20Z",
+      "parallel_safe": true,
+      "edit_surface": [
+        "crates/hive/src/state.rs",
+        "crates/hive/src/main.rs"
+      ],
+      "worker_slot": 0,
+      "completed_at": "2026-06-11T19:34:41Z",
+      "auto_merge": false,
+      "kind": "complete",
+      "status": "merged",
+      "merge_sha": "9284186",
+      "merged_at": "2026-06-28T22:06:54Z"
+    }
+  ]
 }
