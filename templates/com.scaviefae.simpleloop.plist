@@ -42,6 +42,8 @@
         <string>{{PATH}}</string>
         <key>GIT_MAIN_BRANCH</key>
         <string>{{GIT_MAIN_BRANCH}}</string>
+{{LOOP_LANE_KEY}}
+{{LOOP_LANE_VAL}}
     </dict>
 </dict>
 </plist>
