@@ -121,7 +121,9 @@ mkdir -p "$STATE_DIR/signals" "$LOG_DIR"
 # with single-writer ownership (lib/state.py:write_running_json). The
 # startup_repair pass that follows seeds runtime-events.jsonl from running.json
 # the first time after this brief lands.
-python3 "$DAEMON_LIB_DIR/state.py" write-running-json "$PROJECT_DIR" 2>/dev/null || true
+# harness-001/003: pass --lane so a lane-scoped daemon's local running.json
+# contains only its lane's active state. Empty LOOP_LANE → no filter (global).
+python3 "$DAEMON_LIB_DIR/state.py" write-running-json "$PROJECT_DIR" ${LOOP_LANE:+--lane "$LOOP_LANE"} 2>/dev/null || true
 
 echo ""
 echo "╔══════════════════════════════════════╗"
@@ -1628,8 +1630,11 @@ while true; do
     # │  derived. Re-projecting on every tick is idempotent and catches  │
     # │  drift introduced by hand-edits or stale state (the 4-write tail │
     # │  hand-merge-brief.md used to enshrine).                          │
+    # │                                                                  │
+    # │  harness-001/003: --lane scopes the projection to this daemon's  │
+    # │  lane so it never inherits another lane's active state.          │
     # └──────────────────────────────────────────────────────────────────┘
-    python3 "$DAEMON_LIB_DIR/state.py" write-running-json "$PROJECT_DIR" 2>/dev/null || true
+    python3 "$DAEMON_LIB_DIR/state.py" write-running-json "$PROJECT_DIR" ${LOOP_LANE:+--lane "$LOOP_LANE"} 2>/dev/null || true
 
     # ┌─────────────────────────────────────┐
     # │  Phase 1: Assess state              │

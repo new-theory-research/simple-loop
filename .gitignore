@@ -11,6 +11,10 @@ target/
 .loop/state/log.jsonl
 .loop/state/metrics.jsonl
 .loop/config.local.sh
+# harness-001/003: running.json is daemon-local volatile state — never committed.
+# Each daemon projects its own local copy from cards + runtime-events.jsonl.
+# Two daemons cannot clobber each other's running.json via a shared git main.
+.loop/state/running.json
 
 # Zensical build output
 site/

@@ -258,23 +258,37 @@ def save_running(paths, data):
     function now projects from cards + runtime-events.jsonl and writes the
     result, ignoring the `data` argument. The rc-mutation pattern that used
     to live in this module is being torn out cycle-by-cycle.
+
+    harness-001/003: running.json is daemon-local — never committed. The
+    git add + commit that used to live here are removed.
     """
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from state import write_running_json
     write_running_json(paths["project_dir"])
-    git(paths["project_dir"], "add", paths["running_file"])
-    git(paths["project_dir"], "commit", "-m", "loop: project running.json", check=False)
 
 
-def project_running(paths):
+def project_running(paths, lane=None):
     """Project running.json from cards + runtime-events.jsonl.
 
     The single canonical writer of running.json. Returns the projected dict.
     Lint enforces: no direct writes to running.json outside this path.
+
+    Args:
+        paths: init_paths() dict.
+        lane: optional program-lane partition key (harness-001/003). When set
+            (non-empty), only briefs in this lane appear in active/
+            awaiting_review/pending_merges. When None (the default), the value
+            is read from the LOOP_LANE environment variable — so action
+            handlers spawned by a lane-scoped daemon.sh automatically project
+            the correct lane without needing each call site to pass lane
+            explicitly. Empty env var → None → global projection (single-
+            daemon, backward-compat). Passed through to state.write_running_json.
     """
+    if lane is None:
+        lane = os.environ.get("LOOP_LANE") or None
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from state import write_running_json
-    return write_running_json(paths["project_dir"])
+    return write_running_json(paths["project_dir"], lane=lane)
 
 
 def runtime_event(paths, event_type, brief, **fields):
@@ -1500,23 +1514,26 @@ def dispatch(paths):
         print(f"dispatch: card status update failed for {brief}: {e} (non-fatal)", file=sys.stderr)
 
     # brief-108-d: project running.json from cards + events. Single-write owner.
+    # harness-001/003: running.json is daemon-local — project locally but do
+    # NOT commit it. Only runtime-events.jsonl goes to main.
     project_running(paths)
     # Commit state files to main via plumbing — immune to worktree branch drift.
+    # running.json is explicitly excluded: it is daemon-local volatile state.
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from git_plumbing import commit_files_to_branch as _commit_files_fn
         _events_path = os.path.join(project_dir, ".loop", "state", "runtime-events.jsonl")
-        _state_files = [(paths["running_file"],
-                         os.path.relpath(paths["running_file"], project_dir))]
+        _state_files = []
         if os.path.exists(_events_path):
             _state_files.append((_events_path,
                                   os.path.relpath(_events_path, project_dir)))
-        _commit_files_fn(
-            project_dir, _state_files, main_branch,
-            f"loop: project running.json (dispatch {brief})",
-        )
+        if _state_files:
+            _commit_files_fn(
+                project_dir, _state_files, main_branch,
+                f"loop: append runtime-events (dispatch {brief})",
+            )
     except Exception as e:
-        print(f"dispatch: running.json plumbing commit failed for {brief}: {e} (non-fatal)",
+        print(f"dispatch: runtime-events plumbing commit failed for {brief}: {e} (non-fatal)",
               file=sys.stderr)
 
     push_bookkeeping(paths, remote, main_branch, f"dispatch {brief}")
@@ -1761,17 +1778,18 @@ def merge(paths):
         evaluation=evaluation,
     )
 
-    # Project running.json from the new card+events truth and stage.
+    # Project running.json from the new card+events truth (daemon-local only —
+    # harness-001/003: running.json is never committed).
     project_running(paths)
-    git(project_dir, "add", paths["running_file"],
+    git(project_dir, "add",
         os.path.join(project_dir, ".loop", "state", "runtime-events.jsonl"),
         check=False)
 
     if _cleanup_staged:
         git(project_dir, "commit", "-m", f"loop: post-merge cleanup for {brief}", check=False)
     else:
-        # Card already merged but events/projection still need committing.
-        git(project_dir, "commit", "-m", f"loop: project running.json (merge {brief})", check=False)
+        # Card already merged but events still need committing.
+        git(project_dir, "commit", "-m", f"loop: append runtime-events (merge {brief})", check=False)
     # --- End producer-side cleanup ---
 
     signal_dedup_clear(paths, brief)
