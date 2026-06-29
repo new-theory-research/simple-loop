@@ -543,5 +543,298 @@ class TestWriteRunningJson(unittest.TestCase):
         self.assertEqual(len(data["active"]), 1)
 
 
+# ── Lane isolation tests (harness-001/003, issue #54) ─────────────────
+#
+# WHY these tests exist (engineering rule 7):
+#   INCIDENT (2026-06-28): a daemon started --lane remote-queens pulled main,
+#   which carried a committed running.json with fleets' fleet-005a as active.
+#   The lane-scoped daemon inherited that entry, "managed" it as its own, and
+#   stalled permanently — never dispatching its own lane's queued brief.
+#
+# ROOT: project_running_json (and write_running_json) had no lane parameter,
+# so they projected ALL cards regardless of Program:. A lane B daemon's
+# running.json included lane A's active briefs, giving it false active state.
+#
+# FIX: project_running_json(lane=X) filters active/awaiting_review/
+# pending_merges to only include briefs whose Program: == X (fail-closed:
+# a brief with no Program: is excluded from a lane-scoped projection).
+#
+# These tests FAIL on the unfixed code (no lane param) and PASS after.
+
+class TestLaneIsolation(unittest.TestCase):
+    """Core fix tests — reproduce the inherit-and-stall incident."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_card_with_program(self, brief_id, status, program=None):
+        """Write a card with an optional Program: field."""
+        cards_dir = os.path.join(self.tmp, "wiki", "briefs", "cards")
+        os.makedirs(cards_dir, exist_ok=True)
+        card_dir = os.path.join(cards_dir, brief_id)
+        os.makedirs(card_dir, exist_ok=True)
+        lines = ["---", f"ID: {brief_id}", f"Branch: {brief_id}", f"Status: {status}"]
+        if program is not None:
+            lines.append(f"Program: {program}")
+        lines += ["---", "", f"# {brief_id}", ""]
+        with open(os.path.join(card_dir, "index.md"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+    # The incident fixture: fleets has an active brief, remote-queens has a
+    # queued brief. A daemon scoped --lane remote-queens MUST NOT see fleets'
+    # active brief in its running.json.
+
+    def test_lane_scoped_projection_excludes_other_lanes_active(self):
+        """Reproduce the 2026-06-28 inherit-and-stall: a daemon started
+        --lane remote-queens must never see fleets' active brief in its
+        running.json active[]. Without the fix this returns len(active)==1
+        (fleet-005a inherited) and the daemon stalls managing a brief it
+        never dispatched."""
+        state_dir = os.path.join(self.tmp, ".loop", "state")
+        os.makedirs(state_dir, exist_ok=True)
+        self._make_card_with_program("fleet-005a", "active", "fleets")
+        self._make_card_with_program("remote-queen-001", "queued", "remote-queens")
+
+        # Dispatch event for the fleets brief (it's active on main).
+        events = [
+            {"ts": "T1", "event": "dispatched", "brief": "fleet-005a",
+             "branch": "fleet-005a",
+             "brief_file": "wiki/briefs/cards/fleet-005a/index.md",
+             "worker_slot": 0},
+        ]
+
+        result = project_running_json(self.tmp, events=events, lane="remote-queens")
+
+        # The fleets brief must NOT appear — the remote-queens daemon must not
+        # inherit it, defer on it, or stall waiting for it to clear.
+        active_ids = [e["brief"] for e in result["active"]]
+        self.assertNotIn(
+            "fleet-005a", active_ids,
+            "lane=remote-queens must never inherit fleets' active brief (the stall bug)"
+        )
+        self.assertEqual(result["active"], [],
+                         "remote-queens has no active brief of its own — active must be empty")
+
+    def test_lane_scoped_projection_includes_own_lane_active(self):
+        """A brief in the correct lane DOES appear in the scoped projection."""
+        state_dir = os.path.join(self.tmp, ".loop", "state")
+        os.makedirs(state_dir, exist_ok=True)
+        self._make_card_with_program("fleet-005a", "active", "fleets")
+        self._make_card_with_program("remote-queen-001", "active", "remote-queens")
+
+        events = [
+            {"ts": "T1", "event": "dispatched", "brief": "fleet-005a",
+             "branch": "fleet-005a",
+             "brief_file": "wiki/briefs/cards/fleet-005a/index.md",
+             "worker_slot": 0},
+            {"ts": "T2", "event": "dispatched", "brief": "remote-queen-001",
+             "branch": "remote-queen-001",
+             "brief_file": "wiki/briefs/cards/remote-queen-001/index.md",
+             "worker_slot": 0},
+        ]
+
+        result = project_running_json(self.tmp, events=events, lane="remote-queens")
+        active_ids = [e["brief"] for e in result["active"]]
+        self.assertIn("remote-queen-001", active_ids)
+        self.assertNotIn("fleet-005a", active_ids)
+
+    def test_lane_scoped_awaiting_review_excludes_other_lanes(self):
+        """Lane filter also applies to awaiting_review — the stall logic reads
+        that bucket too."""
+        state_dir = os.path.join(self.tmp, ".loop", "state")
+        os.makedirs(state_dir, exist_ok=True)
+        self._make_card_with_program("fleet-005a", "active", "fleets")
+        self._make_card_with_program("remote-queen-001", "active", "remote-queens")
+
+        events = [
+            {"ts": "T1", "event": "dispatched", "brief": "fleet-005a",
+             "branch": "fleet-005a",
+             "brief_file": "wiki/briefs/cards/fleet-005a/index.md"},
+            {"ts": "T2", "event": "completed", "brief": "fleet-005a",
+             "kind": "complete", "auto_merge": False},
+            {"ts": "T3", "event": "dispatched", "brief": "remote-queen-001",
+             "branch": "remote-queen-001",
+             "brief_file": "wiki/briefs/cards/remote-queen-001/index.md"},
+        ]
+
+        result = project_running_json(self.tmp, events=events, lane="remote-queens")
+        awaiting_ids = [e["brief"] for e in result["awaiting_review"]]
+        self.assertNotIn("fleet-005a", awaiting_ids,
+                         "fleets brief in awaiting_review must not appear in remote-queens view")
+        active_ids = [e["brief"] for e in result["active"]]
+        self.assertIn("remote-queen-001", active_ids)
+
+    def test_lane_scoped_pending_merges_excludes_other_lanes(self):
+        """Lane filter applies to pending_merges bucket."""
+        state_dir = os.path.join(self.tmp, ".loop", "state")
+        os.makedirs(state_dir, exist_ok=True)
+        self._make_card_with_program("fleet-005a", "active", "fleets")
+        self._make_card_with_program("remote-queen-001", "active", "remote-queens")
+
+        events = [
+            {"ts": "T1", "event": "dispatched", "brief": "fleet-005a",
+             "branch": "fleet-005a",
+             "brief_file": "wiki/briefs/cards/fleet-005a/index.md"},
+            {"ts": "T2", "event": "completed", "brief": "fleet-005a",
+             "kind": "complete", "auto_merge": True},
+            {"ts": "T3", "event": "approved", "brief": "fleet-005a"},
+            {"ts": "T4", "event": "dispatched", "brief": "remote-queen-001",
+             "branch": "remote-queen-001",
+             "brief_file": "wiki/briefs/cards/remote-queen-001/index.md"},
+        ]
+
+        result = project_running_json(self.tmp, events=events, lane="remote-queens")
+        pending_ids = [e["brief"] for e in result["pending_merges"]]
+        self.assertNotIn("fleet-005a", pending_ids,
+                         "fleets brief in pending_merges must not appear in remote-queens view")
+
+    def test_brief_without_program_excluded_from_lane_projection(self):
+        """Fail-closed: a brief with no Program: field is EXCLUDED from a
+        lane-scoped projection so it's never accidentally managed by the
+        wrong daemon."""
+        state_dir = os.path.join(self.tmp, ".loop", "state")
+        os.makedirs(state_dir, exist_ok=True)
+        # Brief with no Program: field.
+        self._make_card_with_program("unlabeled-001", "active", program=None)
+        self._make_card_with_program("remote-queen-001", "active", "remote-queens")
+
+        events = [
+            {"ts": "T1", "event": "dispatched", "brief": "unlabeled-001",
+             "branch": "unlabeled-001",
+             "brief_file": "wiki/briefs/cards/unlabeled-001/index.md"},
+            {"ts": "T2", "event": "dispatched", "brief": "remote-queen-001",
+             "branch": "remote-queen-001",
+             "brief_file": "wiki/briefs/cards/remote-queen-001/index.md"},
+        ]
+
+        result = project_running_json(self.tmp, events=events, lane="remote-queens")
+        active_ids = [e["brief"] for e in result["active"]]
+        self.assertNotIn("unlabeled-001", active_ids, "unlabeled brief must be excluded (fail-closed)")
+        self.assertIn("remote-queen-001", active_ids)
+
+    def test_history_is_global_across_lanes(self):
+        """history[] is NOT filtered by lane — it's read-only/cosmetic and the
+        merged briefs from all lanes are useful for depends-on resolution."""
+        state_dir = os.path.join(self.tmp, ".loop", "state")
+        os.makedirs(state_dir, exist_ok=True)
+        self._make_card_with_program("fleet-005a", "merged", "fleets")
+        self._make_card_with_program("remote-queen-001", "merged", "remote-queens")
+
+        events = [
+            {"ts": "T1", "event": "merged", "brief": "fleet-005a",
+             "merge_sha": "abc", "merged_at": "T1"},
+            {"ts": "T2", "event": "merged", "brief": "remote-queen-001",
+             "merge_sha": "def", "merged_at": "T2"},
+        ]
+
+        result = project_running_json(self.tmp, events=events, lane="remote-queens")
+        history_ids = [e["brief"] for e in result["history"]]
+        self.assertIn("fleet-005a", history_ids,
+                      "history is global — merged briefs from all lanes must appear")
+        self.assertIn("remote-queen-001", history_ids)
+
+    def test_no_lane_global_projection_unchanged(self):
+        """Single-daemon path (no lane): ALL active briefs from ALL lanes appear.
+        Byte-for-byte unchanged from pre-fix behavior."""
+        state_dir = os.path.join(self.tmp, ".loop", "state")
+        os.makedirs(state_dir, exist_ok=True)
+        self._make_card_with_program("fleet-005a", "active", "fleets")
+        self._make_card_with_program("remote-queen-001", "active", "remote-queens")
+
+        events = [
+            {"ts": "T1", "event": "dispatched", "brief": "fleet-005a",
+             "branch": "fleet-005a",
+             "brief_file": "wiki/briefs/cards/fleet-005a/index.md",
+             "worker_slot": 0},
+            {"ts": "T2", "event": "dispatched", "brief": "remote-queen-001",
+             "branch": "remote-queen-001",
+             "brief_file": "wiki/briefs/cards/remote-queen-001/index.md",
+             "worker_slot": 1},
+        ]
+
+        result = project_running_json(self.tmp, events=events)  # no lane
+        active_ids = [e["brief"] for e in result["active"]]
+        self.assertIn("fleet-005a", active_ids, "no-lane must see all briefs")
+        self.assertIn("remote-queen-001", active_ids, "no-lane must see all briefs")
+
+    def test_empty_lane_equals_no_lane(self):
+        """Empty/whitespace lane → no filter (same as queue.py / brief-152)."""
+        state_dir = os.path.join(self.tmp, ".loop", "state")
+        os.makedirs(state_dir, exist_ok=True)
+        self._make_card_with_program("fleet-005a", "active", "fleets")
+        self._make_card_with_program("remote-queen-001", "active", "remote-queens")
+
+        events = [
+            {"ts": "T1", "event": "dispatched", "brief": "fleet-005a",
+             "branch": "fleet-005a",
+             "brief_file": "wiki/briefs/cards/fleet-005a/index.md"},
+            {"ts": "T2", "event": "dispatched", "brief": "remote-queen-001",
+             "branch": "remote-queen-001",
+             "brief_file": "wiki/briefs/cards/remote-queen-001/index.md"},
+        ]
+
+        result_none = project_running_json(self.tmp, events=events, lane=None)
+        result_empty = project_running_json(self.tmp, events=events, lane="")
+        result_ws = project_running_json(self.tmp, events=events, lane="  ")
+
+        for result in (result_empty, result_ws):
+            self.assertEqual(
+                sorted(e["brief"] for e in result["active"]),
+                sorted(e["brief"] for e in result_none["active"]),
+                "empty/whitespace lane must equal no-lane"
+            )
+
+    def test_write_running_json_lane_param_passed_through(self):
+        """write_running_json(lane=X) projects the lane-scoped view and writes it."""
+        state_dir = os.path.join(self.tmp, ".loop", "state")
+        os.makedirs(state_dir, exist_ok=True)
+        self._make_card_with_program("fleet-005a", "active", "fleets")
+        self._make_card_with_program("remote-queen-001", "active", "remote-queens")
+
+        events = [
+            {"ts": "T1", "event": "dispatched", "brief": "fleet-005a",
+             "branch": "fleet-005a",
+             "brief_file": "wiki/briefs/cards/fleet-005a/index.md"},
+            {"ts": "T2", "event": "dispatched", "brief": "remote-queen-001",
+             "branch": "remote-queen-001",
+             "brief_file": "wiki/briefs/cards/remote-queen-001/index.md"},
+        ]
+        events_path = os.path.join(state_dir, "runtime-events.jsonl")
+        with open(events_path, "w") as f:
+            for e in events:
+                f.write(json.dumps(e) + "\n")
+
+        result = write_running_json(self.tmp, lane="remote-queens")
+        running_path = os.path.join(state_dir, "running.json")
+        self.assertTrue(os.path.exists(running_path))
+        with open(running_path) as f:
+            on_disk = json.load(f)
+
+        active_ids = [e["brief"] for e in on_disk["active"]]
+        self.assertNotIn("fleet-005a", active_ids,
+                         "on-disk running.json must be lane-scoped")
+        self.assertIn("remote-queen-001", active_ids)
+
+    def test_gitignore_excludes_running_json(self):
+        """Acceptance criterion 2: .gitignore must contain .loop/state/running.json
+        so the file is never committed to main."""
+        # Walk up to find the simple-loop repo root (this test file is in lib/).
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        gitignore_path = os.path.join(repo_root, ".gitignore")
+        self.assertTrue(
+            os.path.exists(gitignore_path),
+            f".gitignore not found at {gitignore_path}"
+        )
+        with open(gitignore_path) as f:
+            content = f.read()
+        self.assertIn(
+            ".loop/state/running.json", content,
+            ".gitignore must include .loop/state/running.json (harness-001/003)"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

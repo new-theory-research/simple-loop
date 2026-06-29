@@ -355,12 +355,28 @@ def _build_superseded_history_entry(brief_id, fm, events_for_brief):
 
 # ── Projector ─────────────────────────────────────────────────────────
 
-def project_running_json(project_dir, events=None):
+def _card_program(fm):
+    """Return lowercased program lane from frontmatter, or ''."""
+    p = fm.get("program", "")
+    if isinstance(p, list):
+        return ""
+    return str(p).strip().lower()
+
+
+def project_running_json(project_dir, events=None, lane=None):
     """Project running.json from card frontmatter + runtime-events.jsonl.
 
     Args:
         project_dir: absolute project root path.
         events: parsed runtime-events list (for tests). None → read from disk.
+        lane: optional program-lane partition key (harness-001/003). When None,
+            empty, or whitespace-only the projection is global — all briefs, no
+            lane filter. Single-daemon behavior is byte-for-byte unchanged.
+            When set to a non-empty value, only briefs whose card carries a
+            matching Program: field appear in active[], awaiting_review[], and
+            pending_merges[]. history[] is always global (read-only, cosmetic).
+            A brief with NO Program: field is excluded from a lane-scoped
+            projection (fail-closed — same semantics as queue.py's --lane).
 
     Returns:
         dict with keys: active, completed_pending_eval, pending_merges,
@@ -375,6 +391,9 @@ def project_running_json(project_dir, events=None):
         - History order matches first-merged-first (events file is append-only
           and reflects merge order). Backfill order matches the events file.
     """
+    # Normalise lane the same way queue.py does: empty/whitespace → no filter.
+    lane_key = lane.strip().lower() if lane and lane.strip() else None
+
     if events is None:
         events_path = os.path.join(project_dir, ".loop", "state", "runtime-events.jsonl")
         events = _read_runtime_events(events_path)
@@ -410,6 +429,11 @@ def project_running_json(project_dir, events=None):
             continue
 
         if status == "active":
+            # Lane filter: when lane_key is set, exclude briefs not in this lane.
+            # A brief with no Program: field is excluded (fail-closed — a lane
+            # daemon must never inherit another lane's active state).
+            if lane_key is not None and _card_program(fm) != lane_key:
+                continue
             comp = _completed_event(evs)
             appr = _approved_event(evs)
             if appr is not None:
@@ -475,13 +499,20 @@ def append_event(project_dir, event_type, brief, **fields):
 
 # ── Atomic write of running.json from projection ──────────────────────
 
-def write_running_json(project_dir, data=None):
+def write_running_json(project_dir, data=None, lane=None):
     """Project (or accept pre-projected data) and write running.json atomically.
 
     THIS IS THE ONLY FUNCTION ALLOWED TO WRITE running.json. Lint enforces.
+
+    Args:
+        project_dir: absolute project root path.
+        data: pre-projected dict, or None to project from cards+events.
+        lane: optional program-lane partition key (harness-001/003). Passed
+            through to project_running_json; see its docstring. Empty/None →
+            global projection (single-daemon, backward-compat).
     """
     if data is None:
-        data = project_running_json(project_dir)
+        data = project_running_json(project_dir, lane=lane)
     running_path = os.path.join(project_dir, ".loop", "state", "running.json")
     os.makedirs(os.path.dirname(running_path), exist_ok=True)
     tmp = running_path + ".tmp"
@@ -499,6 +530,31 @@ def _usage():
     sys.exit(1)
 
 
+def _parse_cli_lane(args, start_idx):
+    """Extract --lane <value> from args starting at start_idx.
+
+    Returns (lane_value_or_None, remaining_positional_args).
+    Empty/whitespace lane → None (same normalisation as queue.py).
+    """
+    lane = None
+    positional = []
+    i = start_idx
+    while i < len(args):
+        a = args[i]
+        if a == "--lane":
+            i += 1
+            if i < len(args):
+                lane = args[i]
+        elif a.startswith("--lane="):
+            lane = a[len("--lane="):]
+        else:
+            positional.append(a)
+        i += 1
+    if lane is not None and not lane.strip():
+        lane = None
+    return lane, positional
+
+
 def main():
     if len(sys.argv) < 2:
         _usage()
@@ -507,16 +563,18 @@ def main():
     if cmd == "project-running-json":
         if len(sys.argv) < 3:
             _usage()
-        project_dir = sys.argv[2]
-        result = project_running_json(project_dir)
+        lane, positional = _parse_cli_lane(sys.argv, 2)
+        project_dir = positional[0] if positional else sys.argv[2]
+        result = project_running_json(project_dir, lane=lane)
         print(json.dumps(result, indent=2))
         return 0
 
     if cmd == "write-running-json":
         if len(sys.argv) < 3:
             _usage()
-        project_dir = sys.argv[2]
-        write_running_json(project_dir)
+        lane, positional = _parse_cli_lane(sys.argv, 2)
+        project_dir = positional[0] if positional else sys.argv[2]
+        write_running_json(project_dir, lane=lane)
         return 0
 
     if cmd == "append-event":
