@@ -132,6 +132,14 @@
       "status": "merged",
       "merge_sha": "28f1d4f",
       "merged_at": "2026-06-28T22:47:16Z"
+    },
+    {
+      "brief": "brief-152-queen-lane-wiring",
+      "branch": "brief-152-queen-lane-wiring",
+      "merged_at": "2026-06-29T00:45:15Z",
+      "merge_sha": "744eb06",
+      "evaluation": "",
+      "reason": "backfilled_from_git"
     }
   ]
 }
