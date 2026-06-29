@@ -1,13 +1,13 @@
 {
   "brief": "brief-152-queen-lane-wiring",
   "brief_file": "wiki/briefs/cards/brief-152-queen-lane-wiring/index.md",
-  "iteration": 1,
+  "iteration": 2,
   "status": "running",
   "tasks_completed": [
-    "piece 1: queue.py empty/whitespace --lane coerces to no-filter (None) instead of literal \"\" key; enumerate_dispatchable line ~120 + main() CLI coercion widened to whitespace; docstring updated. Added TestEmptyLaneIsNoFilter (4 cases). 166 pass; CLI smoke confirms enumerate + fingerprint byte-for-byte identical between --lane \"\" and no --lane."
+    "piece 1: queue.py empty/whitespace --lane coerces to no-filter (None) instead of literal \"\" key; enumerate_dispatchable line ~120 + main() CLI coercion widened to whitespace; docstring updated. Added TestEmptyLaneIsNoFilter (4 cases). 166 pass; CLI smoke confirms enumerate + fingerprint byte-for-byte identical between --lane \"\" and no --lane.",
+    "piece 2: templates/prompts/queen.md — both queue.py selection invocations (assess step ~line 21, dispatch step ~line 39) now pass --lane \"$LOOP_LANE\"; added a one-line note explaining empty LOOP_LANE = no filter. Commit 8ca0d54. Proved the selection path is lane-scoped at the shell-expansion level: `LOOP_LANE=\"\"; queue.py . --lane \"$LOOP_LANE\"` output is byte-for-byte IDENTICAL (diff empty) to legacy `queue.py .`. 166 pass."
   ],
   "tasks_remaining": [
-    "piece 2: templates/prompts/queen.md — append --lane \"$LOOP_LANE\" to both queue.py selection invocations (lines ~21 and ~39). Daemon already exports LOOP_LANE (lib/daemon.sh:50-51). If testable, prove the selection path is lane-scoped.",
     "piece 3: bin/loop cmd_install_service + templates/com.scaviefae.simpleloop.plist — add a --lane passthrough that writes LOOP_LANE into the plist EnvironmentVariables; OMIT the key when no --lane is given so the stock single-daemon plist diffs clean. Daemon reads LOOP_LANE from env at daemon.sh:50.",
     "closing: write closeout.md (what shipped, the three pieces, pass criteria, single-daemon parity proof) and review.md (gate runbook, Human-gate: review; link closeout). Then set status complete."
   ],
@@ -16,6 +16,7 @@
     "queue_fingerprint branches on `lane is None` — so keeping main()'s empty→None coercion is load-bearing for byte-for-byte fingerprint parity, not just enumerate. Verified: fingerprint identical between --lane \"\" and no --lane (ae018aafb9938ade).",
     "Wiring map for remaining pieces: queen.md does selection via `queue.py .` (lines ~21,39, NO --lane today). daemon.sh parses --lane / LOOP_LANE env at lines 40-57 and builds _LANE_OPT, exports LOOP_LANE at 50-51. plist template EnvironmentVariables block is at templates/com.scaviefae.simpleloop.plist:37-45; bin/loop interpolates it via sed at bin/loop:1972-1981 (ProgramArguments carry only project_dir + interval, no lane).",
     "No .loop/config.sh / VERIFY_CMD in this worktree. Verify manually with: python3 -m pytest lib/tests/ -q.",
-    "Human-gate: review — closing iteration must produce both closeout.md AND review.md in wiki/briefs/cards/brief-152-queen-lane-wiring/."
+    "Human-gate: review — closing iteration must produce both closeout.md AND review.md in wiki/briefs/cards/brief-152-queen-lane-wiring/.",
+    "Piece 2 (iter 2): queen.md is a prompt template, not pytest-testable directly. Verified the lane-scoping at the seam it actually runs through — shell expansion of `--lane \"$LOOP_LANE\"`. Empty LOOP_LANE → no filter (piece 1 coercion), diff vs legacy `queue.py .` empty. daemon.sh:50-51 exports LOOP_LANE; _LANE_OPT (daemon.sh:55-56) is for the daemon's own fingerprint/dedup path, separate from the queen's selection invocation that piece 2 just wired."
   ]
 }
