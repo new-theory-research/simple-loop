@@ -1,9 +1,17 @@
 {
   "brief": "brief-153-requeue-gate-hold",
   "brief_file": "wiki/briefs/cards/brief-153-requeue-gate-hold/index.md",
-  "iteration": 0,
-  "status": "running",
-  "tasks_completed": [],
+  "iteration": 1,
+  "status": "complete",
+  "tasks_completed": [
+    "Investigate + ground the re-queue gate-bypass replay across both decision layers (daemon AM_FLAG routing in daemon.sh + projector bucketing in state.py); confirm the class is already closed by generation-scoped projection (state._current_generation, brief-249), then add lib/tests/test_requeue_gate_hold.py (7 tests) encoding the portal#50 repro and criteria 1-4; write closeout.md + review.md"
+  ],
   "tasks_remaining": [],
-  "learnings": []
+  "learnings": [
+    "The re-queue gate-bypass class is ALREADY closed in the current codebase. state._current_generation() slices the event log at the LAST `dispatched` event, so an `approved`/`merged` event from a prior pass is scoped out and cannot bucket a re-dispatched (active) card into pending_merges. This is the brief-249 generation-scoping fix; it also closes the approval/merge replay this brief targeted.",
+    "Two decision layers both had to be cleared: (1) daemon.sh:1734-1802 reads Auto-merge fresh from the current card on every completion (never the bug), and (2) state.py project_running_json buckets active cards via generation-scoped _approved_event/_completed_event (where the original bypass lived).",
+    "Load-bearing assumption: generation-scoping requires a FRESH `dispatched` event on every re-queue (actions.dispatch:1463 always appends one). Any future re-dispatch path that skips it would reopen the class — candidate follow-up assertion noted in closeout.",
+    "Deliverable was a regression guard, not a code edit: forcing a no-op change to lib/ would be theater. Empirical probe + 7 tests prove criteria 1-4 incl. the no-over-correction guard (Auto-merge:true still merges on re-completion).",
+    "Verification: pytest lib/tests/ -q -> 173 passed (was 166; +7). test-flow-v2.sh -> 163 passed / 52 failed, byte-for-byte identical to baseline with the new file removed (52 are pre-existing/environmental; this worktree has no .loop/config.sh). Zero new failures."
+  ]
 }
