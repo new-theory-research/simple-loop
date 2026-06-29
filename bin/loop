@@ -1909,7 +1909,21 @@ cmd_sweep() {
 cmd_install_service() {
     require_loop_dir
 
-    local interval="${1:-${HEARTBEAT_INTERVAL:-300}}"
+    # Parse args: positional interval + optional --lane <name>.
+    # A lane scopes this daemon to one Program: (brief-152). Empty/whitespace
+    # lane = no lane = stock single-daemon install (plist diffs clean).
+    local interval="" lane=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --lane)   shift; lane="${1:-}" ;;
+            --lane=*) lane="${1#--lane=}" ;;
+            *)        [ -z "$interval" ] && interval="$1" ;;
+        esac
+        shift
+    done
+    interval="${interval:-${HEARTBEAT_INTERVAL:-300}}"
+    # Trim surrounding whitespace; a blank lane stays no-filter.
+    lane="$(printf '%s' "$lane" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 
     # Resolve installed lib dir — same logic as cmd_start
     local daemon_script="$LIB_DIR/daemon.sh"
@@ -1969,6 +1983,20 @@ PYEOF
     safe_path="$(printf '%s\n' "$PATH" | sed 's/[\/&]/\\&/g')"
     safe_main_branch="$(printf '%s\n' "$main_branch" | sed 's/[\/&]/\\&/g')"
 
+    # LOOP_LANE plist injection. Each placeholder sits alone on its line, so the
+    # no-lane case is a clean line-delete (stock plist byte-for-byte unchanged)
+    # and the with-lane case is a single-line substitution (no multi-line sed).
+    local lane_key_sed lane_val_sed
+    if [ -n "$lane" ]; then
+        local safe_lane
+        safe_lane="$(printf '%s' "$lane" | sed 's/[|&]/\\&/g')"
+        lane_key_sed="s|{{LOOP_LANE_KEY}}|        <key>LOOP_LANE</key>|"
+        lane_val_sed="s|{{LOOP_LANE_VAL}}|        <string>${safe_lane}</string>|"
+    else
+        lane_key_sed="/{{LOOP_LANE_KEY}}/d"
+        lane_val_sed="/{{LOOP_LANE_VAL}}/d"
+    fi
+
     sed \
         -e "s/{{PROJECT_NAME}}/${project_name}/g" \
         -e "s/{{PROJECT_DIR}}/${safe_project_dir}/g" \
@@ -1978,9 +2006,12 @@ PYEOF
         -e "s/{{HOME}}/${safe_home}/g" \
         -e "s/{{PATH}}/${safe_path}/g" \
         -e "s/{{GIT_MAIN_BRANCH}}/${safe_main_branch}/g" \
+        -e "$lane_key_sed" \
+        -e "$lane_val_sed" \
         "$plist_template" > "$plist_dest"
 
     echo "LaunchAgent written: $plist_dest"
+    [ -n "$lane" ] && echo "Lane: $lane (LOOP_LANE in plist EnvironmentVariables)"
 
     # Unload first if already loaded (idempotent re-install)
     launchctl unload "$plist_dest" 2>/dev/null || true

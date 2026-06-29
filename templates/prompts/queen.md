@@ -18,7 +18,7 @@ What's the situation?
 - **Brief complete?** → Evaluate it. Read the diff (`git diff <main_branch>...<branch> --stat`), check quality, write evaluation to `.loop/evaluations/`. Decide: merge, fix, or escalate.
 - **Brief active and running?** → The daemon handles worker iterations. No action needed unless it's blocked.
 - **Brief blocked?** → Read the learnings. Can you unblock it, or does the human need to intervene? If stuck, write `.loop/state/signals/escalate.json`. Re-verify a blocker with the same operation class that failed, not an identity check. (E.g. verify Railway auth with `railway status`, not `railway whoami` — whoami always fails under project-scoped tokens even when service ops work.)
-- **No active brief?** → Check goals.md for what to do next. Run `python3 ~/.local/share/simple-loop/lib/queue.py .` to get the dispatchable queue; dispatch the queue head.
+- **No active brief?** → Check goals.md for what to do next. Run `python3 ~/.local/share/simple-loop/lib/queue.py . --lane "$LOOP_LANE"` to get the dispatchable queue; dispatch the queue head.
 - **Nothing to do?** → Idle. That's fine.
 
 ## Step 3: Evaluate (if brief complete)
@@ -36,10 +36,13 @@ What's the situation?
 Run the shared enumerator:
 
 ```bash
-python3 ~/.local/share/simple-loop/lib/queue.py .
+python3 ~/.local/share/simple-loop/lib/queue.py . --lane "$LOOP_LANE"
 ```
 
-Returns a JSON array ordered by `goals.md` priority — `Status: queued` cards only, filtered against `running.json`. Pick index 0 (the queue head). If the array is empty, idle.
+Returns a JSON array ordered by `goals.md` priority — `Status: queued` cards only,
+filtered against `running.json`. The daemon exports `LOOP_LANE` (empty for a
+single daemon → no filter, byte-for-byte unchanged; a lane name → only that
+program's cards). Pick index 0 (the queue head). If the array is empty, idle.
 
 Write `.loop/state/pending-dispatch.json` using the values from the enumerator output:
 

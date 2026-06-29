@@ -283,5 +283,57 @@ class TestGoldenIIIAdditiveInvariant(unittest.TestCase):
         self.assertEqual(before, after)
 
 
+# ── Empty/whitespace lane coerces to no-filter (brief-152) ──────────────────
+
+class TestEmptyLaneIsNoFilter(unittest.TestCase):
+    """brief-152: a daemon with no lane exports an empty LOOP_LANE and the queen
+    invokes `queue.py . --lane "$LOOP_LANE"` — i.e. `--lane ""`. An empty (or
+    whitespace-only) lane MUST mean "no filter," byte-for-byte identical to no
+    --lane at all — NOT the literal "" key, which would fail-closed against every
+    unlabeled card and silently empty the single-daemon queue. This is the
+    load-bearing backward-compat guarantee (same class as golden iii)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        cards_dir = os.path.join(self.tmp, "wiki", "briefs", "cards")
+        os.makedirs(cards_dir)
+        state_dir = os.path.join(self.tmp, ".loop", "state")
+        os.makedirs(state_dir)
+        # The single-daemon reality: labeled and unlabeled cards side by side.
+        _write_card(cards_dir, "brief-401-a", program="alpha")
+        _write_card(cards_dir, "brief-402-none")          # no Program: field
+        _write_card(cards_dir, "brief-403-b", program="beta")
+        _write_goals(state_dir, ["brief-402-none", "brief-401-a", "brief-403-b"])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_empty_lane_equals_no_lane(self):
+        """`--lane ""` ≡ no `--lane`: the success-criterion golden equality."""
+        self.assertEqual(
+            enumerate_dispatchable(self.tmp, lane=""),
+            enumerate_dispatchable(self.tmp),
+        )
+
+    def test_whitespace_lane_equals_no_lane(self):
+        """A whitespace-only lane is just as degenerate as empty → no filter."""
+        self.assertEqual(
+            enumerate_dispatchable(self.tmp, lane="   "),
+            enumerate_dispatchable(self.tmp),
+        )
+
+    def test_empty_lane_includes_unlabeled_card(self):
+        """The fail-closed trap, named: empty lane must NOT drop the unlabeled
+        brief that `--lane ""` → lane_key="" would have excluded."""
+        result = [c["brief"] for c in enumerate_dispatchable(self.tmp, lane="")]
+        self.assertIn("brief-402-none", result)
+
+    def test_nonempty_lane_still_fail_closed(self):
+        """Guard: the empty-lane fix must NOT loosen a real lane — alpha still
+        excludes the unlabeled and beta cards (151 semantics preserved)."""
+        result = [c["brief"] for c in enumerate_dispatchable(self.tmp, lane="alpha")]
+        self.assertEqual(result, ["brief-401-a"])
+
+
 if __name__ == "__main__":
     unittest.main()
