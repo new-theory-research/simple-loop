@@ -1564,38 +1564,63 @@ def merge(paths):
     # / Human-gate:review) merged with approved_by=None on 2026-06-28 because
     # pending-merge.json survived the re-queue.
     #
-    # Fix: project running.json here and verify the brief is actually in
-    # pending_merges[]. If it is in awaiting_review[] or absent from any active
-    # bucket, this pending-merge.json is stale — refuse the merge and clean up
-    # the file so it cannot fire on the next tick either.
+    # Fix: check that running.json has the brief in pending_merges[]. We read the
+    # on-disk running.json first — it is the already-projected state written by
+    # project_running() before this call in the normal daemon flow, and is the
+    # authoritative view of where the brief sits. If the brief IS in
+    # pending_merges[] there, the merge is legitimate. If it is NOT there, we
+    # re-project from cards+runtime-events to confirm (catching the re-queue case
+    # where running.json may also be stale), then refuse and clean up.
     try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from state import project_running_json as _project_running_json
-        _rc = _project_running_json(project_dir)
-        _pending_brief_ids = {e.get("brief") for e in _rc.get("pending_merges", [])}
-        if brief not in _pending_brief_ids:
-            _bucket = None
-            for _bkt in ("awaiting_review", "active", "history"):
-                if any(e.get("brief") == brief for e in _rc.get(_bkt, [])):
-                    _bucket = _bkt
-                    break
-            _location = f"in {_bucket}" if _bucket else "not found in any active bucket"
-            print(
-                f"merge: REFUSED — {brief} is not in pending_merges[] ({_location}); "
-                f"pending-merge.json is stale (portal#50 gate). Cleaning up stale file.",
-                file=sys.stderr,
-            )
+        _rc_ondisk = None
+        if os.path.exists(paths["running_file"]):
             try:
-                log_action(paths, "merge_refused_stale_pending_merge", {
-                    "brief": brief, "branch": branch, "location": _location or "none",
-                })
+                with open(paths["running_file"]) as _rf:
+                    _rc_ondisk = json.load(_rf)
             except Exception:
                 pass
-            try:
-                os.remove(paths["pending_merge"])
-            except OSError:
-                pass
-            return False
+
+        _ondisk_pending_ids = (
+            {e.get("brief") for e in _rc_ondisk.get("pending_merges", [])}
+            if _rc_ondisk is not None
+            else set()
+        )
+
+        if brief in _ondisk_pending_ids:
+            # On-disk running.json confirms brief is legitimately in pending_merges[].
+            # Gate passes — proceed with merge.
+            pass
+        else:
+            # Brief is absent from on-disk pending_merges[]. Re-project from
+            # cards+events to get the authoritative current location (the brief
+            # may have been re-queued, moving it to awaiting_review).
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from state import project_running_json as _project_running_json
+            _rc = _project_running_json(project_dir)
+            _pending_brief_ids = {e.get("brief") for e in _rc.get("pending_merges", [])}
+            if brief not in _pending_brief_ids:
+                _bucket = None
+                for _bkt in ("awaiting_review", "active", "history"):
+                    if any(e.get("brief") == brief for e in _rc.get(_bkt, [])):
+                        _bucket = _bkt
+                        break
+                _location = f"in {_bucket}" if _bucket else "not found in any active bucket"
+                print(
+                    f"merge: REFUSED — {brief} is not in pending_merges[] ({_location}); "
+                    f"pending-merge.json is stale (portal#50 gate). Cleaning up stale file.",
+                    file=sys.stderr,
+                )
+                try:
+                    log_action(paths, "merge_refused_stale_pending_merge", {
+                        "brief": brief, "branch": branch, "location": _location or "none",
+                    })
+                except Exception:
+                    pass
+                try:
+                    os.remove(paths["pending_merge"])
+                except OSError:
+                    pass
+                return False
     except Exception as _gate_err:
         # If the gate itself errors (e.g. card directory missing), fail loud —
         # never merge on an unverifiable state (engineering rule 10).
