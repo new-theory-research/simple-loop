@@ -196,12 +196,22 @@ fi
 # ── Case 6: 0/0 (refs identical) → NOT a divergence, no SYNC FAILED log ─────
 # Issue #28: git pull --ff-only fails on a dirty tree even when HEAD == origin.
 # Before the fix this routed to "SYNC FAILED: diverged (0 ahead / 0 behind)".
+#
+# To guarantee the FIRST git pull --ff-only genuinely fails at 0/0 we set
+# pull.rebase=true in the daemon checkout. With that config, git pull aborts
+# on an unstaged tracked-file change ("cannot pull with rebase: You have
+# unstaged changes") even when HEAD already equals origin/main. Without
+# pull.rebase=true the first pull succeeds (ff-only is a no-op) and the
+# issue-#28 block is never reached, so the test would pass on unfixed code.
 make_fixture "$TMP/c6"
 SIGNALS_DIR="$TMP/c6/signals"; mkdir -p "$SIGNALS_DIR"
 SYNC_FAIL_COUNT=0; LOG_LINES=""
 cd "$DAEMON"
+# Force the first pull --ff-only to fail at 0/0 (issue-#28 reproduction).
+git config pull.rebase true
 git fetch origin -q
-# Dirty the tree WITHOUT advancing HEAD — orphan untracked file + modified tracked
+# Dirty the tree WITHOUT advancing HEAD: modify a tracked file (triggers the
+# pull.rebase abort) plus an untracked file.
 echo "runtime scratch" > "$DAEMON/.loop/state/running.json"
 echo "dirty untracked" > "$DAEMON/.loop/state/scratch.tmp"
 if sync_project_checkout; then
@@ -219,38 +229,50 @@ if [ "$SYNC_FAIL_COUNT" -eq 0 ]; then
 else
     fail "0/0 dirty-tree: failure counter incremented (=$SYNC_FAIL_COUNT)"
 fi
+# Assert the issue-#28 recovery branch ran (not just a lucky first-pull success).
+if echo "$LOG_LINES" | grep -q "GIT SYNC: dirty working tree with refs in sync"; then
+    pass "0/0 dirty-tree: issue-#28 recovery log message present"
+else
+    fail "0/0 dirty-tree: issue-#28 recovery log message missing (got: $LOG_LINES)"
+fi
 
-# ── Case 7: dirty tree, refs identical — working tree reconciles after sync ───
-# After the fix, the stash/pop cycle leaves the working tree clean relative to
-# HEAD, so the projector can read cards without hand-alignment.
+# ── Case 7: dirty-tree + ff-only pull (behind-by-1) — card reconciles ────────
+# This case exercises acceptance criterion #3: a brief card written to origin
+# while the daemon's working tree is dirty reconciles after sync, so the
+# projector reads the latest state without hand-alignment.
+#
+# NOTE: this case validates the pre-existing ff-only path (behind==1, ahead==0),
+# NOT the issue-#28 0/0 fix. With behind==1, git pull --ff-only succeeds on the
+# first call (ff-only handles a dirty unrelated tracked file by fast-forwarding
+# over it), so ahead==0 AND behind==0 is never reached and the issue-#28 block
+# is not exercised here. The mutation check for issue-#28 lives in Case 6.
 make_fixture "$TMP/c7"
 SIGNALS_DIR="$TMP/c7/signals"; mkdir -p "$SIGNALS_DIR"
 SYNC_FAIL_COUNT=0; LOG_LINES=""
-# Simulate brief-150 writing a card to origin (master REF) while the daemon's
-# working tree still has the old version.
+# Simulate a brief card written to origin while the daemon's working tree is stale.
 mkdir -p "$OTHER/wiki/briefs/cards/brief-153"
 echo 'Status: active' > "$OTHER/wiki/briefs/cards/brief-153/index.md"
 git -C "$OTHER" add -A && git -C "$OTHER" commit -q -m "brief-153: flip to active"
 git -C "$OTHER" push -q origin main
 cd "$DAEMON" && git fetch origin -q
-# Dirty the daemon working tree (bookkeeping noise, same as the real symptom)
+# Dirty the daemon working tree (bookkeeping noise, same as the real symptom).
 echo "stale running.json" > "$DAEMON/.loop/state/running.json"
 if sync_project_checkout; then
-    pass "dirty-tree + behind-by-1: sync_project_checkout returns success"
+    pass "ff-only + dirty-tree (behind-by-1): sync_project_checkout returns success"
 else
-    fail "dirty-tree + behind-by-1: sync_project_checkout returned failure"
+    fail "ff-only + dirty-tree (behind-by-1): sync_project_checkout returned failure"
 fi
-# After sync, the card written to origin must be present in the working tree
+# After sync, the card written to origin must be present in the working tree.
 if [ -f "$DAEMON/wiki/briefs/cards/brief-153/index.md" ] && \
    grep -q "active" "$DAEMON/wiki/briefs/cards/brief-153/index.md"; then
-    pass "dirty-tree + behind-by-1: working-tree card reconciled to origin after sync"
+    pass "ff-only + dirty-tree (behind-by-1): working-tree card reconciled to origin"
 else
-    fail "dirty-tree + behind-by-1: working-tree card still stale after sync"
+    fail "ff-only + dirty-tree (behind-by-1): working-tree card still stale after sync"
 fi
 if echo "$LOG_LINES" | grep -q "SYNC FAILED"; then
-    fail "dirty-tree + behind-by-1: false 'SYNC FAILED' logged"
+    fail "ff-only + dirty-tree (behind-by-1): false 'SYNC FAILED' logged"
 else
-    pass "dirty-tree + behind-by-1: no 'SYNC FAILED' in log"
+    pass "ff-only + dirty-tree (behind-by-1): no 'SYNC FAILED' in log"
 fi
 
 echo ""
