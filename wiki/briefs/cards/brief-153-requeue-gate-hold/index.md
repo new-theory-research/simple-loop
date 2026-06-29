@@ -1,7 +1,7 @@
 ---
 ID: brief-153-requeue-gate-hold
 Branch: brief-153-requeue-gate-hold
-Status: queued
+Status: active
 Model: opus
 Auto-merge: false
 Validator: core/agents/reviewer.md
