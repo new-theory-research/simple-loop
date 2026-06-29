@@ -106,18 +106,24 @@ def enumerate_dispatchable(project_dir, running=None, lane=None):
     Args:
         project_dir: project root path (str).
         running: parsed running.json dict, or None to read from disk.
-        lane: optional program-lane partition key (brief-151). When None
-            (default), the card Program: field is never read and every queued
-            card is a candidate — single-daemon behavior byte-for-byte
-            unchanged. When set, only cards whose Program: lowercases to
-            lane.lower() are kept; a card with NO Program: field is EXCLUDED
-            (fail-closed — an unlabeled brief never gets silently grabbed by a
-            lane queen).
+        lane: optional program-lane partition key (brief-151). When None,
+            empty, or whitespace-only (brief-152), the card Program: field is
+            never read and every queued card is a candidate — single-daemon
+            behavior byte-for-byte unchanged. When set to a non-empty value,
+            only cards whose Program: matches (case- and whitespace-insensitive)
+            are kept; a card with NO Program: field is EXCLUDED (fail-closed —
+            an unlabeled brief never gets silently grabbed by a lane queen).
 
     Returns:
         List of dicts with keys: brief, branch, brief_file.
     """
-    lane_key = lane.lower() if lane is not None else None
+    # An empty or whitespace-only lane means "no filter" — NOT the literal ""
+    # key (which would fail-closed against every unlabeled card). This is the
+    # single-daemon default: the daemon exports an empty LOOP_LANE and the queen
+    # passes `--lane "$LOOP_LANE"`, so enumerate must read that empty lane as
+    # None. A non-empty lane is stripped + lowered to match _parse_card_program
+    # (brief-152). Non-empty lane semantics (151 fail-closed) are untouched.
+    lane_key = lane.strip().lower() if lane and lane.strip() else None
     cards_dir = os.path.join(project_dir, "wiki", "briefs", "cards")
 
     if running is None:
@@ -291,9 +297,12 @@ def main():
         else:
             positional.append(a)
         i += 1
-    # An explicit empty --lane "" is degenerate; treat it as no lane so it can't
-    # accidentally match unlabeled cards (which report Program: "").
-    if lane == "":
+    # An explicit empty/whitespace --lane "" is degenerate; treat it as no lane
+    # so it can't fail-closed against unlabeled cards (which report Program: "").
+    # This keeps the single-daemon path — queen runs `--lane "$LOOP_LANE"` with
+    # LOOP_LANE empty — byte-for-byte identical to no --lane, including the
+    # queue_fingerprint string (which branches on lane is None).
+    if lane is not None and not lane.strip():
         lane = None
     project_dir = positional[0] if positional else os.getcwd()
     if fingerprint:
