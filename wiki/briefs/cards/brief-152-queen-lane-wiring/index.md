@@ -1,7 +1,7 @@
 ---
 ID: brief-152-queen-lane-wiring
 Branch: brief-152-queen-lane-wiring
-Status: active
+Status: merged
 Model: opus
 Auto-merge: false
 Validator: core/agents/reviewer.md
