@@ -1,0 +1,3 @@
+GIT_REMOTE=origin
+GIT_MAIN_BRANCH=master
+THROTTLE=1
