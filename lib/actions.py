@@ -1556,6 +1556,56 @@ def merge(paths):
 
     project_dir = paths["project_dir"]
 
+    # ── Portal#50 gate: reject stale pending-merge.json ─────────────────────
+    # A pending-merge.json left over from a prior approval cycle (e.g. a failed
+    # push, daemon restart, or an aborted merge) fires the legacy daemon path
+    # even when the brief has since been re-queued and is now in awaiting_review
+    # (no current-generation approved event). Receipt: fleet-001 (Auto-merge:false
+    # / Human-gate:review) merged with approved_by=None on 2026-06-28 because
+    # pending-merge.json survived the re-queue.
+    #
+    # Fix: project running.json here and verify the brief is actually in
+    # pending_merges[]. If it is in awaiting_review[] or absent from any active
+    # bucket, this pending-merge.json is stale — refuse the merge and clean up
+    # the file so it cannot fire on the next tick either.
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from state import project_running_json as _project_running_json
+        _rc = _project_running_json(project_dir)
+        _pending_brief_ids = {e.get("brief") for e in _rc.get("pending_merges", [])}
+        if brief not in _pending_brief_ids:
+            _bucket = None
+            for _bkt in ("awaiting_review", "active", "history"):
+                if any(e.get("brief") == brief for e in _rc.get(_bkt, [])):
+                    _bucket = _bkt
+                    break
+            _location = f"in {_bucket}" if _bucket else "not found in any active bucket"
+            print(
+                f"merge: REFUSED — {brief} is not in pending_merges[] ({_location}); "
+                f"pending-merge.json is stale (portal#50 gate). Cleaning up stale file.",
+                file=sys.stderr,
+            )
+            try:
+                log_action(paths, "merge_refused_stale_pending_merge", {
+                    "brief": brief, "branch": branch, "location": _location or "none",
+                })
+            except Exception:
+                pass
+            try:
+                os.remove(paths["pending_merge"])
+            except OSError:
+                pass
+            return False
+    except Exception as _gate_err:
+        # If the gate itself errors (e.g. card directory missing), fail loud —
+        # never merge on an unverifiable state (engineering rule 10).
+        print(
+            f"merge: gate check failed for {brief}: {_gate_err} — refusing merge to avoid unverified state",
+            file=sys.stderr,
+        )
+        return False
+    # ── end portal#50 gate ──────────────────────────────────────────────────
+
     # Verify main tree is on main branch (should always be true with worktrees)
     current = git(project_dir, "branch", "--show-current", check=False).stdout.strip()
     if current != main_branch:
