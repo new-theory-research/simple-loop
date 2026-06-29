@@ -1446,6 +1446,26 @@ sync_project_checkout() {
     case "$ahead" in ''|*[!0-9]*) ahead=0 ;; esac
     case "$behind" in ''|*[!0-9]*) behind=0 ;; esac
 
+    # Issue #28: when ahead==0 AND behind==0 the refs are identical — HEAD IS
+    # origin/main. The pull failed because the working tree is dirty (untracked
+    # or modified bookkeeping files), NOT because the checkout diverged. This is
+    # a false positive; log "SYNC FAILED: diverged (0 ahead / 0 behind)" 89×
+    # was the observed symptom. Fix: autostash everything, retry ff-only pull
+    # (which only needs a fast-forward — usually a no-op when already in sync),
+    # then pop. Even if the retry is a no-op it leaves the working tree clean
+    # relative to HEAD, which is what matters for the projector reading cards.
+    if [ "$ahead" -eq 0 ] && [ "$behind" -eq 0 ]; then
+        local stashed=false
+        if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+            git stash push -q --include-untracked -m "loop: sync dirty-tree stash (issue #28)" 2>/dev/null && stashed=true
+        fi
+        git pull --ff-only "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
+        if [ "$stashed" = true ]; then git stash pop -q 2>/dev/null || true; fi
+        SYNC_FAIL_COUNT=0
+        daemon_log "GIT SYNC: dirty working tree with refs in sync — stashed, re-pulled, restored (issue #28)"
+        return 0
+    fi
+
     # Auto-heal the common case: every local-ahead commit is daemon
     # bookkeeping (`loop:` prefix) — replaying those onto origin is safe.
     local non_loop=1
