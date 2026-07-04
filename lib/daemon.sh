@@ -76,6 +76,12 @@ GIT_MAIN_BRANCH="${GIT_MAIN_BRANCH:-main}"
 MAX_COMMITS_BEHIND="${MAX_COMMITS_BEHIND:-30}"
 MAX_CYCLE_WALL_TIME_SECS="${MAX_CYCLE_WALL_TIME_SECS:-5400}"
 WORKER_KILL_GRACE_SECS="${WORKER_KILL_GRACE_SECS:-10}"
+# Validator wall-time watchdog (issue #32): the validator's claude call runs
+# synchronously in the main tick loop with no bound of its own. Default is
+# generous — a validator review is a single Claude call, not an iterated
+# worker cycle — but a hung network call (receipt: 2026-07-02, "API Error:
+# Unable to connect" for 1467s) must not be allowed to stall the whole daemon.
+VALIDATOR_WALL_TIME_SECS="${VALIDATOR_WALL_TIME_SECS:-1800}"
 # TTL for conductor dedup cache entries. After this many seconds a cached
 # trigger is treated as fresh, allowing re-evaluation of persistent conditions
 # (e.g. stale_brief after a stuck worker exit). 30 min keeps dedup spam-free
@@ -1074,20 +1080,53 @@ Verdict guide:
     local VALIDATOR_LOG="$LOG_DIR/validator_${brief_id}_$(date +%Y%m%d_%H%M%S).log"
     local VALIDATOR_JSON=$(mktemp)
     local V_START=$(date +%s)
+    local VALIDATOR_TIMEOUT_FLAG
+    VALIDATOR_TIMEOUT_FLAG=$(mktemp)
+    rm -f "$VALIDATOR_TIMEOUT_FLAG"  # written by watchdog only if timeout fires
 
     cd "$WORKTREE_DIR"
 
     # Tier: validator = sonnet (see top-of-file model tier policy).
+    # Wall-time watchdog (issue #32): same shape as the worker watchdog above
+    # (~line 626) — background the claude call, sleep-then-SIGTERM-then-SIGKILL
+    # if it's still alive past VALIDATOR_WALL_TIME_SECS. Without this a hung
+    # network call ran synchronously in the main tick loop with no bound.
     claude --model sonnet --dangerously-skip-permissions \
         --output-format json \
         -p "$VALIDATOR_PROMPT_BODY" \
-        > "$VALIDATOR_JSON" 2>>"$VALIDATOR_LOG"
+        > "$VALIDATOR_JSON" 2>>"$VALIDATOR_LOG" &
+    local VALIDATOR_PID
+    VALIDATOR_PID=$!
 
+    (
+        sleep "$VALIDATOR_WALL_TIME_SECS"
+        if kill -0 "$VALIDATOR_PID" 2>/dev/null; then
+            touch "$VALIDATOR_TIMEOUT_FLAG"
+            kill -TERM "$VALIDATOR_PID" 2>/dev/null
+            sleep "$WORKER_KILL_GRACE_SECS"
+            kill -KILL "$VALIDATOR_PID" 2>/dev/null || true
+        fi
+    ) &
+    local VALIDATOR_WATCHDOG_PID
+    VALIDATOR_WATCHDOG_PID=$!
+
+    wait "$VALIDATOR_PID"
     local V_EXIT=$?
+
+    # Cancel watchdog (no-op if already fired; avoids a dangling sleep).
+    kill "$VALIDATOR_WATCHDOG_PID" 2>/dev/null
+    wait "$VALIDATOR_WATCHDOG_PID" 2>/dev/null || true
+
     local V_END=$(date +%s)
     local V_DURATION=$((V_END - V_START))
 
     cd "$PROJECT_DIR"
+
+    if [ -f "$VALIDATOR_TIMEOUT_FLAG" ]; then
+        rm -f "$VALIDATOR_TIMEOUT_FLAG"
+        daemon_log "VALIDATOR: wall-time exceeded ${VALIDATOR_WALL_TIME_SECS}s — killed validator for $brief_id cycle $cycle"
+        notify "$brief_id: validator wall-time exceeded (${VALIDATOR_WALL_TIME_SECS}s)"
+    fi
 
     parse_metrics "$VALIDATOR_JSON" "$VALIDATOR_LOG" "validator" "{'brief': '$brief_id', 'cycle': $cycle, 'commit': '${commit_sha:0:12}', 'exit_code': $V_EXIT}"
     rm -f "$VALIDATOR_JSON"
@@ -1783,7 +1822,7 @@ try:
                 print('false')
                 sys.exit(0)
         break
-except: pass
+except Exception: pass
 print('false')
 " 2>/dev/null)
 
@@ -1798,7 +1837,7 @@ try:
         if b.get('brief') == '$active_entry':
             print(b.get('branch', ''))
             sys.exit(0)
-except: pass
+except Exception: pass
 print('')
 " 2>/dev/null)
             STALENESS_GATED=false
