@@ -1769,6 +1769,32 @@ def merge(paths):
     if evaluation:
         merge_msg += f"\n\nEvaluation: {evaluation}"
 
+    # Issue #28 (Python path): `git merge` refuses with exit 2 when the main
+    # working tree has dirty TRACKED files that the merge would overwrite —
+    # runtime-events.jsonl is the primary trigger (it is committed on the
+    # worker branch via dispatch plumbing, so the merge wants to update it,
+    # but the daemon's working tree has it modified/dirty). Untracked files
+    # (.loop/state/ evaluations/, stewardship-log-*.md, last-queen-success.json)
+    # do NOT block git merge and must NOT be stashed (stashing --include-untracked
+    # would remove log.jsonl and other live state files from the working tree).
+    # Mirror the daemon.sh issue-#28 pattern, but stash only tracked changes.
+    _autostash_taken = False
+    _tracked_dirty = git(project_dir, "status", "--porcelain", "--untracked-files=no",
+                         check=False).stdout.strip()
+    if _tracked_dirty:
+        stash_result = git(
+            project_dir, "stash", "push",
+            "-m", f"loop: merge dirty-tree autostash for {brief} (issue #28)",
+            check=False,
+        )
+        if stash_result.returncode == 0 and "No local changes" not in stash_result.stdout:
+            _autostash_taken = True
+            log_action(paths, "merge_autostash_push", {
+                "brief": brief, "branch": branch,
+                "dirty_lines": len(_tracked_dirty.splitlines()),
+            })
+            print(f"merge autostash: stashed dirty tracked files before merge ({len(_tracked_dirty.splitlines())} entries)")
+
     if git(project_dir, "show-ref", "--verify", "--quiet",
            f"refs/heads/{branch}", check=False).returncode == 0:
         merge_result = git(project_dir, "merge", branch, "--no-ff", "-m", merge_msg, check=False)
@@ -1782,7 +1808,25 @@ def merge(paths):
             or "unmerged" in combined.lower()
         )
         if is_conflict:
+            # Abort the merge FIRST so git returns to a clean HEAD with no
+            # unmerged index entries. Only then is stash pop safe — git refuses
+            # 'stash pop --index' while unmerged entries exist (rc=1 'error:
+            # could not write index'), which would strand the stash and silently
+            # discard dirty tracked content. (Rule 10; validator finding #1/#2.)
             git(project_dir, "merge", "--abort", check=False)
+            if _autostash_taken:
+                pop_result = git(project_dir, "stash", "pop", "--index", check=False)
+                _autostash_taken = False
+                if pop_result.returncode != 0:
+                    # Pop failed after a clean abort — this should not happen
+                    # (the working tree is at HEAD with no unmerged entries).
+                    # Fail loud rather than silently discarding caller data.
+                    raise RuntimeError(
+                        f"merge autostash: stash pop failed after merge --abort "
+                        f"(rc={pop_result.returncode}): {pop_result.stderr.strip()}\n"
+                        "Stash may still be dangling — run 'git stash list' and "
+                        "'git stash pop' manually to recover dirty tracked files."
+                    )
             # brief-108-d: append a `completed` event with merge-conflict kind.
             # The brief was already in pending_merges (had a `completed` +
             # `approved` event); we re-emit `completed` with the new kind so
@@ -1800,10 +1844,82 @@ def merge(paths):
             })
             print(f"Merge conflict on {brief}: aborted, routed to awaiting_review", file=sys.stderr)
             return False
+        # Non-conflict failure: no in-progress merge, so stash pop is safe here.
+        if _autostash_taken:
+            git(project_dir, "stash", "pop", "--index", check=False)
+            _autostash_taken = False
         raise subprocess.CalledProcessError(
             merge_result.returncode, f"git merge {branch}",
             output=merge_result.stdout, stderr=merge_result.stderr,
         )
+
+    # Merge succeeded. Restore the autostash if one was taken.
+    # Only tracked files were stashed (not untracked — those were left in
+    # place to avoid disrupting live daemon state files like log.jsonl).
+    # runtime-events.jsonl is the most likely stash conflict: the stash holds
+    # a pre-merge dirty version; the merge brought in the branch's version.
+    # We ALWAYS want the post-merge (HEAD) version because post-merge code
+    # below regenerates runtime-events.jsonl via project_running() anyway.
+    # Strategy: pop; if it fails due to a tracked-file conflict, take HEAD
+    # versions for conflicted files and drop the stash.
+    if _autostash_taken:
+        pop_result = git(project_dir, "stash", "pop", check=False)
+        if pop_result.returncode != 0:
+            # Pop conflicted after a successful merge. Determine WHICH tracked
+            # files have unmerged (UU) index entries so we can decide how to
+            # handle them safely.
+            #
+            # We ONLY auto-resolve if runtime-events.jsonl is the sole
+            # conflicted path. That file is regenerated by project_running()
+            # below, so taking HEAD is safe and correct. Any other conflicted
+            # tracked file represents caller data that we have no policy for —
+            # fail loud (Rule 10: no silent discard) rather than dropping the
+            # stash and returning True over a corrupted tree.
+            status_after_pop = git(project_dir, "status", "--porcelain",
+                                   "--untracked-files=no", check=False).stdout
+            unmerged = [
+                line[3:].strip()
+                for line in status_after_pop.splitlines()
+                if line[:2] in ("UU", "AA", "DD", "AU", "UA", "DU", "UD")
+            ]
+            events_rel = os.path.join(".loop", "state", "runtime-events.jsonl")
+            non_events_conflicts = [p for p in unmerged if p != events_rel]
+
+            if non_events_conflicts:
+                # Unexpected conflict on caller-owned tracked file(s). We cannot
+                # auto-discard without losing data the caller wrote. Drop the
+                # stash (it cannot be safely re-applied) and raise so the error
+                # surfaces immediately rather than being swallowed by a True return.
+                # The working tree is in a conflict state — abort is not applicable
+                # here (stash pop, not git merge), so we reset the index to HEAD to
+                # leave git in a consistent state before raising.
+                git(project_dir, "reset", "HEAD", check=False)
+                git(project_dir, "stash", "drop", check=False)
+                raise RuntimeError(
+                    f"merge autostash: stash pop conflicted on non-regenerable tracked "
+                    f"file(s) after successful merge of {brief}: "
+                    f"{', '.join(non_events_conflicts)}. "
+                    "Stash dropped; working tree reset to HEAD. "
+                    "The merge landed on main but the dirty tracked content from "
+                    "before the merge could not be restored. "
+                    "Run 'git stash list' and recover manually if needed."
+                )
+
+            # Only runtime-events.jsonl conflicted — safe to auto-resolve with HEAD.
+            # HEAD version is correct: project_running() regenerates this file below.
+            if events_rel in unmerged:
+                git(project_dir, "checkout", "HEAD", "--", events_rel, check=False)
+                # Clear any remaining index conflict markers.
+                git(project_dir, "reset", "HEAD", "--", events_rel, check=False)
+            git(project_dir, "stash", "drop", check=False)
+            log_action(paths, "merge_autostash_pop_conflict_resolved", {
+                "brief": brief, "branch": branch,
+                "note": "autostash pop conflicted on runtime-events.jsonl; HEAD version kept, stash dropped",
+            })
+            print(f"merge autostash: pop conflicted (runtime-events.jsonl) — kept HEAD version, stash dropped")
+        else:
+            log_action(paths, "merge_autostash_pop", {"brief": brief, "branch": branch})
+            print(f"merge autostash: restored dirty tree after merge")
 
     # Remove worktree before deleting branch
     remove_worktree(paths, brief)
