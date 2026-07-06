@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     fs,
     io::{BufRead, BufReader},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 /// Deserialize a `Vec<T>` element-by-element, dropping any element that fails
@@ -2137,6 +2137,11 @@ pub struct LogEvent {
     /// True if sourced from daemon.log (worker/validator live activity)
     #[allow(dead_code)]
     pub from_daemon_log: bool,
+    /// True if sourced from an intent-declaration journal (director session
+    /// activity). The actor string is a session tag, not a fixed role name,
+    /// so the dance floor keys the intent color off this flag rather than the
+    /// actor string (which would otherwise fall through to the muted default).
+    pub intent: bool,
 }
 
 pub struct DanceFloorState {
@@ -2230,6 +2235,7 @@ pub fn load_daemon_log_events(log_path: &Path, max_age_secs: i64) -> Vec<LogEven
             brief,
             malformed: false,
             from_daemon_log: true,
+            intent: false,
         });
     }
     events
@@ -2251,6 +2257,126 @@ fn extract_brief_from_message(msg: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+// ── intent-declaration journal ────────────────────────────────────────────────
+
+/// Path of the in-project intent journal, relative to the cwd (which is the
+/// project dir — same convention as every other `.loop/...` load path here).
+const DEFAULT_INTENT_JOURNAL: &str = ".loop/state/intent-journal.jsonl";
+
+/// Env var holding a colon-separated list of *extra* intent-journal paths to
+/// merge in. This machine runs two clones — the daemon clone and the director's
+/// working clone — each with its own journal; hive merges both so one dance
+/// floor shows every director's declared intent, not just the local project's.
+const INTENT_JOURNALS_ENV: &str = "HIVE_INTENT_JOURNALS";
+
+/// One line of the intent journal (portal `scripts/intent-journal.py`,
+/// `wiki/specs/harness-coordination.md` §4): `{ts, session, action, detail}`.
+/// A director session appends one line before a collision-prone action.
+#[derive(Deserialize)]
+struct RawIntentLine {
+    ts: Option<String>,
+    session: Option<String>,
+    action: Option<String>,
+    detail: Option<String>,
+}
+
+/// Shorten a session tag for the actor column: the first 8 chars when it looks
+/// like a UUID (Claude Code session ids), else the tag verbatim (human handles
+/// like `titania` stay readable). "Looks like a UUID" = the canonical 8-4-4-4-12
+/// hyphen layout, so we never chop a short human name.
+pub fn short_session_tag(session: &str) -> String {
+    if looks_like_uuid(session) {
+        session.chars().take(8).collect()
+    } else {
+        session.to_string()
+    }
+}
+
+fn looks_like_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    for (i, &c) in b.iter().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if c != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !c.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The full set of intent journals to merge: the in-project default (if it
+/// exists) plus every colon-separated path in `HIVE_INTENT_JOURNALS`. Empty
+/// segments in the env var are ignored. Absence of the env var or the default
+/// file is not an error — the journal is ephemeral watchable-layer state.
+pub fn intent_journal_paths() -> Vec<PathBuf> {
+    intent_journal_paths_from(std::env::var(INTENT_JOURNALS_ENV).ok().as_deref())
+}
+
+/// Testable core of [`intent_journal_paths`] — the env value is injected so the
+/// merge logic can be exercised without touching process env.
+fn intent_journal_paths_from(env_value: Option<&str>) -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from(DEFAULT_INTENT_JOURNAL)];
+    if let Some(list) = env_value {
+        for seg in list.split(':') {
+            if !seg.is_empty() {
+                paths.push(PathBuf::from(seg));
+            }
+        }
+    }
+    paths
+}
+
+/// Parse one intent-journal file into dance-floor events. A missing file yields
+/// zero events (feature silently off). Malformed lines are skipped silently —
+/// the journal is best-effort ephemera, so a bad line must never break the
+/// floor (contrast log.jsonl, which surfaces a `[malformed]` row).
+pub fn load_intent_journal_events(path: &Path) -> Vec<LogEvent> {
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return vec![], // absent journal = feature off, not an error
+    };
+    let reader = BufReader::new(file);
+    let mut events = Vec::new();
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<RawIntentLine>(&line) else {
+            continue; // malformed — skip silently
+        };
+        let ts = entry.ts.as_deref().and_then(parse_log_ts);
+        let actor = entry.session.as_deref().map(short_session_tag);
+        let action = entry.action.unwrap_or_default();
+        let detail = entry.detail.unwrap_or_default();
+        let event = if detail.is_empty() {
+            action
+        } else {
+            format!("{} — {}", action, detail)
+        };
+        events.push(LogEvent {
+            ts,
+            actor,
+            event: Some(event),
+            brief: None,
+            malformed: false,
+            from_daemon_log: false,
+            intent: true,
+        });
+    }
+    events
 }
 
 impl DanceFloorState {
@@ -2285,6 +2411,7 @@ impl DanceFloorState {
                             brief: entry.brief,
                             malformed: false,
                             from_daemon_log: false,
+                            intent: false,
                         });
                     }
                     Err(_) => {
@@ -2296,6 +2423,7 @@ impl DanceFloorState {
                             brief: None,
                             malformed: true,
                             from_daemon_log: false,
+                            intent: false,
                         });
                     }
                 }
@@ -2305,6 +2433,13 @@ impl DanceFloorState {
         // Load live worker/validator activity from daemon.log (last 30 min)
         let daemon_events = load_daemon_log_events(daemon_log_path, 1800);
         events.extend(daemon_events);
+
+        // Load director intent declarations — the in-project journal plus any
+        // extra clones named in HIVE_INTENT_JOURNALS. Interleaved by ts below
+        // with the other two sources. Absent journals contribute nothing.
+        for path in intent_journal_paths() {
+            events.extend(load_intent_journal_events(&path));
+        }
 
         // Sort by timestamp (None timestamps sort last), then cap
         events.sort_by(|a, b| match (a.ts, b.ts) {
@@ -3410,6 +3545,155 @@ mod tests {
         assert_eq!(raw.ts.as_deref(), Some("2026-04-21T16:58:00Z"));
     }
 
+    // ── intent-journal tests ───────────────────────────────────────────────────
+
+    /// Write `data` to a uniquely-named temp file; the caller-supplied tag keeps
+    /// two fixtures in one test from colliding on the same nanosecond.
+    fn intent_tempfile(tag: &str, data: &[u8]) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "hive_intent_{}_{}.jsonl",
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(data).unwrap();
+        path
+    }
+
+    #[test]
+    fn short_session_tag_shortens_uuid_keeps_handle() {
+        // A real UUID (Claude Code session id) collapses to its first 8 chars.
+        assert_eq!(
+            short_session_tag("a1b2c3d4-e5f6-7890-abcd-ef1234567890"),
+            "a1b2c3d4"
+        );
+        // A human handle is not a UUID, so it survives verbatim.
+        assert_eq!(short_session_tag("titania"), "titania");
+        // A near-UUID (wrong length) is not chopped — we never truncate a name.
+        assert_eq!(short_session_tag("a1b2c3d4-short"), "a1b2c3d4-short");
+    }
+
+    #[test]
+    fn intent_journal_line_renders_as_event() {
+        // One well-formed line becomes one dance-floor event: the actor is the
+        // shortened session tag, the text is "action — detail", intent flag set.
+        let line = br#"{"ts":"2026-04-21T17:00:00Z","session":"titania","action":"merge","detail":"brief-042 to master"}
+"#;
+        let path = intent_tempfile("one", line);
+        let events = load_intent_journal_events(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert!(ev.intent, "intent flag drives the distinct actor color");
+        assert_eq!(ev.actor.as_deref(), Some("titania"));
+        assert_eq!(ev.event.as_deref(), Some("merge — brief-042 to master"));
+        assert!(ev.ts.is_some(), "a valid ts parses so the row interleaves");
+        assert!(!ev.malformed);
+    }
+
+    #[test]
+    fn intent_journal_uuid_session_shortened_in_actor() {
+        let line = br#"{"ts":"2026-04-21T17:00:00Z","session":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","action":"spec","detail":"authored harness-coordination sec 4"}
+"#;
+        let path = intent_tempfile("uuid", line);
+        let events = load_intent_journal_events(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor.as_deref(), Some("a1b2c3d4"));
+        assert_eq!(
+            events[0].event.as_deref(),
+            Some("spec — authored harness-coordination sec 4")
+        );
+    }
+
+    #[test]
+    fn intent_journal_absent_file_yields_zero_events() {
+        // Feature silently off when the journal doesn't exist — never an error.
+        let missing = std::env::temp_dir().join("hive_intent_does_not_exist_xyz.jsonl");
+        assert_eq!(load_intent_journal_events(&missing).len(), 0);
+    }
+
+    #[test]
+    fn intent_journal_malformed_line_skipped_silently() {
+        // A torn/garbage line must not break the floor and must not surface a
+        // [malformed] row (contrast log.jsonl) — the journal is best-effort.
+        let data = br#"not json at all
+{"ts":"2026-04-21T17:00:00Z","session":"scav","action":"push","detail":"branch X"}
+{"partial": "line with no
+"#;
+        let path = intent_tempfile("malformed", data);
+        let events = load_intent_journal_events(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(events.len(), 1, "only the one valid line survives");
+        assert_eq!(events[0].actor.as_deref(), Some("scav"));
+        assert!(events.iter().all(|e| !e.malformed));
+    }
+
+    #[test]
+    fn intent_journal_paths_merges_default_and_env_list() {
+        // No env → just the in-project default.
+        let just_default = intent_journal_paths_from(None);
+        assert_eq!(just_default.len(), 1);
+        assert_eq!(
+            just_default[0],
+            std::path::PathBuf::from(".loop/state/intent-journal.jsonl")
+        );
+
+        // Colon-separated env adds each non-empty segment after the default.
+        let merged = intent_journal_paths_from(Some("/a/one.jsonl::/b/two.jsonl"));
+        assert_eq!(merged.len(), 3, "default + two paths, empty segment dropped");
+        assert_eq!(merged[1], std::path::PathBuf::from("/a/one.jsonl"));
+        assert_eq!(merged[2], std::path::PathBuf::from("/b/two.jsonl"));
+    }
+
+    #[test]
+    fn intent_journal_two_files_interleave_by_ts() {
+        // Two clones' journals, timestamps interleaved. Merged + sorted (the
+        // same comparator DanceFloorState::load uses) must alternate by ts.
+        let file_a = br#"{"ts":"2026-04-21T17:00:00Z","session":"scav","action":"dispatch","detail":"a-early"}
+{"ts":"2026-04-21T17:00:20Z","session":"scav","action":"dispatch","detail":"a-late"}
+"#;
+        let file_b = br#"{"ts":"2026-04-21T17:00:10Z","session":"titania","action":"merge","detail":"b-mid"}
+{"ts":"2026-04-21T17:00:30Z","session":"titania","action":"merge","detail":"b-latest"}
+"#;
+        let pa = intent_tempfile("inter_a", file_a);
+        let pb = intent_tempfile("inter_b", file_b);
+
+        let mut events = load_intent_journal_events(&pa);
+        events.extend(load_intent_journal_events(&pb));
+        std::fs::remove_file(&pa).ok();
+        std::fs::remove_file(&pb).ok();
+
+        // Same sort DanceFloorState::load applies to the merged sources.
+        events.sort_by(|a, b| match (a.ts, b.ts) {
+            (Some(at), Some(bt)) => at.cmp(&bt),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+
+        let order: Vec<&str> = events
+            .iter()
+            .map(|e| e.event.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "dispatch — a-early",
+                "merge — b-mid",
+                "dispatch — a-late",
+                "merge — b-latest",
+            ]
+        );
+    }
+
     // ── test helpers ──────────────────────────────────────────────────────────
 
     fn tempfile_write(data: &[u8]) -> std::path::PathBuf {
@@ -3446,11 +3730,11 @@ mod tests {
                     let ts = entry.ts_str().and_then(parse_log_ts);
                     let actor = entry.derived_actor();
                     let event_msg = entry.event.or(entry.action);
-                    events.push(LogEvent { ts, actor, event: event_msg, brief: entry.brief, malformed: false, from_daemon_log: false });
+                    events.push(LogEvent { ts, actor, event: event_msg, brief: entry.brief, malformed: false, from_daemon_log: false, intent: false });
                 }
                 Err(_) => {
                     let preview = line.chars().take(60).collect::<String>();
-                    events.push(LogEvent { ts: None, actor: None, event: Some(format!("[malformed] {}", preview)), brief: None, malformed: true, from_daemon_log: false });
+                    events.push(LogEvent { ts: None, actor: None, event: Some(format!("[malformed] {}", preview)), brief: None, malformed: true, from_daemon_log: false, intent: false });
                 }
             }
         }

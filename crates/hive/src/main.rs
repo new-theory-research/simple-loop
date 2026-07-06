@@ -145,6 +145,10 @@ const ORANGE: Color = Color::from_u32(0x00FF8C00);
 // read as calmer than conductor/worker colors so the dance floor separates
 // brief-cycle noise from scout observation at a glance.
 const TEAL: Color = Color::from_u32(0x005DADE2);
+// Intent declarations = rose. Director sessions are a distinct presence from
+// the daemon's brief-cycle actors (queen/worker/validator/scout), so they get
+// an unused warm hue — clearly apart from lavender (queen) and coral (errors).
+const ROSE: Color = Color::from_u32(0x00FF79C6);
 
 // ── app state ─────────────────────────────────────────────────────────────────
 
@@ -1053,7 +1057,14 @@ fn render_dance_floor<'a>(df: &'a state::DanceFloorState) -> (Text<'a>, u16) {
             .map(state::relative_time)
             .unwrap_or_else(|| "?".to_string());
         let actor_str = display_actor(ev.actor.as_deref());
-        let ac = actor_color(ev.actor.as_deref());
+        // Intent rows carry a session tag as their actor, not a role name, so
+        // actor_color would land them on the muted default. Key their color off
+        // the intent flag instead, keeping them a distinct presence.
+        let ac = if ev.intent {
+            ROSE
+        } else {
+            actor_color(ev.actor.as_deref())
+        };
         // Strip the brief id from the message — it's already in its own
         // column, and the redundancy triggered false positives in event_color
         // for briefs whose id contains words like "error", "fail", "merge",
@@ -1067,11 +1078,19 @@ fn render_dance_floor<'a>(df: &'a state::DanceFloorState) -> (Text<'a>, u16) {
         // brief-cycle rows even in monochrome terminals / colorblind palettes.
         // Color alone isn't enough signal for "observation vs throughput".
         let is_scout = ev.actor.as_deref() == Some("scout");
-        let leading = if is_scout { "◇ " } else { "  " };
+        // Intent rows get a leading marker too, so the "declared intent" layer
+        // is separable from brief-cycle throughput even in a mono terminal.
+        let leading = if is_scout {
+            "◇ "
+        } else if ev.intent {
+            "› "
+        } else {
+            "  "
+        };
 
         let mut spans: Vec<Span<'a>> = vec![
             Span::styled(format!("{:>7}", time_str), Style::default().fg(MUTED)),
-            Span::styled(leading, Style::default().fg(TEAL)),
+            Span::styled(leading, Style::default().fg(if ev.intent { ROSE } else { TEAL })),
             Span::styled(format!("{:<11}", actor_str), Style::default().fg(ac)),
             Span::styled("  ", Style::default()),
         ];
