@@ -1208,6 +1208,22 @@ def close_as_delivered(paths, brief_id, delivered_via, reason=""):
 
 # ─── Action: dispatch ─────────────────────────────────────────────────
 
+def _load_queue_module():
+    """Import lib/queue.py by explicit path.
+
+    lib/queue.py collides with stdlib `queue`, so load it by explicit path via
+    importlib rather than `import queue` (which could resolve to the stdlib
+    module if it were ever pre-imported). No sys.modules collision; no
+    dependency on cwd or sys.path ordering.
+    """
+    import importlib.util
+    qpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue.py")
+    spec = importlib.util.spec_from_file_location("loop_queue", qpath)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def worktree_dir_for(paths, brief):
     """Return the worktree path for a brief."""
     return os.path.join(paths["worktrees_dir"], brief)
@@ -1261,6 +1277,67 @@ def _init_commit_already_landed(wt_dir, brief):
     expected = f"Initialize brief {brief}"
     head = git(wt_dir, "log", "-1", "--format=%s", check=False)
     return head.returncode == 0 and head.stdout.strip() == expected
+
+
+def _sync_worktree_file_from_head(project_dir, main_branch, repo_path):
+    """Sync project_dir's real index + working-tree copy of `repo_path` from
+    the branch ref that a git-plumbing commit just advanced (issue #29).
+
+    lib/git_plumbing.py commits directly to `refs/heads/<branch>` via a
+    throwaway temp index (GIT_INDEX_FILE), deliberately never touching
+    project_dir's real .git/index or working tree (git_plumbing.py:6-9,
+    "The working tree is never touched" — built for brief-150, where
+    project_dir's worktree had drifted onto some OTHER branch and a plain
+    `git commit` there would land on the wrong ref).
+
+    But when project_dir IS checked out to `main_branch` — the daemon's
+    normal layout, not the drift case brief-150 guards against — advancing
+    refs/heads/<main_branch> without this sync leaves the on-disk file and
+    the real index at the OLD content while HEAD (the ref we just moved)
+    has the NEW content: a staged divergence. lib/queue.py:36
+    (_parse_card_status) and lib/state.py:174-177 (_walk_cards) both read
+    the working-tree file directly, so they kept seeing the pre-dispatch
+    status forever (the 2026-06-29 escalation's root cause).
+
+    `git checkout HEAD -- <path>` restores both the real index and the
+    working tree for exactly this path from current HEAD. When project_dir
+    is on some other branch (the brief-150 case), HEAD there doesn't reflect
+    the commit we just made to a different ref, so there is nothing correct
+    to sync — skip rather than clobber that unrelated worktree state.
+    """
+    current = git(project_dir, "rev-parse", "--abbrev-ref", "HEAD", check=False)
+    if current.returncode != 0 or current.stdout.strip() != main_branch:
+        return
+    result = git(project_dir, "checkout", "HEAD", "--", repo_path, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"dispatch: failed to sync working tree for {repo_path} after "
+            f"card-status commit (issue #29 fix): {result.stderr.strip()}"
+        )
+
+
+def _assert_dispatch_projection(paths, project_dir, main_branch, brief, card_repo_path):
+    """Post-dispatch invariant (issue #29): working-tree card status and
+    running.json.active must both agree the brief is active. Raises loudly
+    instead of letting dispatch() report success on a half-projected state
+    (rule 10 — no silent half-projection)."""
+    current = git(project_dir, "rev-parse", "--abbrev-ref", "HEAD", check=False)
+    if current.returncode == 0 and current.stdout.strip() == main_branch:
+        wt_path = os.path.join(project_dir, card_repo_path)
+        loop_queue = _load_queue_module()
+        wt_status = loop_queue._parse_card_status(wt_path)
+        if wt_status != "active":
+            raise RuntimeError(
+                f"dispatch: post-dispatch invariant failed for {brief} — "
+                f"working-tree card Status is {wt_status!r}, expected 'active'"
+            )
+    rc = load_running(paths)
+    active_ids = {e.get("brief") for e in rc.get("active", [])}
+    if brief not in active_ids:
+        raise RuntimeError(
+            f"dispatch: post-dispatch invariant failed for {brief} — not "
+            f"present in running.json active[] after projection"
+        )
 
 
 def _release_claim_quiet(paths, brief_id):
@@ -1330,15 +1407,7 @@ def dispatch(paths):
     except (ValueError, TypeError):
         drain_secs = 0
     if drain_secs > 0 and active:
-        # lib/queue.py collides with stdlib `queue`, so load it by explicit
-        # path via importlib rather than `import queue` (which could resolve to
-        # the stdlib module if it were ever pre-imported). No sys.modules
-        # collision; no dependency on cwd or sys.path ordering.
-        import importlib.util
-        _qpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue.py")
-        _spec = importlib.util.spec_from_file_location("loop_queue", _qpath)
-        _loop_queue = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_loop_queue)
+        _loop_queue = _load_queue_module()
         # brief-151: when this daemon is lane-partitioned (LOOP_LANE exported by
         # daemon.sh), the drain gate must consider only this lane's queue head —
         # otherwise a solo brief in another lane could wrongly hold our dispatch.
@@ -1485,38 +1554,49 @@ def dispatch(paths):
     )
 
     # Update card Status → active (card-is-truth: queued → active on dispatch)
-    # Uses plumbing: reads from main, transforms in memory, commits to main.
-    # Working tree is never touched — immune to worktree branch drift.
+    # Commits via plumbing so the write always lands on main_branch regardless
+    # of what project_dir's worktree happens to be checked out to (brief-150).
+    # Issue #29: plumbing alone leaves project_dir's real index + working tree
+    # stale when project_dir IS checked out to main_branch (the daemon's
+    # normal layout) — see _sync_worktree_file_from_head for the mechanism and
+    # why. A failure anywhere in this block fails the dispatch loudly (raises)
+    # rather than silently leaving queue.py/state.py reading a stale card
+    # (rule 10 — the whole bug class this fixes).
     _card_repo_path = f"wiki/briefs/cards/{brief}/index.md"
-    try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from _set_card_status import transform_card_status_content as _transform_fn
-        from git_plumbing import (
-            read_file_at_branch as _read_branch,
-            commit_file_to_branch as _commit_file,
-        )
-        _card_content = _read_branch(project_dir, _card_repo_path, main_branch)
-        _new_content, _changed = _transform_fn(_card_content, "active")
-        if _changed:
-            _tmp_fd, _tmp_path = tempfile.mkstemp(prefix="card-status-", suffix=".md")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from _set_card_status import transform_card_status_content as _transform_fn
+    from git_plumbing import (
+        read_file_at_branch as _read_branch,
+        commit_file_to_branch as _commit_file,
+    )
+    _card_content = _read_branch(project_dir, _card_repo_path, main_branch)
+    _new_content, _changed = _transform_fn(_card_content, "active")
+    if _changed:
+        _tmp_fd, _tmp_path = tempfile.mkstemp(prefix="card-status-", suffix=".md")
+        try:
+            os.write(_tmp_fd, _new_content.encode())
+            os.close(_tmp_fd)
+            _commit_file(project_dir, _tmp_path, _card_repo_path, main_branch,
+                         f"loop: card status → active for {brief}")
+        finally:
             try:
-                os.write(_tmp_fd, _new_content.encode())
-                os.close(_tmp_fd)
-                _commit_file(project_dir, _tmp_path, _card_repo_path, main_branch,
-                             f"loop: card status → active for {brief}")
-            finally:
-                try:
-                    os.unlink(_tmp_path)
-                except OSError:
-                    pass
-            log_action(paths, "card_status_set_active", {"brief": brief})
-    except Exception as e:
-        print(f"dispatch: card status update failed for {brief}: {e} (non-fatal)", file=sys.stderr)
+                os.unlink(_tmp_path)
+            except OSError:
+                pass
+        _sync_worktree_file_from_head(project_dir, main_branch, _card_repo_path)
+        log_action(paths, "card_status_set_active", {"brief": brief})
 
     # brief-108-d: project running.json from cards + events. Single-write owner.
     # harness-001/003: running.json is daemon-local — project locally but do
     # NOT commit it. Only runtime-events.jsonl goes to main.
     project_running(paths)
+
+    # Issue #29: verify the post-dispatch invariant before declaring success —
+    # queue.py/state.py read the working tree directly, so a stale card here
+    # recreates the false-dispatchable loop. Fail loud rather than report a
+    # half-projected dispatch as done.
+    _assert_dispatch_projection(paths, project_dir, main_branch, brief, _card_repo_path)
+
     # Commit state files to main via plumbing — immune to worktree branch drift.
     # running.json is explicitly excluded: it is daemon-local volatile state.
     try:
