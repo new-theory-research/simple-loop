@@ -44,23 +44,11 @@ mkdir -p "$INSTALL_DIR"/{lib,templates/prompts}
 mkdir -p "$INSTALL_DIR"/core/{agents,skills,templates}
 mkdir -p "$BIN_DIR"
 
-# Record source provenance for `loop info`
-SOURCE_COMMIT=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
-_sl_dirty_check=$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null | head -1)
-if [ -n "$_sl_dirty_check" ]; then SOURCE_DIRTY="true"; else SOURCE_DIRTY="false"; fi
-python3 -c "
-import json, datetime
-data = {
-    'source_repo': '$SCRIPT_DIR',
-    'source_commit': '$SOURCE_COMMIT',
-    'source_dirty': '$SOURCE_DIRTY' == 'true',
-    'version': '0.2.0',
-    'installed_at': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-}
-with open('$INSTALL_DIR/PROVENANCE.json', 'w') as f:
-    json.dump(data, f, indent=2)
-    f.write('\n')
-" || echo "  warning: PROVENANCE.json generation failed (non-fatal; 'loop info' will show 'unknown' provenance)"
+# Record source provenance for `loop info` / `loop status` / daemon startup log
+# (issue #41: version-visibility primitive — PROVENANCE.json is the install
+# artifact; nothing here is coordination state). Prints old SHA -> new SHA so
+# the install itself is a receipt.
+python3 "$SCRIPT_DIR/lib/write_provenance.py" "$SCRIPT_DIR" "$INSTALL_DIR" || echo "  warning: PROVENANCE.json generation failed (non-fatal; 'loop info'/'loop status' will show 'unknown' provenance)"
 
 # Copy lib (daemon runtime)
 cp "$SCRIPT_DIR/lib/daemon.sh" "$INSTALL_DIR/lib/"
