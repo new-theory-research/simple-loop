@@ -2108,6 +2108,77 @@ def heartbeat_is_stale(heartbeat_path, interval_s=300):
         return True
 
 
+# ─── Version visibility (issue #41) ────────────────────────────────
+
+def read_provenance(install_dir):
+    """Read PROVENANCE.json from an install dir. Returns dict or None.
+
+    PROVENANCE.json is written by install.sh (via write_provenance.py) at
+    install time — source_commit, source_repo, source_dirty, version,
+    installed_at. It's the version-visibility primitive: daemon.sh's startup
+    log line and `loop status` both read it back, so a merge to master that
+    hasn't been installed yet is a visible fact instead of archaeology.
+    None (missing file, unreadable, or no source_commit) means "pre-VERSION
+    install" — callers must surface that loudly, never silently.
+    """
+    path = os.path.join(install_dir, "PROVENANCE.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not data.get("source_commit"):
+            return None
+        return data
+    except (FileNotFoundError, IOError, OSError, json.JSONDecodeError):
+        return None
+
+
+def installed_version_line(install_dir):
+    """One-line installed-SHA + date summary, for the daemon startup log.
+
+    Loud, explicit fallback (never a blank/absent line) when PROVENANCE.json
+    is missing — an install that predates this primitive.
+    """
+    p = read_provenance(install_dir)
+    if p is None:
+        return "unknown (pre-VERSION install)"
+    sha = p.get("source_commit", "unknown")
+    date = p.get("installed_at", "unknown")
+    dirty = " dirty" if p.get("source_dirty") else ""
+    return f"{sha} (installed {date}{dirty})"
+
+
+def upstream_ahead_count(source_repo, sha):
+    """Count commits origin/master is ahead of the installed SHA.
+
+    Returns (count, None) on success, (None, reason) when the source repo is
+    unreachable — path missing, not fetched, git errors, or times out. Never
+    raises. Uses whatever origin/master ref is already fetched locally (no
+    network fetch here) so `loop status` stays fast and works offline.
+    """
+    if not source_repo or not os.path.isdir(source_repo):
+        return None, "source repo not found"
+    if not sha or sha == "unknown":
+        return None, "installed SHA unknown"
+    try:
+        verify = subprocess.run(
+            ["git", "-C", source_repo, "rev-parse", "--verify", "-q", "origin/master"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if verify.returncode != 0:
+            return None, "no origin/master ref in source repo"
+        count = subprocess.run(
+            ["git", "-C", source_repo, "rev-list", "--count", f"{sha}..origin/master"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if count.returncode != 0:
+            return None, (count.stderr.strip() or "git rev-list failed")
+        return int(count.stdout.strip()), None
+    except subprocess.TimeoutExpired:
+        return None, "git command timed out"
+    except (ValueError, OSError) as e:
+        return None, str(e)
+
+
 # ─── Validator artifact-presence check (brief-014 fix 5) ────────────
 
 # Matches checkbox lines that name a backticked path — the common form in

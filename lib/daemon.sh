@@ -115,6 +115,19 @@ WP_BRIEFS=()
 # Find lib directory (co-located with this script)
 DAEMON_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Version visibility (issue #41): read the installed SHA + date back from
+# PROVENANCE.json (written by install.sh at install time) so the running
+# daemon announces which commit it's actually on. Loud fallback — never a
+# blank line — when the install predates PROVENANCE.json.
+INSTALL_ROOT="$(dirname "$DAEMON_LIB_DIR")"
+INSTALLED_VERSION_LINE=$(python3 -c "
+import sys
+sys.path.insert(0, '$DAEMON_LIB_DIR')
+from actions import installed_version_line
+print(installed_version_line('$INSTALL_ROOT'))
+" 2>/dev/null)
+[ -z "$INSTALLED_VERSION_LINE" ] && INSTALLED_VERSION_LINE="unknown (pre-VERSION install)"
+
 # Ensure directories exist
 mkdir -p "$STATE_DIR/signals" "$LOG_DIR"
 
@@ -138,6 +151,7 @@ echo "╚═══════════════════════�
 echo ""
 echo "  Project:   ${PROJECT_NAME:-$(basename "$PROJECT_DIR")}"
 echo "  Directory: $PROJECT_DIR"
+echo "  Version:   $INSTALLED_VERSION_LINE"
 echo "  Idle interval: ${HEARTBEAT_INTERVAL}s"
 echo "  Worker cooldown: ${WORKER_COOLDOWN}s (max $MAX_ITERATIONS/brief)"
 echo "  PID:       $$"

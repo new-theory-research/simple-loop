@@ -1142,6 +1142,33 @@ print('STALE' if heartbeat_is_stale('$hb_file', interval_s=${HEARTBEAT_INTERVAL:
     echo "  Project:  ${PROJECT_NAME:-$(basename "$PROJECT_DIR")}"
     echo "  Dir:      $PROJECT_DIR"
 
+    # Version — issue #41: installed SHA/date read back from PROVENANCE.json
+    # (written by install.sh at install time), plus how far upstream master
+    # has moved, so merge-without-install is a glance, not archaeology.
+    if [ -f "$actions_script" ]; then
+        python3 -c "
+import sys
+sys.path.insert(0, '$(dirname "$actions_script")')
+from actions import read_provenance, upstream_ahead_count
+
+p = read_provenance('$SIMPLE_LOOP_HOME')
+if p is None:
+    print('  Version:  unknown (pre-VERSION install)')
+else:
+    sha = p.get('source_commit', 'unknown')
+    date = p.get('installed_at', 'unknown')
+    dirty = ' dirty' if p.get('source_dirty') else ''
+    print(f'  Version:  {sha} (installed {date}{dirty})')
+    count, reason = upstream_ahead_count(p.get('source_repo', ''), sha)
+    if reason:
+        print(f'  Upstream: unreachable ({reason})')
+    elif count == 0:
+        print('  Upstream: up to date with master')
+    else:
+        print(f'  Upstream: +{count} commit(s) on master since install')
+" 2>/dev/null || echo "  Version:  unknown (status check failed)"
+    fi
+
     # Pause state
     if [ -f "$SIGNALS_DIR/pause.json" ]; then
         local reason
