@@ -1722,18 +1722,31 @@ def merge(paths):
         merge_result = git(project_dir, "merge", f"{remote}/{branch}", "--no-ff", "-m", merge_msg, check=False)
 
     if merge_result.returncode != 0:
-        # Restore autostash before bailing out so no data is lost.
-        if _autostash_taken:
-            git(project_dir, "stash", "pop", "--index", check=False)
-            _autostash_taken = False
-
         combined = merge_result.stdout + merge_result.stderr
         is_conflict = merge_result.returncode in (1, 128) and (
             "CONFLICT" in combined or "Automatic merge failed" in combined
             or "unmerged" in combined.lower()
         )
         if is_conflict:
+            # Abort the merge FIRST so git returns to a clean HEAD with no
+            # unmerged index entries. Only then is stash pop safe — git refuses
+            # 'stash pop --index' while unmerged entries exist (rc=1 'error:
+            # could not write index'), which would strand the stash and silently
+            # discard dirty tracked content. (Rule 10; validator finding #1/#2.)
             git(project_dir, "merge", "--abort", check=False)
+            if _autostash_taken:
+                pop_result = git(project_dir, "stash", "pop", "--index", check=False)
+                _autostash_taken = False
+                if pop_result.returncode != 0:
+                    # Pop failed after a clean abort — this should not happen
+                    # (the working tree is at HEAD with no unmerged entries).
+                    # Fail loud rather than silently discarding caller data.
+                    raise RuntimeError(
+                        f"merge autostash: stash pop failed after merge --abort "
+                        f"(rc={pop_result.returncode}): {pop_result.stderr.strip()}\n"
+                        "Stash may still be dangling — run 'git stash list' and "
+                        "'git stash pop' manually to recover dirty tracked files."
+                    )
             # brief-108-d: append a `completed` event with merge-conflict kind.
             # The brief was already in pending_merges (had a `completed` +
             # `approved` event); we re-emit `completed` with the new kind so
@@ -1751,6 +1764,10 @@ def merge(paths):
             })
             print(f"Merge conflict on {brief}: aborted, routed to awaiting_review", file=sys.stderr)
             return False
+        # Non-conflict failure: no in-progress merge, so stash pop is safe here.
+        if _autostash_taken:
+            git(project_dir, "stash", "pop", "--index", check=False)
+            _autostash_taken = False
         raise subprocess.CalledProcessError(
             merge_result.returncode, f"git merge {branch}",
             output=merge_result.stdout, stderr=merge_result.stderr,
