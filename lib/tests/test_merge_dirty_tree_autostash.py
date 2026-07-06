@@ -554,5 +554,176 @@ class TestMergeExistingGatesPreserved(unittest.TestCase):
             shutil.rmtree(str(tmp), ignore_errors=True)
 
 
+class TestMergePopConflictOnNonEventsFile(unittest.TestCase):
+    """Validator finding: pop-conflict on a file other than runtime-events.jsonl.
+
+    Scenario (Rule 10 silent-discard):
+      - main's working tree has foo.txt dirty (tracked, non-regenerable)
+      - The brief branch also modifies foo.txt from the same base — the git
+        MERGE succeeds (no conflict), but the post-merge stash POP conflicts
+        on foo.txt because the stash holds the pre-merge dirty version while
+        HEAD now has the branch's committed version.
+      - The old code only checks out runtime-events.jsonl and drops the stash,
+        leaving foo.txt with UU conflict markers in the working tree while
+        reporting True (success) — a Rule 10 silent discard over a corrupted tree.
+
+    The fixed code detects non-events conflicted files and raises instead of
+    silently discarding.
+    """
+
+    def _build_pop_conflict_project(self, tmp: Path):
+        """Repo where merge() succeeds but stash pop conflicts on foo.txt.
+
+        How the pop conflict arises:
+          base    foo.txt = "base\n"       (seed commit, both main and branch start here)
+          branch  foo.txt = "branch\n"     (committed on branch — git merge takes this)
+          stash   foo.txt = "dirty\n"      (working-tree dirty on main before stash push)
+
+        git merge succeeds (no conflict — main HEAD still has "base", branch has "branch").
+        After merge, HEAD foo.txt = "branch\n".
+        stash pop tries to apply "dirty\n" on top of "branch\n" → pop CONFLICT on foo.txt.
+        runtime-events.jsonl is also dirty on main (normal daemon steady state).
+        """
+        origin = tmp / "origin.git"
+        origin.mkdir()
+        _git(origin, "init", "--bare", "-q", "-b", "main")
+
+        project = tmp / "project"
+        project.mkdir()
+        _git(project, "init", "-q", "-b", "main")
+        _git(project, "config", "user.email", "t@t")
+        _git(project, "config", "user.name", "t")
+        _git(project, "remote", "add", "origin", str(origin))
+
+        loop_state = project / ".loop" / "state"
+        loop_state.mkdir(parents=True)
+
+        # Seed: foo.txt at "base", runtime-events.jsonl seeded (so branch can diverge on it)
+        (project / "foo.txt").write_text("base\n")
+        (loop_state / "runtime-events.jsonl").write_text(
+            '{"ts":"2026-07-05T00:00:00Z","event":"dispatched","brief":"' + BRIEF + '"}\n'
+        )
+        (project / "README").write_text("seed\n")
+        _git(project, "add", "README", "foo.txt", ".loop/state/runtime-events.jsonl")
+        _git(project, "commit", "-q", "-m", "seed")
+        _git(project, "push", "-u", "origin", "main", "-q")
+
+        # Branch: modifies foo.txt to "branch\n" AND updates runtime-events.jsonl
+        _git(project, "checkout", "-b", BRIEF)
+        (project / "foo.txt").write_text("branch\n")
+        (project / "work.txt").write_text("work output\n")
+        (loop_state / "runtime-events.jsonl").write_text(
+            '{"ts":"2026-07-05T00:00:00Z","event":"dispatched","brief":"' + BRIEF + '"}\n'
+            '{"ts":"2026-07-05T01:00:00Z","event":"completed","brief":"' + BRIEF + '"}\n'
+        )
+        _git(project, "add", "foo.txt", "work.txt", ".loop/state/runtime-events.jsonl")
+        _git(project, "commit", "-q", "-m", f"[worker] {BRIEF} task done")
+        _git(project, "push", "-u", "origin", BRIEF, "-q")
+
+        # Back to main
+        _git(project, "checkout", "main")
+
+        # Card + .loop scaffold
+        card_dir = project / "wiki" / "briefs" / "cards" / BRIEF
+        card_dir.mkdir(parents=True)
+        (card_dir / "index.md").write_text(
+            f"---\nID: {BRIEF}\nStatus: active\nAuto-merge: true\n---\n\n# {BRIEF}\n"
+        )
+        _git(project, "add", f"wiki/briefs/cards/{BRIEF}/index.md")
+        _git(project, "commit", "-q", "-m", f"loop: card status -> active for {BRIEF}")
+        _git(project, "push", "origin", "main", "-q")
+
+        (project / ".loop" / "config.sh").write_text("GIT_REMOTE=origin\nGIT_MAIN_BRANCH=main\n")
+        _write_log(project)
+        _write_events(project)
+        write_running_json(str(project))
+
+        # Dirty foo.txt to "dirty\n" — this is what will conflict during stash pop.
+        # The git MERGE will succeed (main HEAD has "base"; branch has "branch" — no
+        # merge conflict). But after the merge, HEAD has "branch\n", and the stash holds
+        # "dirty\n". git stash pop cannot apply "dirty" cleanly on "branch" → pop conflict.
+        (project / "foo.txt").write_text("dirty\n")
+
+        # Also dirty runtime-events.jsonl (normal daemon state)
+        events_path = project / ".loop" / "state" / "runtime-events.jsonl"
+        with open(events_path, "a") as f:
+            f.write(json.dumps({
+                "ts": "2026-07-05T02:00:00Z", "event": "_dirty_test_marker",
+                "brief": BRIEF,
+            }) + "\n")
+
+        _write_pending_merge(project)
+        return project
+
+    def test_pop_conflict_on_nonevent_file_fails_loud(self):
+        """merge() must raise (not return True) when stash pop conflicts on a non-events file.
+
+        UNFIXED behaviour: merge() returns True with UU foo.txt in the tree and
+        an empty stash list — corrupted tree, success reported. (Rule 10 violation.)
+        FIXED behaviour: merge() raises RuntimeError so the caller sees the failure
+        and the corrupted tree is not silently passed off as success.
+        """
+        tmp = Path(tempfile.mkdtemp())
+        project = self._build_pop_conflict_project(tmp)
+        try:
+            # Pre-condition: verify the stash pop WILL conflict on foo.txt.
+            # We do this by staging the merge ourselves to see what happens.
+            _git(project, "stash", "push", "-m", "probe")
+            merge_probe = _git(project, "merge", BRIEF, "--no-ff",
+                               "-m", "probe merge", check=False)
+            if merge_probe.returncode != 0:
+                _git(project, "merge", "--abort", check=False)
+                _git(project, "stash", "pop", check=False)
+                self.skipTest("probe merge failed — test setup doesn't reproduce the scenario")
+            pop_probe = _git(project, "stash", "pop", check=False)
+            pop_conflicted = pop_probe.returncode != 0
+            # Undo the probe merge and restore dirty state.
+            # reset --hard removes the merge commit; the working tree goes back
+            # to the post-stash HEAD.
+            _git(project, "reset", "--hard", "HEAD~1")
+            if pop_conflicted:
+                # pop left conflict markers in the index — clear them, then
+                # drop the probe stash so the stash list is empty before the
+                # real merge() call (otherwise the post-fix stash assertion
+                # would see the probe stash as a false dangling stash).
+                _git(project, "checkout", "HEAD", "--", "foo.txt", check=False)
+                _git(project, "reset", "HEAD", check=False)
+                _git(project, "stash", "drop", check=False)
+            # Restore dirty foo.txt and events for the real test
+            (project / "foo.txt").write_text("dirty\n")
+            events_path = project / ".loop" / "state" / "runtime-events.jsonl"
+            if not pop_conflicted:
+                self.skipTest(
+                    "stash pop did not conflict on foo.txt in this git version — "
+                    "test setup does not reproduce the validator scenario"
+                )
+
+            paths = init_paths(str(project))
+            with self.assertRaises(RuntimeError) as ctx:
+                merge(paths)
+
+            self.assertIn(
+                "foo.txt", str(ctx.exception),
+                "RuntimeError must name the conflicted file so the caller can diagnose"
+            )
+
+            # Stash list must be empty — no dangling stash left behind.
+            stash_list = _git(project, "stash", "list").stdout.strip()
+            self.assertEqual(
+                stash_list, "",
+                "stash must be dropped after the RuntimeError — no dangling stash"
+            )
+
+            # Working tree must not have UU markers (git is in a consistent state)
+            status_short = _git(project, "status", "--short").stdout
+            self.assertNotIn(
+                "UU", status_short,
+                "no unmerged paths must remain in the working tree after the RuntimeError"
+            )
+        finally:
+            import shutil
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
