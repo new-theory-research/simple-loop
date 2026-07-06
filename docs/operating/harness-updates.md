@@ -101,8 +101,33 @@ If the daemon's misbehaving but you need work to move:
 3. **Hand-merge a brief on main** via `git merge --no-ff <branch>` when the daemon's stuck in a state-mismatch or other internal error (see [hand-merge-brief.md](hand-merge-brief.md))
 4. **Stop the daemon entirely** and run cycles by dispatching loop-coder agents directly from the main-thread session
 5. **Clean running.json by hand** (pure-JSON edits) to prune stale active entries or backfill missed merges — last-resort because it's easy to corrupt state further
+6. **Unblock a parked (`status:"blocked"`) brief** — commit `progress.json` status `blocked`→`running` + a learnings note to the brief's **branch** (see below; issue #39)
 
 Each escape hatch is a signal the harness wanted something it didn't have. File that observation somewhere durable (`.loop/knowledge/learnings.md`, or a runway entry for the permanent fix).
+
+#### Unblocking a parked brief — read the trap first
+
+`lib/assess.py` reads `.loop/state/progress.json` via `git_show(project_dir, ref, ...)` (`git_show(project_dir, branch, ".loop/state/progress.json")`, `assess.py:400`) — **from the brief's committed branch (or its remote), never from the worktree.** A brief a worker deliberately parked with `status:"blocked"` (e.g. pending director-supervised spend) produces `CONDUCTOR:brief_blocked` on every tick until that status flips on the branch.
+
+**The trap:** editing the worktree's `.loop/state/progress.json` is the obvious move and a silent no-op — assess never reads it. There is no unblock signal today; nothing in the daemon, queen prompt, or these docs defines how a parked brief resumes on its own (tracked as a fix-shape decision on issue #39). Until then, this is the only working path:
+
+```bash
+# 1. Temp worktree of the brief's branch (not the daemon's live worktree)
+git worktree add /tmp/unblock-<brief-id> <brief-id>
+cd /tmp/unblock-<brief-id>
+
+# 2. Flip status and record why, in progress.json
+#    - "status": "blocked" -> "running"
+#    - append a learnings entry pointing at the receipts that satisfy the block
+#      (e.g. "unblocked 2026-07-05: supervised Modal run completed GREEN, receipts at <commit>")
+
+# 3. Commit and push to the brief's branch
+git add .loop/state/progress.json
+git commit -m "[scav] unblock <brief-id>: <why>"
+git push origin <brief-id>
+```
+
+The next tick's `assess` sees the brief's status as `running` again and emits a `WORKER` trigger — a different conductor target than the cached `brief_blocked` dedup, so the stale dedup window doesn't suppress it. Clean up the temp worktree (`git worktree remove /tmp/unblock-<brief-id>`) once the daemon picks the brief back up.
 
 ## Script-over-inference
 

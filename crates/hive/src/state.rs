@@ -2168,12 +2168,19 @@ pub fn parse_daemon_log_line(line: &str) -> Option<(DateTime<Utc>, String, Strin
     let actor_raw = rest[..colon_pos].trim().to_string();
     let message = rest[colon_pos + 2..].trim().to_string();
 
-    // Normalize actor label to lowercase
-    let actor = match actor_raw.to_uppercase().as_str() {
+    // Normalize actor label to lowercase. Under WORKER_PARALLEL, daemon.sh's
+    // wlog()/spawn_parallel_worker()/reap_finished_workers() tag lines as
+    // `WORKER[<brief-id>]:` (not bare `WORKER:`) so interleaved parallel worker
+    // output stays attributable — those brief-tagged lines were falling through
+    // to the unrecognized-prefix branch and never reaching the dance floor
+    // (issue #37: worker had zero events while daemon/queen/validator showed up).
+    let actor_upper = actor_raw.to_uppercase();
+    let actor = match actor_upper.as_str() {
         "WORKER" => "worker",
         "VALIDATOR" => "validator",
         s if s == "CONDUCTOR" || s.starts_with("CONDUCTOR") => "conductor",
         "DAEMON ACTION" | "DAEMON" => "daemon",
+        s if s.starts_with("WORKER[") => "worker",
         _ => return None, // skip unrecognized prefixes (git output, blank lines, etc.)
     }
     .to_string();
@@ -3689,6 +3696,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_daemon_log_bracketed_worker_lines_land_as_worker_actor() {
+        // issue #37 receipt: all four WORKER_PARALLEL lifecycle log lines use
+        // WORKER[<brief-id>]: prefixes, which must still parse as actor=worker.
+        let lines = [
+            "[2026-07-05 10:00:00] WORKER[ft-001-training-derisk-harness]: starting iteration for ft-001-training-derisk-harness in worktree",
+            "[2026-07-05 10:00:01] WORKER[ft-001-training-derisk-harness]: spawned background iteration (pid 4242, live=1/3)",
+            "[2026-07-05 10:05:00] WORKER[ft-001-training-derisk-harness]: iteration complete (299s), pushed to ft-001-training-derisk-harness",
+            "[2026-07-05 10:05:01] WORKER[ft-001-training-derisk-harness]: reaped — iteration FAILED (exit 1, consecutive=1)",
+        ];
+        for line in lines {
+            let (_, actor, _) = parse_daemon_log_line(line)
+                .unwrap_or_else(|| panic!("expected to parse: {line}"));
+            assert_eq!(actor, "worker", "line should map to worker actor: {line}");
+        }
+    }
+
+    #[test]
     fn parse_daemon_log_validator_line() {
         let line = "[2026-04-21 11:33:17] VALIDATOR: reviewing brief-006-playground-render-fix cycle 4 (commit a3886394)";
         let (ts, actor, msg) = parse_daemon_log_line(line).expect("should parse");
@@ -3776,6 +3800,28 @@ some non-bracket junk line
         // Two lines with same actor+brief within 30s should collapse
         assert_eq!(events.len(), 1, "expected 1 collapsed entry, got {}", events.len());
         assert!(events[0].event.as_deref().unwrap_or("").contains("model loaded"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_daemon_log_events_surfaces_bracketed_worker_lifecycle_lines() {
+        // issue #37: a worker event must land in the same stream daemon/queen/
+        // validator actors already reach via load_daemon_log_events.
+        let data = "\
+[2026-07-05 10:00:00] WORKER[ft-001-training-derisk-harness]: spawned background iteration (pid 4242, live=1/3)
+[2026-07-05 10:05:00] VALIDATOR: reviewing ft-001-training-derisk-harness cycle 6\n";
+        let path = std::env::temp_dir().join(format!(
+            "hive_daemon_worker_lifecycle_{}.log",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos()
+        ));
+        std::fs::write(&path, data).unwrap();
+        let events = load_daemon_log_events(&path, 99_999_999);
+        assert!(
+            events.iter().any(|e| e.actor.as_deref() == Some("worker")
+                && e.event.as_deref().unwrap_or("").contains("spawned background iteration")),
+            "expected a worker event in the stream, got: {:?}",
+            events.iter().map(|e| (&e.actor, &e.event)).collect::<Vec<_>>()
+        );
         std::fs::remove_file(&path).ok();
     }
 

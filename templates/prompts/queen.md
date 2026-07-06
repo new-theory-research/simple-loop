@@ -10,6 +10,7 @@ Read these files now:
 - `.loop/state/signals/` — check for escalate.json, pause.json, resume.json
 - `.loop/state/log.jsonl` — tail the last 20 lines for recent decisions
 - `.loop/knowledge/learnings.md` — accumulated knowledge
+- Note: a brief's `progress.json` `status` (e.g. `blocked`) is read from the brief's committed **branch** via `git_show` (`lib/assess.py`), not from the worktree — unblocking a parked brief means committing the status flip to that branch (see `docs/operating/harness-updates.md` § Known escape hatches).
 
 ## Step 2: Assess
 

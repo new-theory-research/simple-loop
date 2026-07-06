@@ -185,6 +185,45 @@ class TestIterationAdvance(unittest.TestCase):
             self.assertEqual(result["status"], "fail")
             self.assertIn("frozen", result["evidence"])
 
+    def test_advancing_counter_high_dispatch_age_no_alarm(self):
+        """Issue #38: healthy long brief, counter advanced recently — no alarm
+        even though total dispatch age is well past STUCK_MIN and this tick's
+        current==prev (no new advance since the immediately-prior sweep)."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            make_project(tmp)
+            add_active(tmp, "ft-001-training-derisk-harness", old_ts(78), iteration=5)
+            snapshot = {
+                "ft-001-training-derisk-harness": {
+                    "iteration": 5,
+                    "last_advance_ts": old_ts(3),  # counter moved 3→4→5 recently
+                }
+            }
+            result = sweep.check_iteration_advance(
+                "ft-001-training-derisk-harness", old_ts(78),
+                str(tmp / ".loop" / "worktrees"), snapshot
+            )
+            self.assertEqual(result["status"], "ok")
+
+    def test_counter_genuinely_unmoved_past_threshold_alarms(self):
+        """Issue #38: counter hasn't actually advanced in STUCK_MIN — still fires."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            make_project(tmp)
+            add_active(tmp, "ft-001-training-derisk-harness", old_ts(78), iteration=5)
+            snapshot = {
+                "ft-001-training-derisk-harness": {
+                    "iteration": 5,
+                    "last_advance_ts": old_ts(45),  # genuinely frozen for 45m
+                }
+            }
+            result = sweep.check_iteration_advance(
+                "ft-001-training-derisk-harness", old_ts(78),
+                str(tmp / ".loop" / "worktrees"), snapshot
+            )
+            self.assertEqual(result["status"], "fail")
+            self.assertIn("frozen", result["evidence"])
+
 
 # ── Predicate 3: subprocess-exists ──────────────────────────────────────────
 
@@ -363,6 +402,40 @@ class TestSnapshot(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             loaded = sweep.load_snapshot(d)
             self.assertEqual(loaded, {})
+
+    def test_last_advance_ts_updates_when_iteration_advances(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            make_project(tmp)
+            add_active(tmp, "brief-001-test", old_ts(10), iteration=5)
+            state_dir = str(tmp / ".loop" / "state")
+            worktrees_dir = str(tmp / ".loop" / "worktrees")
+            active = [{"brief": "brief-001-test"}]
+            prev_snapshot = {"brief-001-test": {"iteration": 4, "last_advance_ts": old_ts(20)}}
+
+            sweep.save_snapshot(state_dir, active, worktrees_dir, prev_snapshot=prev_snapshot)
+            loaded = sweep.load_snapshot(state_dir)
+
+            self.assertEqual(loaded["brief-001-test"]["iteration"], 5)
+            # advanced this tick — last_advance_ts should be fresh (~now), not the old 20m-ago value
+            self.assertLess(sweep.age_minutes(loaded["brief-001-test"]["last_advance_ts"]), 1)
+
+    def test_last_advance_ts_carries_forward_when_unmoved(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            make_project(tmp)
+            add_active(tmp, "brief-001-test", old_ts(10), iteration=5)
+            state_dir = str(tmp / ".loop" / "state")
+            worktrees_dir = str(tmp / ".loop" / "worktrees")
+            active = [{"brief": "brief-001-test"}]
+            prev_snapshot = {"brief-001-test": {"iteration": 5, "last_advance_ts": old_ts(20)}}
+
+            sweep.save_snapshot(state_dir, active, worktrees_dir, prev_snapshot=prev_snapshot)
+            loaded = sweep.load_snapshot(state_dir)
+
+            self.assertEqual(loaded["brief-001-test"]["iteration"], 5)
+            # unchanged this tick — last_advance_ts should carry forward the old value (~20m ago)
+            self.assertGreater(sweep.age_minutes(loaded["brief-001-test"]["last_advance_ts"]), 15)
 
 
 if __name__ == "__main__":

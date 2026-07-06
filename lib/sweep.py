@@ -152,7 +152,8 @@ def check_iteration_advance(brief_id: str, dispatched_at: str, worktrees_dir: st
             "suggested_action": None,
         }
 
-    prev_iter = snapshot.get(brief_id, {}).get("iteration")
+    prev_entry = snapshot.get(brief_id, {})
+    prev_iter = prev_entry.get("iteration")
     if prev_iter is None:
         return {
             "predicate": "iteration-advance",
@@ -171,12 +172,34 @@ def check_iteration_advance(brief_id: str, dispatched_at: str, worktrees_dir: st
             "suggested_action": None,
         }
 
+    # current_iter <= prev_iter: no advance since the last tick. Anchor the
+    # freeze test to the last time the counter actually moved (last_advance_ts,
+    # carried forward across snapshots), not to the brief's original dispatch —
+    # a healthy multi-cycle brief older than STUCK_MIN will show current==prev
+    # on most ticks between advances (issue #38: dispatch-age anchoring cried
+    # wolf on every tick past minute 30). Falls back to dispatched_at when no
+    # last_advance_ts has been recorded yet.
+    anchor_ts = prev_entry.get("last_advance_ts") or dispatched_at
+    frozen_age = age_minutes(anchor_ts)
+
+    if frozen_age < STUCK_MIN:
+        return {
+            "predicate": "iteration-advance",
+            "brief": brief_id,
+            "status": "ok",
+            "evidence": (
+                f"iteration {current_iter} unchanged since last check, but last "
+                f"advance was {frozen_age:.1f}m ago (< {STUCK_MIN}m threshold)"
+            ),
+            "suggested_action": None,
+        }
+
     return {
         "predicate": "iteration-advance",
         "brief": brief_id,
         "status": "fail",
         "evidence": (
-            f"iteration frozen at {current_iter} for >{STUCK_MIN}m "
+            f"iteration frozen at {current_iter} for {frozen_age:.0f}m since last advance "
             f"(dispatched {dispatch_age:.0f}m ago, prev snapshot={prev_iter})"
         ),
         "suggested_action": (
@@ -322,7 +345,16 @@ def load_snapshot(snapshot_dir: str) -> dict:
         return {}
 
 
-def save_snapshot(snapshot_dir: str, active_entries: list, worktrees_dir: str) -> None:
+def save_snapshot(snapshot_dir: str, active_entries: list, worktrees_dir: str,
+                   prev_snapshot: dict = None) -> None:
+    """Persist this tick's iteration snapshot, carrying forward last_advance_ts.
+
+    last_advance_ts only moves to "now" when the iteration counter actually
+    increased since prev_snapshot; otherwise it's carried forward unchanged so
+    check_iteration_advance can anchor its freeze test to the last real advance.
+    """
+    prev_snapshot = prev_snapshot or {}
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     snapshot = {}
     for entry in active_entries:
         brief_id = entry.get("brief", "")
@@ -334,9 +366,17 @@ def save_snapshot(snapshot_dir: str, active_entries: list, worktrees_dir: str) -
             try:
                 with open(progress_path) as f:
                     data = json.load(f)
+                current_iter = data.get("iteration", 0)
+                prev_entry = prev_snapshot.get(brief_id, {})
+                prev_iter = prev_entry.get("iteration")
+                if prev_iter is None or current_iter > prev_iter:
+                    last_advance_ts = now_ts
+                else:
+                    last_advance_ts = prev_entry.get("last_advance_ts", now_ts)
                 snapshot[brief_id] = {
-                    "iteration": data.get("iteration", 0),
-                    "snapshot_ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "iteration": current_iter,
+                    "snapshot_ts": now_ts,
+                    "last_advance_ts": last_advance_ts,
                 }
             except Exception:
                 pass
@@ -488,7 +528,7 @@ def run_sweep(project_dir: str, quick: bool = False, auto_route: bool = False,
 
     # Update snapshot
     try:
-        save_snapshot(snapshot_dir, active, worktrees_dir)
+        save_snapshot(snapshot_dir, active, worktrees_dir, prev_snapshot=snapshot)
     except Exception:
         pass
 
