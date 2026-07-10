@@ -82,6 +82,20 @@ WORKER_KILL_GRACE_SECS="${WORKER_KILL_GRACE_SECS:-10}"
 # worker cycle — but a hung network call (receipt: 2026-07-02, "API Error:
 # Unable to connect" for 1467s) must not be allowed to stall the whole daemon.
 VALIDATOR_WALL_TIME_SECS="${VALIDATOR_WALL_TIME_SECS:-1800}"
+# Queen circuit breaker (receipts: 2026-07-02→09, Anthropic API degradation).
+# A flaky upstream causes queen (claude -p opus) to hang 30+ min then exit-1;
+# the daemon keeps firing them every tick and burns Opus continuously.
+#   QUEEN_WALL_TIME_SECS   — kill a queen that runs longer than this (default 600s).
+#                            A healthy queen takes 25–60s; 600s is a generous ceiling.
+#   QUEEN_FAIL_THRESHOLD   — consecutive queen failures before the breaker trips
+#                            and the daemon writes pause.json (default 3).
+# Both are config-overridable via .loop/config.sh; in-code defaults apply when
+# config.sh is absent or does not set the var, so an un-updated config still works.
+QUEEN_WALL_TIME_SECS="${QUEEN_WALL_TIME_SECS:-600}"
+QUEEN_FAIL_THRESHOLD="${QUEEN_FAIL_THRESHOLD:-3}"
+# Health-probe timeout for auto-resume (lightweight ping, not a full queen).
+# Short enough to not block the tick; long enough to survive a slow connect.
+QUEEN_PROBE_TIMEOUT_SECS="${QUEEN_PROBE_TIMEOUT_SECS:-30}"
 # TTL for conductor dedup cache entries. After this many seconds a cached
 # trigger is treated as fresh, allowing re-evaluation of persistent conditions
 # (e.g. stale_brief after a stuck worker exit). 30 min keeps dedup spam-free
@@ -104,6 +118,7 @@ THROTTLE="$(printf '%s' "$THROTTLE" | tr -cd '0-9')"
 # Tracking
 CONSECUTIVE_SKIPS=0
 CONSECUTIVE_WORKER_FAILURES=0
+CONSECUTIVE_QUEEN_FAILURES=0
 
 # Parallel-worker registry (daemon-process lifetime; reaped at each tick
 # start). Parallel indexed arrays — bash 3.2 has no associative arrays and no
@@ -315,24 +330,69 @@ invoke_conductor() {
     local TURN_LOG="$LOG_DIR/queen_${TURN}_$(date +%Y%m%d_%H%M%S).log"
     local TURN_START=$(date +%s)
     local JSON_TMP=$(mktemp)
+    local QUEEN_TIMEOUT_FLAG
+    QUEEN_TIMEOUT_FLAG=$(mktemp)
+    rm -f "$QUEEN_TIMEOUT_FLAG"  # written by watchdog only if timeout fires
 
     cd "$PROJECT_DIR"
 
     # Tier: queen = opus (see top-of-file model tier policy).
-    claude --model opus --dangerously-skip-permissions \
+    # Circuit breaker wall-time cap (receipts: 2026-07-02→09): background the
+    # claude invocation so a watchdog can kill it if it hangs past
+    # QUEEN_WALL_TIME_SECS (default 600s; healthy queen = 25–60s). Mirrors the
+    # worker watchdog pattern at run_worker_iteration (~line 640).
+    python3 -c "import os,sys; os.setpgrp(); os.execvp(sys.argv[1],sys.argv[1:])" \
+        claude --model opus --dangerously-skip-permissions \
         --output-format json \
         -p "$(cat "$CONDUCTOR_PROMPT")
 
 Trigger reason: $reason" \
-        > "$JSON_TMP" 2>>"$TURN_LOG"
+        > "$JSON_TMP" 2>>"$TURN_LOG" &
+    local QUEEN_PID
+    QUEEN_PID=$!
 
+    # Watchdog: fires after QUEEN_WALL_TIME_SECS, SIGTERM-grace-SIGKILL the
+    # process group. Leaves QUEEN_TIMEOUT_FLAG so the return path below records
+    # the kill as a failure rather than treating it as a normal exit-code.
+    (
+        sleep "$QUEEN_WALL_TIME_SECS"
+        if kill -0 "$QUEEN_PID" 2>/dev/null; then
+            touch "$QUEEN_TIMEOUT_FLAG"
+            kill -TERM -"$QUEEN_PID" 2>/dev/null || kill -TERM "$QUEEN_PID" 2>/dev/null
+            sleep "$WORKER_KILL_GRACE_SECS"
+            kill -KILL -"$QUEEN_PID" 2>/dev/null || true
+        fi
+    ) &
+    local QUEEN_WATCHDOG_PID
+    QUEEN_WATCHDOG_PID=$!
+
+    wait "$QUEEN_PID"
     local EXIT_CODE=$?
+
+    # Cancel watchdog (no-op if already fired; avoids a dangling sleep).
+    kill "$QUEEN_WATCHDOG_PID" 2>/dev/null
+    wait "$QUEEN_WATCHDOG_PID" 2>/dev/null || true
 
     parse_metrics "$JSON_TMP" "$TURN_LOG" "queen" "{'reason': '$reason', 'exit_code': $EXIT_CODE}"
     rm -f "$JSON_TMP"
 
     local TURN_END=$(date +%s)
     local TURN_DURATION=$((TURN_END - TURN_START))
+
+    # Wall-time kill: watchdog touched QUEEN_TIMEOUT_FLAG. Treat as failure.
+    if [ -f "$QUEEN_TIMEOUT_FLAG" ]; then
+        rm -f "$QUEEN_TIMEOUT_FLAG"
+        daemon_log "QUEEN #$TURN: wall-time cap exceeded ${QUEEN_WALL_TIME_SECS}s — killed (${TURN_DURATION}s)"
+        notify "Queen killed: wall-time cap (${QUEEN_WALL_TIME_SECS}s)"
+        local _qe_tmp _qe_ts
+        _qe_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        _qe_tmp=$(mktemp)
+        python3 -c "import json,sys; json.dump({'ts':sys.argv[1],'reason':'wall-time cap exceeded (${QUEEN_WALL_TIME_SECS}s)','exit_code':1,'log_tail':''},sys.stdout)" \
+            "$_qe_ts" \
+            > "$_qe_tmp" && mv "$_qe_tmp" "$STATE_DIR/last-queen-error.json" || rm -f "$_qe_tmp"
+        return 1
+    fi
+    rm -f "$QUEEN_TIMEOUT_FLAG"
 
     if [ "$EXIT_CODE" -ne 0 ]; then
         daemon_log "QUEEN #$TURN: FAILED (exit $EXIT_CODE, ${TURN_DURATION}s)"
@@ -390,6 +450,81 @@ json.dump({"ts": ts, "reason": reason, "exit_code": exit_code, "log_tail": log_t
     fi
 
     return 0
+}
+
+# ── Queen circuit-breaker helpers ─────────────────────────────────────────────
+# Called by the Phase 2 main loop after invoke_conductor returns. Manages
+# the consecutive-failure counter and the pause.json circuit-trip.
+
+# Write the circuit-breaker pause signal. Shape matches the existing pause.json
+# that directors write by hand — same file, same consumer (the pause check
+# block in the main loop). The `"by": "circuit-breaker"` field lets the
+# pause-check block distinguish circuit-breaker pauses from human-written ones
+# so it can run the auto-resume probe instead of waiting for a human signal.
+_cb_write_pause() {
+    local ts
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    mkdir -p "$SIGNALS_DIR"
+    # Build JSON without embedded single quotes in the python -c string so
+    # `eval` in tests can parse this function without quoting confusion.
+    local threshold="$QUEEN_FAIL_THRESHOLD"
+    local reason="circuit-breaker: ${threshold} consecutive queen failures"
+    printf '{"reason":"%s","paused_at":"%s","by":"circuit-breaker","fail_threshold":%s}\n' \
+        "$reason" "$ts" "$threshold" > "$SIGNALS_DIR/pause.json" 2>/dev/null \
+    || printf '{"reason":"circuit-breaker","paused_at":"%s","by":"circuit-breaker"}\n' "$ts" \
+        > "$SIGNALS_DIR/pause.json"
+}
+
+# Lightweight API health probe for auto-resume. Returns 0 = API healthy,
+# non-zero = still degraded or result ambiguous. Rule 10 fail-safe: anything
+# other than a clean success is treated as still-down so we never resume into
+# a cascade. Uses haiku (cheapest model) with a short wall-time cap.
+_cb_probe_api() {
+    local probe_tmp probe_exit
+    probe_tmp=$(mktemp)
+    # Spawn with a PGID of its own so the kill-on-timeout reaches it cleanly.
+    python3 -c "import os,sys; os.setpgrp(); os.execvp(sys.argv[1],sys.argv[1:])" \
+        claude --model haiku --dangerously-skip-permissions \
+        --output-format json \
+        -p "Reply with the single word: pong" \
+        > "$probe_tmp" 2>/dev/null &
+    local probe_pid=$!
+
+    # Watchdog: hard-kill after QUEEN_PROBE_TIMEOUT_SECS.
+    (
+        sleep "$QUEEN_PROBE_TIMEOUT_SECS"
+        if kill -0 "$probe_pid" 2>/dev/null; then
+            kill -KILL -"$probe_pid" 2>/dev/null || kill -KILL "$probe_pid" 2>/dev/null || true
+        fi
+    ) &
+    local probe_watchdog_pid=$!
+
+    wait "$probe_pid"
+    probe_exit=$?
+    kill "$probe_watchdog_pid" 2>/dev/null
+    wait "$probe_watchdog_pid" 2>/dev/null || true
+    rm -f "$probe_tmp"
+    return "$probe_exit"
+}
+
+# Update the consecutive-failure counter and trip the circuit breaker if the
+# threshold is reached. Call with "fail" or "success".
+#   fail    — increment counter; if >= QUEEN_FAIL_THRESHOLD, write pause.json
+#   success — reset counter to 0
+_cb_record_queen_result() {
+    local result="$1"
+    if [ "$result" = "success" ]; then
+        CONSECUTIVE_QUEEN_FAILURES=0
+        return 0
+    fi
+    # fail path
+    CONSECUTIVE_QUEEN_FAILURES=$((CONSECUTIVE_QUEEN_FAILURES + 1))
+    daemon_log "CIRCUIT BREAKER: queen failure $CONSECUTIVE_QUEEN_FAILURES/$QUEEN_FAIL_THRESHOLD"
+    if [ "$CONSECUTIVE_QUEEN_FAILURES" -ge "$QUEEN_FAIL_THRESHOLD" ]; then
+        daemon_log "CIRCUIT BREAKER: threshold reached — writing pause.json, backing off"
+        notify "Circuit breaker tripped: $CONSECUTIVE_QUEEN_FAILURES consecutive queen failures"
+        _cb_write_pause
+    fi
 }
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -1635,13 +1770,44 @@ while true; do
         daemon_log "PAUSED: $(cat "$SIGNALS_DIR/pause.json")"
         notify "Paused"
 
+        # Detect whether this pause was written by the circuit breaker.
+        # If so, run a lightweight API probe each 60s; on success, remove
+        # pause.json and let the tick resume. A human-written pause waits for
+        # a human resume.json as before.
+        _CB_PAUSE=$(python3 -c "
+import json, sys
+try:
+    with open('$SIGNALS_DIR/pause.json') as f:
+        d = json.load(f)
+    print('yes' if d.get('by') == 'circuit-breaker' else 'no')
+except Exception:
+    print('no')
+" 2>/dev/null || echo "no")
+
         while [ -f "$SIGNALS_DIR/pause.json" ] && [ ! -f "$SIGNALS_DIR/resume.json" ]; do
             sleep 60
+            if [ "$_CB_PAUSE" = "yes" ] && [ -f "$SIGNALS_DIR/pause.json" ] && [ ! -f "$SIGNALS_DIR/resume.json" ]; then
+                # Auto-resume probe: lightweight haiku ping with short timeout.
+                # Fail-safe (Rule 10): only resume on unambiguous success (exit 0).
+                # Any non-zero exit — including timeouts and ambiguous errors —
+                # keeps the daemon paused rather than risking a cascade.
+                daemon_log "CIRCUIT BREAKER: probing API health..."
+                if _cb_probe_api; then
+                    daemon_log "CIRCUIT BREAKER: API probe succeeded — resuming and resetting failure counter"
+                    notify "Circuit breaker: API recovered — resuming"
+                    CONSECUTIVE_QUEEN_FAILURES=0
+                    rm -f "$SIGNALS_DIR/pause.json"
+                    break
+                else
+                    daemon_log "CIRCUIT BREAKER: API probe failed — staying paused (fail-safe)"
+                fi
+            fi
         done
 
         if [ -f "$SIGNALS_DIR/resume.json" ]; then
             daemon_log "RESUMED: $(cat "$SIGNALS_DIR/resume.json")"
             notify "Resumed"
+            CONSECUTIVE_QUEEN_FAILURES=0
             rm -f "$SIGNALS_DIR/pause.json" "$SIGNALS_DIR/resume.json"
         fi
     fi
@@ -1761,8 +1927,12 @@ while true; do
                     # doesn't match — a swallowed queen error gets re-evaluated
                     # next tick instead of cached for up to CONDUCTOR_DEDUP_TTL_SECS.
                     LAST_CONDUCTOR_TRIGGER="error_${_CONDUCTOR_INVOKE_RC}_${_NOW}"
+                    # Circuit breaker: track consecutive queen failures.
+                    _cb_record_queen_result "fail"
                 else
                     LAST_CONDUCTOR_TRIGGER="$CONDUCTOR_TRIGGER"
+                    # Circuit breaker: queen succeeded — reset failure counter.
+                    _cb_record_queen_result "success"
                 fi
                 LAST_CONDUCTOR_TRIGGER_TS="$_NOW"
                 # Re-stat the queue AFTER the queen ran: she may have dispatched
