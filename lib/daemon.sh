@@ -636,13 +636,35 @@ run_worker_iteration() {
     if git -C "$WORKTREE_DIR" rebase "${GIT_REMOTE}/${GIT_MAIN_BRANCH}" -q 2>/dev/null; then
         wlog "WORKER: rebased $branch onto ${GIT_REMOTE}/${GIT_MAIN_BRANCH} ($COMMITS_BEHIND_BEFORE commits)"
     else
-        git -C "$WORKTREE_DIR" rebase --abort 2>/dev/null || true
-        wlog "WORKER: rebase failed for $branch (conflicts) → routed to awaiting_review"
-        python3 "$DAEMON_LIB_DIR/actions.py" move-to-awaiting-review "$brief_id" "$PROJECT_DIR" \
-            rebase-blocked "rebase conflict against main — human resolution required" \
-            2>>"$LOG_DIR/daemon.log" || true
-        notify "$brief_id: rebase conflict → routed to awaiting_review"
-        return 0
+        # Issue #55: a conflict set of exactly .loop/state/progress.json is
+        # transient loop bookkeeping (rewritten on every dispatch), never
+        # load-bearing branch content. Auto-resolve in main's favor and
+        # continue the rebase instead of false-parking the brief
+        # (ft-011 2026-07-10, capture-005-cont 2026-07-11). Any other
+        # conflicting file still parks below.
+        local CONFLICT_FILES
+        local REBASE_RECOVERED=0
+        CONFLICT_FILES=$(git -C "$WORKTREE_DIR" diff --name-only --diff-filter=U 2>/dev/null)
+        if [ "$CONFLICT_FILES" = ".loop/state/progress.json" ]; then
+            git -C "$WORKTREE_DIR" checkout --ours -- .loop/state/progress.json 2>/dev/null
+            git -C "$WORKTREE_DIR" add .loop/state/progress.json 2>/dev/null
+            # Note: `-q` is not accepted alongside `--continue` (git errors
+            # with usage text) — redirect instead of relying on -q here.
+            if git -C "$WORKTREE_DIR" rebase --continue >/dev/null 2>&1; then
+                REBASE_RECOVERED=1
+                wlog "WORKER[$brief_id]: auto-resolved progress.json-only rebase conflict in main's favor"
+                wlog "WORKER: rebased $branch onto ${GIT_REMOTE}/${GIT_MAIN_BRANCH} ($COMMITS_BEHIND_BEFORE commits)"
+            fi
+        fi
+        if [ "$REBASE_RECOVERED" != "1" ]; then
+            git -C "$WORKTREE_DIR" rebase --abort 2>/dev/null || true
+            wlog "WORKER: rebase failed for $branch (conflicts) → routed to awaiting_review"
+            python3 "$DAEMON_LIB_DIR/actions.py" move-to-awaiting-review "$brief_id" "$PROJECT_DIR" \
+                rebase-blocked "rebase conflict against main — human resolution required" \
+                2>>"$LOG_DIR/daemon.log" || true
+            notify "$brief_id: rebase conflict → routed to awaiting_review"
+            return 0
+        fi
     fi
     # ─────────────────────────────────────────────────────────────────────────
 
