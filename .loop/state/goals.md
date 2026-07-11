@@ -11,6 +11,11 @@ The May hackathon-hardening queue (briefs 142–151) is **complete**: all merged
 
 ## Queued next
 
-1. **brief-152 (wire `--lane` through to brief selection — finish brick 0)** — queen prompt runs `queue.py . --lane "$LOOP_LANE"`; `queue.py` treats empty lane as no-filter (single-daemon byte-for-byte unchanged); `loop install-service --lane` passthrough. Opus, Auto-merge: false, Human-gate: review. Depends-on: brief-151. Canonical at `wiki/briefs/cards/brief-152-queen-lane-wiring/index.md`.
+1. **brief-154 (issue intake — a `loop-triage-issues` skill that turns issues into cards)** — closes the intake gap the 2026-07-11 director audit found: `loop-file-issue` files issues out, nothing reads them back, so the loop has closed 0 of 11 fixed issues while dozens sit open. New skill at `core/skills/triage-issues/SKILL.md` (mirrors `file-issue`; install.sh's `core/skills/*/` loop carries it — zero install.sh edits). It clusters open issues by root-cause mechanism (holistic over symptom), emits `Status: draft` / `Program: harness-improvements` cards with an open-issues-only `Issues:` back-link field, plus a `comment-plan.md` — no tracker writes during triage; "tracked as brief-NNN" comments post only via a gated step after human review. First run against every issue open at run time is a deliverable (cluster A cites #2 as the day-one holistic fix). No daemon/queue edits. Opus, Auto-merge: false, Human-gate: review, Parallel-safe: false. Depends-on: _none_. Canonical at `wiki/briefs/cards/brief-154-issue-intake-triage/index.md`.
 
-2. **brief-153 (re-queued human-gate brief must re-hold, not auto-merge)** — approval must be scoped to the current dispatch generation; a re-queue invalidates a prior approval so the brief re-enters `awaiting_review` and waits. Repro from portal#50 must hold. Opus, Auto-merge: false, Human-gate: review. Depends-on: _none_. Canonical at `wiki/briefs/cards/brief-153-requeue-gate-hold/index.md`.
+## Disposition — prior queue (2026-07-11)
+
+The two entries that sat here are resolved; kept for history:
+
+- **brief-152 (queen lane wiring — finish brick 0)** — **merged** (merge `744eb06`, 2026-06-29; card `Status: merged`). `--lane` now reaches the queen's brief selection; single-daemon path byte-for-byte unchanged. Canonical at `wiki/briefs/cards/brief-152-queen-lane-wiring/index.md`.
+- **brief-153 (re-queued human-gate brief must re-hold)** — **not-doing** (superseded). The re-queue gate concern folds into the gate/audit-model cluster (#16 #26 #48 #52) that brief-154's triage will card holistically rather than as a one-off. Canonical at `wiki/briefs/cards/brief-153-requeue-gate-hold/index.md`.
