@@ -55,3 +55,11 @@ name: `lib/startup_repair.py:22` (`(?:brief|audit|capture)-…`) still recognize
 only three lanes, so startup repair is blind to ft-*/rq-*/fleet-*/serve-*/harness-*
 cards. `lib/lint.py:219-220`'s warning text also still reads "doesn't match
 brief-NNN". Reconcile both here so the lane-ID model has one definition, not three.
+
+## Review handoff (2026-07-11, from the multi-lane merge review)
+
+Two non-blocking follow-ups from the multi-lane review: (1) `_lane_set` is
+duplicated byte-for-byte in `lib/queue.py` and `lib/state.py` (comment-linked,
+not shared) — add a shared helper or a cross-module agreement test before the
+two can drift; (2) consider a shell test pinning daemon.sh's LOOP_LANE
+whitespace-normalization (the spaced-list lane split-brain the review caught).
