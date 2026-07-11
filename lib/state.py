@@ -363,20 +363,38 @@ def _card_program(fm):
     return str(p).strip().lower()
 
 
+def _lane_set(lane):
+    """Normalize a lane spec into a set of lane keys, or None for "no filter".
+
+    Mirrors queue.py's `_lane_set` so a lane-scoped daemon's running.json
+    projection partitions on the SAME comma-separated lane list the queue
+    enumerator uses (multi-lane-daemon). A one-element list is the degenerate
+    single-lane case, byte-for-byte unchanged from the exact-match era; empty /
+    whitespace / all-commas / None → None (global projection, single-daemon).
+    """
+    if not lane:
+        return None
+    keys = {part.strip().lower() for part in lane.split(",")}
+    keys.discard("")
+    return keys or None
+
+
 def project_running_json(project_dir, events=None, lane=None):
     """Project running.json from card frontmatter + runtime-events.jsonl.
 
     Args:
         project_dir: absolute project root path.
         events: parsed runtime-events list (for tests). None → read from disk.
-        lane: optional program-lane partition key (harness-001/003). When None,
-            empty, or whitespace-only the projection is global — all briefs, no
-            lane filter. Single-daemon behavior is byte-for-byte unchanged.
-            When set to a non-empty value, only briefs whose card carries a
-            matching Program: field appear in active[], awaiting_review[], and
-            pending_merges[]. history[] is always global (read-only, cosmetic).
-            A brief with NO Program: field is excluded from a lane-scoped
-            projection (fail-closed — same semantics as queue.py's --lane).
+        lane: optional program-lane partition — a comma-separated lane list
+            (harness-001/003, multi-lane-daemon). When None, empty, whitespace-
+            only, or all-commas the projection is global — all briefs, no lane
+            filter. Single-daemon behavior is byte-for-byte unchanged (single
+            lane is the one-element degenerate case). When it names one or more
+            lanes, only briefs whose card Program: is in the lane set appear in
+            active[], awaiting_review[], and pending_merges[]. history[] is
+            always global (read-only, cosmetic). A brief with NO Program: field
+            is excluded from a lane-scoped projection (fail-closed — same
+            semantics as queue.py's --lane).
 
     Returns:
         dict with keys: active, completed_pending_eval, pending_merges,
@@ -391,8 +409,10 @@ def project_running_json(project_dir, events=None, lane=None):
         - History order matches first-merged-first (events file is append-only
           and reflects merge order). Backfill order matches the events file.
     """
-    # Normalise lane the same way queue.py does: empty/whitespace → no filter.
-    lane_key = lane.strip().lower() if lane and lane.strip() else None
+    # Normalise lane the same way queue.py does: a comma-separated lane list →
+    # a set, empty/whitespace/all-commas → None (no filter). Multi-lane lets one
+    # daemon's projection span several lanes (multi-lane-daemon).
+    lane_set = _lane_set(lane)
 
     if events is None:
         events_path = os.path.join(project_dir, ".loop", "state", "runtime-events.jsonl")
@@ -432,7 +452,7 @@ def project_running_json(project_dir, events=None, lane=None):
             # Lane filter: when lane_key is set, exclude briefs not in this lane.
             # A brief with no Program: field is excluded (fail-closed — a lane
             # daemon must never inherit another lane's active state).
-            if lane_key is not None and _card_program(fm) != lane_key:
+            if lane_set is not None and _card_program(fm) not in lane_set:
                 continue
             comp = _completed_event(evs)
             appr = _approved_event(evs)

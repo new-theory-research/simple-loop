@@ -32,7 +32,7 @@ _LIB_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _LIB_DIR not in sys.path:
     sys.path.insert(0, _LIB_DIR)
 
-from queue import enumerate_dispatchable  # noqa: E402
+from queue import enumerate_dispatchable, queue_fingerprint  # noqa: E402
 from claim import claim_brief, release_claim, _ref_for  # noqa: E402
 
 
@@ -333,6 +333,151 @@ class TestEmptyLaneIsNoFilter(unittest.TestCase):
         excludes the unlabeled and beta cards (151 semantics preserved)."""
         result = [c["brief"] for c in enumerate_dispatchable(self.tmp, lane="alpha")]
         self.assertEqual(result, ["brief-401-a"])
+
+
+# ── Multi-lane — one daemon owns SEVERAL lanes (multi-lane-daemon) ───────────
+
+class TestMultiLaneOwnership(unittest.TestCase):
+    """`--lane "alpha,beta"` keeps cards in EITHER lane, in goals order, and
+    still fail-closes the unlabeled card and any out-of-set lane. Single-lane is
+    the one-element degenerate case — byte-for-byte identical to the exact-match
+    era — and lane-list order does not change the result set."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        cards_dir = os.path.join(self.tmp, "wiki", "briefs", "cards")
+        os.makedirs(cards_dir)
+        state_dir = os.path.join(self.tmp, ".loop", "state")
+        os.makedirs(state_dir)
+        # Three lanes + one unlabeled.
+        _write_card(cards_dir, "brief-501-a", program="alpha")
+        _write_card(cards_dir, "brief-502-b", program="beta")
+        _write_card(cards_dir, "brief-503-g", program="gamma")
+        _write_card(cards_dir, "brief-504-a2", program="alpha")
+        _write_card(cards_dir, "brief-505-none")  # no Program:
+        _write_goals(state_dir, [
+            "brief-503-g", "brief-501-a", "brief-505-none",
+            "brief-502-b", "brief-504-a2",
+        ])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_two_lanes_union_in_goals_order(self):
+        result = [c["brief"] for c in
+                  enumerate_dispatchable(self.tmp, lane="alpha,beta")]
+        # goals order is g, a, none, b, a2 → alpha∪beta subset is a, b, a2.
+        self.assertEqual(result, ["brief-501-a", "brief-502-b", "brief-504-a2"])
+
+    def test_out_of_set_lane_and_unlabeled_excluded(self):
+        result = [c["brief"] for c in
+                  enumerate_dispatchable(self.tmp, lane="alpha,beta")]
+        self.assertNotIn("brief-503-g", result)     # gamma not in set
+        self.assertNotIn("brief-505-none", result)  # fail-closed unlabeled
+
+    def test_lane_list_order_does_not_change_result(self):
+        forward = enumerate_dispatchable(self.tmp, lane="alpha,beta")
+        reverse = enumerate_dispatchable(self.tmp, lane="beta,alpha")
+        self.assertEqual(forward, reverse)
+
+    def test_whitespace_and_empty_members_are_dropped(self):
+        # ` alpha , , beta ` normalizes to {alpha, beta}.
+        messy = [c["brief"] for c in
+                 enumerate_dispatchable(self.tmp, lane=" alpha , , beta ")]
+        clean = [c["brief"] for c in
+                 enumerate_dispatchable(self.tmp, lane="alpha,beta")]
+        self.assertEqual(messy, clean)
+
+    def test_single_lane_is_one_element_degenerate_case(self):
+        # A one-element list must equal the exact-match single-lane result.
+        one = [c["brief"] for c in enumerate_dispatchable(self.tmp, lane="alpha")]
+        self.assertEqual(one, ["brief-501-a", "brief-504-a2"])
+        # And is a strict subset of the two-lane union.
+        union = [c["brief"] for c in
+                 enumerate_dispatchable(self.tmp, lane="alpha,beta")]
+        for bid in one:
+            self.assertIn(bid, union)
+
+    def test_all_commas_lane_is_no_filter(self):
+        # ",," and " , " have no real members → no filter → all queued cards.
+        allc = enumerate_dispatchable(self.tmp, lane=",,")
+        self.assertEqual(allc, enumerate_dispatchable(self.tmp))
+
+
+# ── Reorder-stable lane fingerprint (multi-lane-daemon) ──────────────────────
+
+class TestFingerprintLaneReorderStable(unittest.TestCase):
+    """queue_fingerprint folds a SORTED lane set into its namespace, so a
+    reordered lane list maps to one fingerprint (never spuriously busts the
+    queen dedup). lane=None keeps the legacy fingerprint string exactly, and a
+    single lane is byte-for-byte unchanged from the exact-match era."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        cards_dir = os.path.join(self.tmp, "wiki", "briefs", "cards")
+        os.makedirs(cards_dir)
+        state_dir = os.path.join(self.tmp, ".loop", "state")
+        os.makedirs(state_dir)
+        _write_card(cards_dir, "brief-601-a", program="alpha")
+        _write_card(cards_dir, "brief-602-b", program="beta")
+        _write_card(cards_dir, "brief-603-none")
+        _write_goals(state_dir, ["brief-601-a", "brief-602-b", "brief-603-none"])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_reordered_lane_list_same_fingerprint(self):
+        self.assertEqual(
+            queue_fingerprint(self.tmp, lane="alpha,beta"),
+            queue_fingerprint(self.tmp, lane="beta,alpha"),
+        )
+
+    def test_whitespace_variation_same_fingerprint(self):
+        self.assertEqual(
+            queue_fingerprint(self.tmp, lane="alpha,beta"),
+            queue_fingerprint(self.tmp, lane=" beta , alpha "),
+        )
+
+    def test_lane_scoped_differs_from_global(self):
+        self.assertNotEqual(
+            queue_fingerprint(self.tmp, lane="alpha,beta"),
+            queue_fingerprint(self.tmp, lane=None),
+        )
+
+    def test_lane_none_is_legacy_string_exactly(self):
+        # Reconstruct the legacy raw string independently and hash it.
+        import hashlib
+        goals_path = os.path.join(self.tmp, ".loop", "state", "goals.md")
+        st = os.stat(goals_path)
+        goals_sig = "%d:%d" % (st.st_mtime_ns, st.st_size)
+        ids = ",".join(c["brief"] for c in enumerate_dispatchable(self.tmp))
+        raw = "%s|%s" % (goals_sig, ids)
+        legacy = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+        self.assertEqual(queue_fingerprint(self.tmp, lane=None), legacy)
+
+    def test_empty_lane_fingerprint_equals_none(self):
+        # Empty/whitespace lane → no filter → the global (legacy) fingerprint.
+        self.assertEqual(
+            queue_fingerprint(self.tmp, lane=""),
+            queue_fingerprint(self.tmp, lane=None),
+        )
+        self.assertEqual(
+            queue_fingerprint(self.tmp, lane="   "),
+            queue_fingerprint(self.tmp, lane=None),
+        )
+
+    def test_single_lane_fingerprint_unchanged_from_exact_match(self):
+        # The one-element namespace is "alpha" — identical to the pre-multi-lane
+        # `lane.lower()` namespace, so a single-lane daemon's dedup key is stable.
+        import hashlib
+        goals_path = os.path.join(self.tmp, ".loop", "state", "goals.md")
+        st = os.stat(goals_path)
+        goals_sig = "%d:%d" % (st.st_mtime_ns, st.st_size)
+        ids = ",".join(c["brief"] for c in
+                       enumerate_dispatchable(self.tmp, lane="alpha"))
+        raw = "%s|lane=%s|%s" % (goals_sig, "alpha", ids)
+        expected = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+        self.assertEqual(queue_fingerprint(self.tmp, lane="alpha"), expected)
 
 
 if __name__ == "__main__":

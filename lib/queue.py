@@ -11,6 +11,12 @@ CLI:
 
     python3 lib/queue.py <project_dir> --fingerprint
     Prints a short queue-state fingerprint (issue #17 — queen dedup key).
+
+    Both accept `--lane <spec>`, where <spec> is a comma-separated list of
+    program lanes (`--lane "finetune,capture,fleets"`). A card matches when its
+    Program: is in the lane set; an unlabeled card never matches a non-empty
+    set (fail-closed). Empty/whitespace/absent lane = no filter (single-daemon
+    behavior, byte-for-byte unchanged). Single lane is the one-element case.
 """
 
 import hashlib
@@ -56,6 +62,25 @@ def _parse_card_status(card_path):
     except (IOError, OSError):
         pass
     return ""
+
+
+def _lane_set(lane):
+    """Normalize a lane spec into a set of lane keys, or None for "no filter".
+
+    `lane` is a comma-separated list of program lanes: split on commas, strip,
+    lowercase, drop empties. A one-element list is the degenerate single-lane
+    case — membership against a one-element set is identical to the old exact
+    `==` match, so single-lane results are byte-for-byte unchanged. Empty,
+    whitespace-only, all-commas, or None → None (no filter — the single-daemon
+    guarantee from brief-152). Multi-lane lets one daemon own several lanes
+    (portal laptop: `--lane "finetune,capture,fleets"`; remote queen:
+    `--lane remote-queens`).
+    """
+    if not lane:
+        return None
+    keys = {part.strip().lower() for part in lane.split(",")}
+    keys.discard("")
+    return keys or None
 
 
 def _parse_card_program(card_path):
@@ -114,24 +139,26 @@ def enumerate_dispatchable(project_dir, running=None, lane=None):
     Args:
         project_dir: project root path (str).
         running: parsed running.json dict, or None to read from disk.
-        lane: optional program-lane partition key (brief-151). When None,
-            empty, or whitespace-only (brief-152), the card Program: field is
-            never read and every queued card is a candidate — single-daemon
-            behavior byte-for-byte unchanged. When set to a non-empty value,
-            only cards whose Program: matches (case- and whitespace-insensitive)
-            are kept; a card with NO Program: field is EXCLUDED (fail-closed —
-            an unlabeled brief never gets silently grabbed by a lane queen).
+        lane: optional program-lane partition, a comma-separated list of lanes
+            (multi-lane-daemon). When None, empty, whitespace-only, or all-commas
+            (brief-152), the card Program: field is never read and every queued
+            card is a candidate — single-daemon behavior byte-for-byte unchanged.
+            When it names one or more lanes, only cards whose Program: is IN the
+            lane set (case- and whitespace-insensitive) are kept; a card with NO
+            Program: field is EXCLUDED (fail-closed — an unlabeled brief never
+            gets silently grabbed by a lane queen). Single-lane is the one-element
+            degenerate case, byte-for-byte unchanged from the exact-match era.
 
     Returns:
         List of dicts with keys: brief, branch, brief_file.
     """
-    # An empty or whitespace-only lane means "no filter" — NOT the literal ""
-    # key (which would fail-closed against every unlabeled card). This is the
+    # Normalize the lane spec to a set (or None = no filter). An empty /
+    # whitespace / all-commas lane means "no filter" — NOT the literal "" key
+    # (which would fail-closed against every unlabeled card). This is the
     # single-daemon default: the daemon exports an empty LOOP_LANE and the queen
     # passes `--lane "$LOOP_LANE"`, so enumerate must read that empty lane as
-    # None. A non-empty lane is stripped + lowered to match _parse_card_program
-    # (brief-152). Non-empty lane semantics (151 fail-closed) are untouched.
-    lane_key = lane.strip().lower() if lane and lane.strip() else None
+    # None. Non-empty lane semantics (151 fail-closed) are untouched.
+    lane_set = _lane_set(lane)
     cards_dir = os.path.join(project_dir, "wiki", "briefs", "cards")
 
     if running is None:
@@ -161,7 +188,7 @@ def enumerate_dispatchable(project_dir, running=None, lane=None):
                 continue
             if _parse_card_status(card_path) != "queued":
                 continue
-            if lane_key is not None and _parse_card_program(card_path) != lane_key:
+            if lane_set is not None and _parse_card_program(card_path) not in lane_set:
                 continue
             candidates.append({
                 "brief": card_id,
@@ -268,6 +295,11 @@ def queue_fingerprint(project_dir, lane=None):
     enumerate_dispatchable(), so a new card, a status flip, a running.json
     change, or a goals.md edit/reorder all change the fingerprint.
     O(N cards), frontmatter reads only — cheap per daemon tick.
+
+    `lane` accepts the same comma-separated lane list as enumerate_dispatchable.
+    The lane namespace folded into the fingerprint is the sorted set join, so a
+    reordered lane list ("a,b" vs "b,a") maps to one stable fingerprint and never
+    spuriously busts the queen dedup (multi-lane-daemon).
     """
     goals_path = os.path.join(project_dir, ".loop", "state", "goals.md")
     try:
@@ -277,13 +309,17 @@ def queue_fingerprint(project_dir, lane=None):
         goals_sig = "missing"
 
     ids = ",".join(c["brief"] for c in enumerate_dispatchable(project_dir, lane=lane))
-    # lane=None keeps the legacy fingerprint string byte-for-byte; a lane-scoped
-    # daemon gets a distinct namespace so two lanes can't collide on identical
-    # id lists (brief-151).
-    if lane is None:
+    # lane=None (or empty/whitespace/all-commas → no filter) keeps the legacy
+    # fingerprint string byte-for-byte; a lane-scoped daemon gets a distinct
+    # namespace so two lanes can't collide on identical id lists (brief-151).
+    # The namespace is the SORTED set join, so "a,b" and "b,a" (and a single
+    # "alpha") produce the same fingerprint — reorder-stable (multi-lane-daemon).
+    lane_set = _lane_set(lane)
+    if lane_set is None:
         raw = "%s|%s" % (goals_sig, ids)
     else:
-        raw = "%s|lane=%s|%s" % (goals_sig, lane.lower(), ids)
+        lane_norm = ",".join(sorted(lane_set))
+        raw = "%s|lane=%s|%s" % (goals_sig, lane_norm, ids)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 

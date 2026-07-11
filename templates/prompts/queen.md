@@ -43,7 +43,10 @@ python3 ~/.local/share/simple-loop/lib/queue.py . --lane "$LOOP_LANE"
 Returns a JSON array ordered by `goals.md` priority — `Status: queued` cards only,
 filtered against `running.json`. The daemon exports `LOOP_LANE` (empty for a
 single daemon → no filter, byte-for-byte unchanged; a lane name → only that
-program's cards). Pick index 0 (the queue head). If the array is empty, idle.
+program's cards; a comma-separated list like `finetune,capture,fleets` → cards in
+ANY of those lanes, so one daemon can own several). Keep `"$LOOP_LANE"` quoted so
+the comma-list rides through as a single argument. Pick index 0 (the queue head).
+If the array is empty, idle.
 
 Write `.loop/state/pending-dispatch.json` using the values from the enumerator output:
 
