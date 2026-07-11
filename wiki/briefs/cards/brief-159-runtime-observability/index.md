@@ -53,3 +53,13 @@ together.
 - `closeout.md` — the status-source change and per-issue confirmation. Close #31
   #38 #53 with the merge SHA.
 - `review.md` — gate runbook.
+
+## Delivered early (2026-07-11, director session)
+
+The hive "Drafts" catch-all — one of this card's cry-wolf signals — was fixed
+ahead of the card's flip after it misled the operator's ATC view live (merge
+`fix-hive-drafts-taxonomy`; floor now buckets by real Status:, hides terminal
+cards, and renders an honest Anomalies section). Remaining scope (#31 #38 #53:
+status reads the running daemon, sweep predicates, PID substring matching)
+unchanged. Also add when working this card: startup banner should print the
+active lane set (noted at lane activation).
