@@ -2308,7 +2308,7 @@ def extract_artifact_paths(brief_file_path):
     Returns a set of path strings. Matches any `foo.md`-style backticked
     token on a checkbox line — filters to *.md / *.txt / *.json / *.yaml
     extensions, plus bare filenames without slashes (plan.md, closeout.md).
-    Non-file tokens (\`verdict: pass\`, \`running.json\`-ish config refs)
+    Non-file tokens (`verdict: pass`, `running.json`-ish config refs)
     slip in sometimes; callers check existence on the filesystem, so extra
     tokens just cause cheap no-op stats.
     """

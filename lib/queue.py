@@ -22,7 +22,15 @@ import sys
 import time
 
 
-_BRIEF_ID_RE = re.compile(r"brief-\d+(?:-[\w-]+)?")
+# Card-id shape for goals.md ranking: `<lane>-<number><letter?>(-slug)?` with any
+# lowercase lane prefix (issue #50 — `ft-011-fp3t5-base-serve` etc. never ranked
+# because the regex hardcoded `brief-`). The `(?<![\w-])` lookbehind pins the lane
+# to a word start so the scan can't grab the tail of a hyphenated prose token
+# (e.g. the `brief-12` inside `sub-brief-12`) or a numeric slice of a date
+# (`2026-07-11` has no leading letters, so `[a-z]+` never engages). A spurious
+# prose `word-3` token that matches nothing on disk is harmless — it only occupies
+# a rank slot, never reorders a real card (rank is relative, gaps don't matter).
+_BRIEF_ID_RE = re.compile(r"(?<![\w-])[a-z]+-\d+[a-z]?(?:-[\w-]+)?")
 # Match both YAML (`Parallel-safe: true`) and prose (`**Parallel-safe:** true`)
 # forms — same dual-format the rest of the harness parses.
 _PARALLEL_SAFE_RE = re.compile(

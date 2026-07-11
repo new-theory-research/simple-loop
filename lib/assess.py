@@ -43,13 +43,27 @@ DEPENDS_ON_SECRETS_LINE_RE = re.compile(
 CYCLE_WALL_TIME_SECS_LINE_RE = re.compile(
     r"^\s*(?:\*\*Cycle-wall-time-secs:\*\*|Cycle-wall-time-secs:)\s*(\d+)\s*$", re.IGNORECASE
 )
-# Brief-id shape: `brief-NNN` or `brief-NNN-slug` (slug may itself contain hyphens),
-# with an optional single letter-suffix on the number for sibling briefs
-# (`brief-108a`, `brief-253a-nt0-rename-producer`) — an established portal
-# convention the parser was silently dropping from Depends-on (2026-06-11).
+# Card-id shape: `<lane>-<number><letter?>(-slug)?` where <lane> is any
+# lowercase word (`brief`, `ft`, `capture`, `rq`, `fleet`, `serve`, `harness`, …).
+# The lane list is NOT hardcoded — any `[a-z]+-\d+` stem qualifies — so a project
+# that invents a new lane naming convention keeps working (issue #50: lane-prefixed
+# ids like `capture-004-per-key-identity` and `ft-006-newt-finetune-verb` were being
+# silently dropped from Depends-on gating and goals.md ranking because the shape
+# assumed a literal `brief-` prefix). `[a-z]?` keeps the single letter-suffix for
+# sibling briefs (`brief-108a`, `brief-253a-nt0-rename-producer`, 2026-06-11); a
+# double suffix (`brief-253ab-foo`) still doesn't match — the convention is one letter.
+# Anchored (`^…$`) and matched against a single already-cleaned Depends-on token
+# (comma-split, parenthetical stripped), so it can't grab a mid-prose substring.
 # Shared by lib/lint.py — the linter's check_depends_on imports this so the daemon's
-# parser and the author-time linter agree on what counts as a real brief id.
-BRIEF_ID_RE = re.compile(r"^brief-\d+[a-z]?(-[\w-]+)?$")
+# parser and the author-time linter agree on what counts as a real card id.
+BRIEF_ID_RE = re.compile(r"^[a-z]+-\d+[a-z]?(-[\w-]+)?$")
+
+# Warn-once-per-token dedup (issue #50 / log-noise storm): hive.stderr.log
+# accumulated 46,632 identical "dropping non-brief-id token" lines (one per
+# check-depends-on call, every daemon tick). The set is process-scoped — the
+# daemon re-execs assess.py/actions.py per tick, so a genuinely-broken token
+# still surfaces once per process, but a single long-lived process never repeats.
+_DROPPED_TOKEN_WARNED = set()
 
 
 def parse_depends_on_value(raw, validate_brief_id=True):
@@ -65,7 +79,8 @@ def parse_depends_on_value(raw, validate_brief_id=True):
     Empty tokens filtered.
 
     Brief-082 hardening (validate_brief_id=True, default): tokens that don't
-    match `brief-NNN(-slug)?` are dropped with a stderr warning. Two empirical
+    match `<lane>-<number>(-slug)?` (issue #50 — any lowercase lane prefix,
+    not just `brief-`) are dropped with a warn-once stderr message. Two empirical
     wedges (brief-076 `none (daemon harness, simple-loop master)` and brief-082
     `_(intentionally empty — see Why)_`) had nonsense tokens survive cleaning
     and propagate to the deps history-check, where they never matched and
@@ -92,9 +107,12 @@ def parse_depends_on_value(raw, validate_brief_id=True):
             stripped = cleaned.split("(")[0].strip().strip(".,;")
             if BRIEF_ID_RE.match(stripped):
                 out.append(stripped)
-            else:
+            elif cleaned not in _DROPPED_TOKEN_WARNED:
+                # Warn once per unique token per process (see _DROPPED_TOKEN_WARNED).
+                _DROPPED_TOKEN_WARNED.add(cleaned)
                 print(
-                    f"parse_depends_on_value: dropping non-brief-id token: {cleaned!r}",
+                    "parse_depends_on_value: dropping unparseable dependency "
+                    f"token (not a <lane>-<number> card id): {cleaned!r}",
                     file=sys.stderr,
                 )
         else:
