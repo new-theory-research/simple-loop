@@ -134,7 +134,7 @@ cd /tmp/unblock-<brief-id>
 #      (e.g. "unblocked 2026-07-05: supervised Modal run completed GREEN, receipts at <commit>")
 
 # 3. Commit and push to the brief's branch
-git add .loop/state/progress.json
+git add -f .loop/state/progress.json   # -f: gitignored on main, carried on branches (issue #64)
 git commit -m "[scav] unblock <brief-id>: <why>"
 git push origin <brief-id>
 ```

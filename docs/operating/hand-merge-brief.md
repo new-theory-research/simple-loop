@@ -8,8 +8,12 @@ A legitimate, repeatable pattern — not an edge case. Use when the daemon is in
 # 1. Kill the daemon cleanly
 loop stop
 
-# 2. Commit any loose state files on the brief's branch
+# 2. Commit any loose state files on the brief's branch.
+# NOTE: .loop/state/progress.json is gitignored (issue #64), so a plain
+# `git add` skips it. The branch MUST carry it (assess/auto_merge read a
+# brief's progress from the committed branch via `git show`), so force-add:
 git add .loop/state/
+git add -f .loop/state/progress.json   # gitignored — force-add on the branch
 git commit -m "[scav] commit loose state files before hand-merge"
 
 # 3. Smoke-check
@@ -19,6 +23,16 @@ git status                 # confirm clean
 # 4. Merge with --no-ff (keeps the branch visible in history)
 git checkout main
 git merge --no-ff brief-NNN-slug -m "[scav] Merge brief-NNN-slug: <title>"
+
+# 4b. Strip progress.json off main (issue #64). The merge above brought the
+# branch's committed progress.json into main's tree; main must NEVER track it
+# (Wave-1b migration goal — kill the merge-contamination class). The daemon's
+# merge() does this automatically; a hand-merge must do it explicitly:
+if git ls-files --error-unmatch .loop/state/progress.json >/dev/null 2>&1; then
+    git rm --cached --quiet .loop/state/progress.json
+    git commit -m "[scav] strip progress.json off main after hand-merge (issue #64)" \
+        -- .loop/state/progress.json
+fi
 
 # 5. Clean up
 git branch -d brief-NNN-slug

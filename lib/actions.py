@@ -1530,7 +1530,13 @@ def dispatch(paths):
             json.dump(progress, f, indent=2)
             f.write("\n")
 
-        git(wt_dir, "add", ".loop/state/progress.json")
+        # Issue #64: progress.json is gitignored (Wave-1b migration, to keep it
+        # off main's tree). Plain `git add` respects gitignore and silently
+        # drops it here — but this is the worker BRANCH (wt_dir), which must
+        # carry the file: assess.py / auto_merge.py read a brief's progress via
+        # git_show from the committed branch. Force-add so the branch carries
+        # it; merge() strips it back off main below. Worker-branch only.
+        git(wt_dir, "add", "-f", ".loop/state/progress.json")
         git(wt_dir, "commit", "-m", f"Initialize brief {brief}")
 
     # Push is idempotent — up-to-date branches push as no-op.
@@ -1921,6 +1927,36 @@ def merge(paths):
             log_action(paths, "merge_autostash_pop", {"brief": brief, "branch": branch})
             print(f"merge autostash: restored dirty tree after merge")
 
+    # Capture the actual merge commit before the #64 strip commit advances
+    # HEAD, so merge_sha keeps meaning "the merge" in events/history.
+    _merge_commit_sha = ""
+    try:
+        _mc_r = git(project_dir, "rev-parse", "HEAD", check=False)
+        _merge_commit_sha = (_mc_r.stdout or "").strip()[:8]
+    except Exception:
+        pass
+
+    # ── Strip progress.json from main's tree (issue #64) ────────────────────
+    # Worker branches force-add .loop/state/progress.json (git add -f) so the
+    # committed branch carries fresh progress for the git_show read path in
+    # assess.py / auto_merge.py. The merge above brings that tracked file into
+    # main — but main must NEVER track it (Wave-1b migration goal: keep loop
+    # bookkeeping off main to kill the merge-contamination class, #54/#55). If
+    # the merge left it tracked at HEAD, untrack it with a follow-up commit
+    # before the push so main's tip tree stays clean. Keep the physical file on
+    # disk (it is daemon-local, gitignored). runtime-events.jsonl is NOT
+    # stripped: it is legitimately committed to main via dispatch plumbing and
+    # has no branch read path.
+    _progress_rel = os.path.join(".loop", "state", "progress.json")
+    if git(project_dir, "ls-files", "--error-unmatch", _progress_rel,
+           check=False).returncode == 0:
+        git(project_dir, "rm", "--cached", "--quiet", _progress_rel, check=False)
+        git(project_dir, "commit", "-m",
+            f"loop: strip progress.json off main after merge {brief} (issue #64)",
+            "--", _progress_rel, check=False)
+        log_action(paths, "merge_strip_progress_json", {"brief": brief})
+        print(f"merge: stripped progress.json off main's tree after {brief} (issue #64)")
+
     # Remove worktree before deleting branch
     remove_worktree(paths, brief)
 
@@ -1961,10 +1997,11 @@ def merge(paths):
             print(f"cleanup: card status update failed for {brief}: {e} (non-fatal)", file=sys.stderr)
 
     # brief-108-d: append `merged` event so projector populates history[].
-    merge_sha = ""
+    merge_sha = _merge_commit_sha
     try:
-        sha_r = git(project_dir, "rev-parse", "HEAD", check=False)
-        merge_sha = (sha_r.stdout or "").strip()[:8]
+        if not merge_sha:
+            sha_r = git(project_dir, "rev-parse", "HEAD", check=False)
+            merge_sha = (sha_r.stdout or "").strip()[:8]
     except Exception:
         pass
     runtime_event(
