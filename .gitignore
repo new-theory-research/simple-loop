@@ -19,3 +19,6 @@ target/
 # Zensical build output
 site/
 .site/
+.loop/state/last-queen-error.json
+.loop/state/last-queen-success.json
+__pycache__/
