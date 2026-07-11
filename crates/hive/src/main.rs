@@ -887,27 +887,53 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
         }
     }
 
-    // ── Drafts ────────────────────────────────────────────────────────────────
-    // Only surface the section when there's something to show — Drafts should
-    // be background signal, not visual noise in the common case.
-    if !cells.drafts.is_empty() {
+    // ── Background buckets ──────────────────────────────────────────────────────
+    // Cards off the active floor, bucketed by their real Status frontmatter.
+    // Terminal work is dropped upstream (`discover_draft_briefs`), so these are
+    // background signal, not noise. Each section renders only when non-empty,
+    // newest-first (the vec is pre-sorted).
+    for (title, bucket) in [
+        ("Backlog", state::DraftBucket::Backlog),
+        ("Parked", state::DraftBucket::Parked),
+        ("Draft", state::DraftBucket::Draft),
+    ] {
+        let items: Vec<&state::DraftBrief> =
+            cells.drafts.iter().filter(|d| d.bucket == bucket).collect();
+        if items.is_empty() {
+            continue;
+        }
         lines.push(Line::from(""));
-        lines.push(section_header("Drafts", MUTED));
-        for db in &cells.drafts {
-            let (glyph, tail) = if db.has_index {
-                ("∘", "no symlink")
-            } else {
-                ("∅", "no index.md")
-            };
+        lines.push(section_header(title, MUTED));
+        for db in items {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", glyph), Style::default().fg(MUTED)),
+                Span::styled("  ∘ ", Style::default().fg(MUTED)),
                 Span::styled(
                     db.brief.clone(),
                     Style::default().fg(MUTED).add_modifier(Modifier::DIM),
                 ),
+            ]));
+        }
+    }
+
+    // ── Anomalies ───────────────────────────────────────────────────────────────
+    // Genuinely broken cards only: no index.md, no Status field, or an
+    // unrecognized Status value. Labelled with the real reason and rendered in
+    // amber so they read as "look at this", not background.
+    let anomalies: Vec<&state::DraftBrief> = cells
+        .drafts
+        .iter()
+        .filter(|d| d.bucket == state::DraftBucket::Anomaly)
+        .collect();
+    if !anomalies.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(section_header("Anomalies", AMBER));
+        for db in anomalies {
+            lines.push(Line::from(vec![
+                Span::styled("  ⚠ ", Style::default().fg(AMBER)),
+                Span::styled(db.brief.clone(), Style::default().fg(MUTED)),
                 Span::styled(
-                    format!("  ·  {}", tail),
-                    Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+                    format!("  ·  {}", db.reason),
+                    Style::default().fg(AMBER).add_modifier(Modifier::DIM),
                 ),
             ]));
         }
