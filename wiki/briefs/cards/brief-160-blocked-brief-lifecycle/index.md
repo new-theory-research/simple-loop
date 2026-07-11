@@ -57,5 +57,5 @@ card status. The five issues are facets of the same missing state machine.
 ## Outputs
 
 - `closeout.md` — the lifecycle design and per-issue confirmation. Close #15 #27
-  #39 #55 #58 with the merge SHA.
+  #39 #58 #59 with the merge SHA.
 - `review.md` — gate runbook.
