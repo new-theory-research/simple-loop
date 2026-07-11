@@ -10,15 +10,20 @@
 #             Edits to the repo propagate immediately to all projects.
 #             Recommended for the simple-loop maintainer; coworkers should use
 #             the default copy mode and `loop update` to refresh.
+#   --force   Install even when the source tree is dirty (uncommitted changes).
+#             PROVENANCE.json still records source_dirty:true. Use only when you
+#             know the installed code will match no commit.
 
 set -euo pipefail
 
 LINK_MODE=false
+FORCE=false
 for arg in "$@"; do
     case "$arg" in
         --link) LINK_MODE=true ;;
+        --force) FORCE=true ;;
         -h|--help)
-            sed -n '1,12p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '1,15p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *) echo "Unknown flag: $arg" >&2; exit 1 ;;
@@ -29,6 +34,37 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_DIR="${SIMPLE_LOOP_HOME:-$HOME/.local/share/simple-loop}"
 BIN_DIR="$HOME/.local/bin"
 CLAUDE_DIR="$HOME/.claude"
+
+# ── Refuse to install from a dirty source tree ──
+# A dirty tree means the deployed code matches no commit, so PROVENANCE's
+# source_commit is a lie and nobody can reproduce what's running. Uses the same
+# `git status --porcelain` detection that write_provenance.py records as
+# source_dirty. Not a git repo (tarball/download install) => skip with a note.
+if git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    DIRTY_FILES="$(git -C "$SCRIPT_DIR" status --porcelain)"
+    if [ -n "$DIRTY_FILES" ]; then
+        if [ "$FORCE" = true ]; then
+            echo ""
+            echo "  ############################################################"
+            echo "  # WARNING: --force installing from a DIRTY source tree.     #"
+            echo "  # The installed code will match NO commit. PROVENANCE.json  #"
+            echo "  # will record source_dirty:true. You are on your own.       #"
+            echo "  ############################################################"
+            echo ""
+            echo "$DIRTY_FILES" | sed 's/^/    /'
+            echo ""
+        else
+            echo "" >&2
+            echo "  Dirty source tree — uncommitted changes:" >&2
+            echo "$DIRTY_FILES" | sed 's/^/    /' >&2
+            echo "" >&2
+            echo "  refusing to install from a dirty tree — the installed code would match no commit; commit or stash first, or pass --force" >&2
+            exit 1
+        fi
+    fi
+else
+    echo "  Note: source is not a git repository — skipping dirty-tree check (provenance will record commit 'unknown')."
+fi
 
 echo ""
 echo "Installing Simple Loop v0.2..."
