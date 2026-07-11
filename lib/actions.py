@@ -1927,6 +1927,15 @@ def merge(paths):
             log_action(paths, "merge_autostash_pop", {"brief": brief, "branch": branch})
             print(f"merge autostash: restored dirty tree after merge")
 
+    # Capture the actual merge commit before the #64 strip commit advances
+    # HEAD, so merge_sha keeps meaning "the merge" in events/history.
+    _merge_commit_sha = ""
+    try:
+        _mc_r = git(project_dir, "rev-parse", "HEAD", check=False)
+        _merge_commit_sha = (_mc_r.stdout or "").strip()[:8]
+    except Exception:
+        pass
+
     # ── Strip progress.json from main's tree (issue #64) ────────────────────
     # Worker branches force-add .loop/state/progress.json (git add -f) so the
     # committed branch carries fresh progress for the git_show read path in
@@ -1988,10 +1997,11 @@ def merge(paths):
             print(f"cleanup: card status update failed for {brief}: {e} (non-fatal)", file=sys.stderr)
 
     # brief-108-d: append `merged` event so projector populates history[].
-    merge_sha = ""
+    merge_sha = _merge_commit_sha
     try:
-        sha_r = git(project_dir, "rev-parse", "HEAD", check=False)
-        merge_sha = (sha_r.stdout or "").strip()[:8]
+        if not merge_sha:
+            sha_r = git(project_dir, "rev-parse", "HEAD", check=False)
+            merge_sha = (sha_r.stdout or "").strip()[:8]
     except Exception:
         pass
     runtime_event(
