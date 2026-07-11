@@ -22,3 +22,5 @@ site/
 .loop/state/last-queen-error.json
 .loop/state/last-queen-success.json
 __pycache__/
+.loop/state/progress.json
+.loop/state/runtime-events.jsonl
