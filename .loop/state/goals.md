@@ -31,6 +31,7 @@ one card (proof in `brief-154-issue-intake-triage/closeout.md`).
 7. **brief-161 (cross-repo delivery — target-repo briefs strand their deliverable)** — #35 #36; build artifact resolution + PR hop for target-repo briefs. `wiki/briefs/cards/brief-161-cross-repo-delivery/index.md`.
 8. **brief-163 (input parsing/validation robustness)** — #21 #23; validate-at-parse on LLM/free-form field boundaries. `wiki/briefs/cards/brief-163-input-validation-robustness/index.md`.
 9. **brief-164 (roadmap/misc — field report + capability stubs)** — #1 #3 #4; holding pen with no shared bug mechanism, recommend fan-out at review. `wiki/briefs/cards/brief-164-roadmap-misc/index.md`.
+10. **brief-165 (the presence plane — `hum` shipper + `apiary` bus)** — design-driven (Mattie + director, 2026-07-11), serves **portal#51** and supersedes its git-transport mechanism. BRICK 1: a third transport for presence only (loss-tolerant, fire-and-forget) so a remote queen's workers render on the local dance floor. Schema `{box, lane, brief}` + `hum` sidecar + `apiary` v0 + hive `HIVE_APIARY_URL` input + vendored intent hooks. **Deploy is always-Mattie** — built + locally two-box-verified before any Railway touch. `wiki/briefs/cards/brief-165-apiary-hum-presence-plane/index.md`.
 
 ## Disposition — prior queue (2026-07-11)
 
