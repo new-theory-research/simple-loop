@@ -1667,8 +1667,11 @@ cmd_update() {
         sed 's/^/    /' "$pull_log"
     else
         sed 's/^/    /' "$pull_log"
-        echo "    (pull did not fast-forward — continuing with source as-is;"
-        echo "     resolve manually in $source_repo if you expected new commits)"
+        echo ""
+        echo "  ⚠  Pull did NOT fast-forward — installing from the source tree AS-IS."
+        echo "     Upstream commits you expected may be missing from this update."
+        echo "     Resolve manually in $source_repo, then re-run 'loop update'."
+        echo ""
     fi
     rm -f "$pull_log"
 
