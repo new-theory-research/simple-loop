@@ -551,6 +551,12 @@ commit_worktree_wip() {
     [ -d "$worktree_dir" ] || return 0
     if [ -n "$(git -C "$worktree_dir" status --porcelain 2>/dev/null)" ]; then
         git -C "$worktree_dir" add -A 2>/dev/null
+        # Issue #64: progress.json is gitignored (Wave-1b, to kill main-branch
+        # contamination). `add -A` respects gitignore, so on a worker branch it
+        # silently drops the file assess.py reads via git_show. Force-add it —
+        # worker-branch only (this function only runs on brief worktrees).
+        [ -f "$worktree_dir/.loop/state/progress.json" ] && \
+            git -C "$worktree_dir" add -f .loop/state/progress.json 2>/dev/null
         if git -C "$worktree_dir" commit -m "[loop] $brief_id WIP auto-commit $label" -q 2>/dev/null; then
             daemon_log "WORKER: WIP auto-commit for $brief_id ($label) — worktree was dirty"
         fi
@@ -620,7 +626,9 @@ run_worker_iteration() {
     # logic below overrides progress.json if it belongs to a different brief.
     if [ -f "$WORKTREE_DIR/.loop/state/progress.json" ] && \
        ! git -C "$WORKTREE_DIR" diff --quiet HEAD -- .loop/state/progress.json 2>/dev/null; then
-        git -C "$WORKTREE_DIR" add .loop/state/progress.json 2>/dev/null
+        # Issue #64: force-add — progress.json is gitignored; plain add drops it
+        # on a worker branch. This is a brief worktree, never main.
+        git -C "$WORKTREE_DIR" add -f .loop/state/progress.json 2>/dev/null
         if git -C "$WORKTREE_DIR" commit -m "loop: snapshot progress.json before cycle-start rebase" -q 2>/dev/null; then
             wlog "WORKER: snapshotted dirty progress.json before rebase for $brief_id"
         fi
@@ -652,7 +660,8 @@ run_worker_iteration() {
         CONFLICT_FILES=$(git -C "$WORKTREE_DIR" diff --name-only --diff-filter=U 2>/dev/null)
         if [ "$CONFLICT_FILES" = ".loop/state/progress.json" ]; then
             git -C "$WORKTREE_DIR" checkout --ours -- .loop/state/progress.json 2>/dev/null
-            git -C "$WORKTREE_DIR" add .loop/state/progress.json 2>/dev/null
+            # Issue #64: force-add (gitignored); worker-branch rebase resolution.
+            git -C "$WORKTREE_DIR" add -f .loop/state/progress.json 2>/dev/null
             # Note: `-q` is not accepted alongside `--continue` (git errors
             # with usage text) — redirect instead of relying on -q here.
             if git -C "$WORKTREE_DIR" rebase --continue >/dev/null 2>&1; then
@@ -708,7 +717,8 @@ for b in rc.get('active', []):
                 wlog "WORKER: reset progress.json for $brief_id (was: ${RESET_RESULT#reset:} — rebase inheritance)"
                 ;;
         esac
-        git -C "$WORKTREE_DIR" add ".loop/state/progress.json"
+        # Issue #64: force-add (gitignored); worker-branch reset commit.
+        git -C "$WORKTREE_DIR" add -f ".loop/state/progress.json"
         git -C "$WORKTREE_DIR" commit -m "loop: reset progress.json for $brief_id (was: ${existing_brief:-missing})" -q 2>/dev/null
     fi
 
@@ -726,7 +736,8 @@ p['learnings'] = p.get('learnings', []) + ['Daemon: max iterations ($MAX_ITERATI
 with open('$PROGRESS_FILE', 'w') as f:
     json.dump(p, f, indent=2)
 "
-        git -C "$WORKTREE_DIR" add ".loop/state/progress.json"
+        # Issue #64: force-add (gitignored); worker-branch blocked-status commit.
+        git -C "$WORKTREE_DIR" add -f ".loop/state/progress.json"
         git -C "$WORKTREE_DIR" commit -m "Max iterations reached — marking blocked" -q 2>/dev/null
         git -C "$WORKTREE_DIR" push -u --force-with-lease "$GIT_REMOTE" "$branch" 2>&1 || true
         return 0
