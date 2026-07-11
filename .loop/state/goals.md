@@ -29,13 +29,14 @@ one card (proof in `brief-154-issue-intake-triage/closeout.md`).
 5. **brief-159 (runtime observability — status/sweep signals that cry wolf)** — #31 #38 #53; anchor observables to the running daemon, not local-clone/argv/dispatch-age proxies. `wiki/briefs/cards/brief-159-runtime-observability/index.md`.
 6. **brief-160 (the blocked/parked brief lifecycle)** — #15 #27 #39 #58 #59; give "parked" a first-class state, surface, and unblock path. `wiki/briefs/cards/brief-160-blocked-brief-lifecycle/index.md`.
 7. **brief-161 (cross-repo delivery — target-repo briefs strand their deliverable)** — #35 #36; build artifact resolution + PR hop for target-repo briefs. `wiki/briefs/cards/brief-161-cross-repo-delivery/index.md`.
-8. **brief-162 (harness-update propagation — `loop update` that propagates)** — #20 #57; make `loop update` the one invokable propagation edge. `wiki/briefs/cards/brief-162-harness-update-propagation/index.md`.
 9. **brief-163 (input parsing/validation robustness)** — #21 #23; validate-at-parse on LLM/free-form field boundaries. `wiki/briefs/cards/brief-163-input-validation-robustness/index.md`.
 10. **brief-164 (roadmap/misc — field report + capability stubs)** — #1 #3 #4; holding pen with no shared bug mechanism, recommend fan-out at review. `wiki/briefs/cards/brief-164-roadmap-misc/index.md`.
 
 ## Disposition — prior queue (2026-07-11)
 
 Resolved entries; kept for history:
+
+- **brief-162 (harness-update propagation)** — **merged** (merge `6748c17`, 2026-07-11; card `Status: merged`; closes #20 #57). `loop update` is the propagation edge; first dogfood run propagated its own merge and surfaced #60 (installed-templates ghost files). Canonical at `wiki/briefs/cards/brief-162-harness-update-propagation/index.md`.
 
 - **brief-154 (issue-intake triage skill)** — **merged** (merge `e630e9b`, 2026-07-11; card `Status: merged`). Director-iteration cycle: opus coder → opus reviewer (APPROVE, 8/8 criteria, live coverage diff exit 0) → merge. Its first run emitted the ten Draft cards above. Comment-plan posting still gated on Mattie. Canonical at `wiki/briefs/cards/brief-154-issue-intake-triage/index.md`.
 
