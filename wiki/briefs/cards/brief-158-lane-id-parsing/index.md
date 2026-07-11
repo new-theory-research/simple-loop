@@ -46,3 +46,12 @@ around the lane-selection code.)
 - `closeout.md` — the lane/ID reconciliation and per-issue confirmation. Close #30
   #50 with the merge SHA.
 - `review.md` — gate runbook.
+
+## Review handoff (2026-07-11, from the #50 merge review)
+
+The #50 fix (merged) widened the two regexes the issue named — `assess.py` and
+`queue.py`. The reviewer found a third, independent lane regex the issue did not
+name: `lib/startup_repair.py:22` (`(?:brief|audit|capture)-…`) still recognizes
+only three lanes, so startup repair is blind to ft-*/rq-*/fleet-*/serve-*/harness-*
+cards. `lib/lint.py:219-220`'s warning text also still reads "doesn't match
+brief-NNN". Reconcile both here so the lane-ID model has one definition, not three.
