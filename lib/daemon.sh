@@ -50,6 +50,7 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 LOOP_LANE="${_CLI_LANE:-${LOOP_LANE:-}}"
+LOOP_LANE="${LOOP_LANE// /}"   # strip spaces: unquoted $_LANE_OPT must stay one word (bash 3.2, no arrays) — a spaced list ("a, b") otherwise leaks the tail as a silently-ignored positional and lane-splits daemon vs projection
 export LOOP_LANE
 # Reusable CLI fragment for lane-aware queue.py invocations. Empty (expands to
 # nothing) when no lane is set; word-splits into `--lane <spec>` otherwise.
