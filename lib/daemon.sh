@@ -30,12 +30,14 @@ LOOP_DIR="$PROJECT_DIR/.loop"
 [ -f "$LOOP_DIR/config.sh" ] && source "$LOOP_DIR/config.sh"
 [ -f "$LOOP_DIR/config.local.sh" ] && source "$LOOP_DIR/config.local.sh"
 
-# brief-151: optional program-lane partition. `--lane <name>` (or the LOOP_LANE
-# env / config var) restricts this daemon to dispatching briefs whose card
-# Program: matches <name>. Unset/empty → no lane filter → single-daemon
-# behavior byte-for-byte unchanged. Scan the args after project_dir so the
-# optional heartbeat positional still works alongside --lane in any order; CLI
-# --lane wins over the env/config LOOP_LANE.
+# brief-151 / multi-lane-daemon: optional program-lane partition. `--lane <spec>`
+# (or the LOOP_LANE env / config var) restricts this daemon to dispatching briefs
+# whose card Program: is in <spec>. <spec> is a comma-separated lane list —
+# `--lane finetune,capture,fleets` (portal laptop owns several lanes) or a single
+# `--lane remote-queens`. Unset/empty → no lane filter → single-daemon behavior
+# byte-for-byte unchanged. Scan the args after project_dir so the optional
+# heartbeat positional still works alongside --lane in any order; CLI --lane wins
+# over the env/config LOOP_LANE.
 shift || true
 _CLI_LANE=""
 _HEARTBEAT_ARG=""
@@ -48,11 +50,14 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 LOOP_LANE="${_CLI_LANE:-${LOOP_LANE:-}}"
+LOOP_LANE="${LOOP_LANE// /}"   # strip spaces: unquoted $_LANE_OPT must stay one word (bash 3.2, no arrays) — a spaced list ("a, b") otherwise leaks the tail as a silently-ignored positional and lane-splits daemon vs projection
 export LOOP_LANE
 # Reusable CLI fragment for lane-aware queue.py invocations. Empty (expands to
-# nothing) when no lane is set; word-splits into `--lane <name>` otherwise.
-# Lane names are program slugs with no spaces, so unquoted expansion is safe and
-# sidesteps the bash-3.2 empty-array `set -u` trap.
+# nothing) when no lane is set; word-splits into `--lane <spec>` otherwise.
+# Lane specs are program slugs joined by commas (`finetune,capture,fleets`) with
+# no spaces, so unquoted expansion splits into exactly two words — commas are not
+# in IFS, so the whole comma-list rides through as one arg. This keeps the fragment
+# comma-safe and sidesteps the bash-3.2 empty-array `set -u` trap.
 _LANE_OPT=""
 [ -n "$LOOP_LANE" ] && _LANE_OPT="--lane $LOOP_LANE"
 

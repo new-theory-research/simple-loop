@@ -818,6 +818,40 @@ class TestLaneIsolation(unittest.TestCase):
                          "on-disk running.json must be lane-scoped")
         self.assertIn("remote-queen-001", active_ids)
 
+    def test_multi_lane_projection_spans_named_lanes(self):
+        """multi-lane-daemon: a comma-separated lane list projects briefs from
+        EVERY named lane and still excludes an out-of-set lane. Without the set
+        change, `lane="finetune,capture"` exact-matched nothing and the whole
+        projection fell dark (active[] empty)."""
+        state_dir = os.path.join(self.tmp, ".loop", "state")
+        os.makedirs(state_dir, exist_ok=True)
+        self._make_card_with_program("ft-001", "active", "finetune")
+        self._make_card_with_program("cap-001", "active", "capture")
+        self._make_card_with_program("fleet-005a", "active", "fleets")
+
+        events = [
+            {"ts": "T1", "event": "dispatched", "brief": "ft-001",
+             "branch": "ft-001",
+             "brief_file": "wiki/briefs/cards/ft-001/index.md"},
+            {"ts": "T2", "event": "dispatched", "brief": "cap-001",
+             "branch": "cap-001",
+             "brief_file": "wiki/briefs/cards/cap-001/index.md"},
+            {"ts": "T3", "event": "dispatched", "brief": "fleet-005a",
+             "branch": "fleet-005a",
+             "brief_file": "wiki/briefs/cards/fleet-005a/index.md"},
+        ]
+
+        result = project_running_json(self.tmp, events=events,
+                                      lane="finetune,capture")
+        active_ids = sorted(e["brief"] for e in result["active"])
+        self.assertEqual(active_ids, ["cap-001", "ft-001"],
+                         "both named lanes present; fleets excluded")
+        # Lane-list order is irrelevant.
+        reordered = project_running_json(self.tmp, events=events,
+                                         lane="capture,finetune")
+        self.assertEqual(
+            sorted(e["brief"] for e in reordered["active"]), active_ids)
+
     def test_gitignore_excludes_running_json(self):
         """Acceptance criterion 2: .gitignore must contain .loop/state/running.json
         so the file is never committed to main."""
