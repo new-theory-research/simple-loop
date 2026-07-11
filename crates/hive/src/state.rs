@@ -890,12 +890,28 @@ pub struct QueuedBrief {
     pub readiness: QueuedReadiness,
 }
 
+/// Which muted background section a non-floor card renders in, keyed off its
+/// actual `Status:` frontmatter. Terminal cards are dropped before a
+/// `DraftBrief` is ever built, so this enum never carries a "done" state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftBucket {
+    /// `Status: backlog` — real, un-started work.
+    Backlog,
+    /// `Status: parked` — deliberately on hold.
+    Parked,
+    /// `Status: draft` — authored but awaiting the human flip.
+    Draft,
+    /// Genuinely broken: no `index.md`, or an unparseable/unrecognized
+    /// `Status` value. Never used to hide a card — fail-visible.
+    Anomaly,
+}
+
 pub struct DraftBrief {
     pub brief: String,
-    /// True if the card has an `index.md`. False means only scratch files
-    /// (e.g. `feedback.md`) exist — the number is reserved but no brief has
-    /// been authored yet.
-    pub has_index: bool,
+    pub bucket: DraftBucket,
+    /// For `Anomaly` only: the reason the card is broken, e.g. `"no index.md"`
+    /// or `"unrecognized status: foo"`. Empty for the other buckets.
+    pub reason: String,
 }
 
 pub struct RecentlyFinishedBrief {
@@ -1730,10 +1746,31 @@ pub fn discover_recently_finished_from_cards(cards_dir: &Path) -> Vec<RecentlyFi
     out
 }
 
+/// Terminal statuses: work that has landed or been closed out. These cards are
+/// not floor signal, so `discover_draft_briefs` drops them entirely (recent
+/// merges surface separately via `discover_recently_finished_from_cards`).
+/// Kept deliberately narrow — only statuses that are *provably* terminal, so
+/// an unrecognized value is never silently hidden.
+fn is_terminal_status(status: &str) -> bool {
+    matches!(
+        status,
+        "merged" | "complete" | "completed" | "done" | "ended" | "superseded"
+    )
+}
+
 /// Scan `wiki/briefs/cards/*/` for card dirs not already accounted for in
-/// active/pending/queued/history. Accepts any work-unit prefix (`brief-`,
-/// `audit-`, `capture-`, etc). These are drafts: the identifier is claimed
-/// but the work isn't dispatch-ready (missing `index.md` or `Status: queued`).
+/// active/pending/queued/history, and bucket each by its real `Status:`
+/// frontmatter. Accepts any work-unit prefix (`brief-`, `audit-`, etc).
+///
+/// Buckets:
+///   - `Backlog` (`Status: backlog`), `Parked` (`Status: parked`),
+///     `Draft` (`Status: draft`) — genuine non-floor work.
+///   - `Anomaly` — no `index.md`, an index with no `Status:` field, or an
+///     unrecognized `Status` value (shown verbatim).
+///
+/// Terminal cards (`is_terminal_status`) are dropped — terminal work is not
+/// floor signal. Unknown-but-parseable statuses land in `Anomaly` with the
+/// value shown, never silently hidden (fail-visible, not fail-dark).
 pub fn discover_draft_briefs(cards_dir: &Path, exclude: &HashSet<String>) -> Vec<DraftBrief> {
     let Ok(entries) = fs::read_dir(cards_dir) else {
         return vec![];
@@ -1754,15 +1791,37 @@ pub fn discover_draft_briefs(cards_dir: &Path, exclude: &HashSet<String>) -> Vec
         if exclude.contains(&brief_id) {
             continue;
         }
-        let has_index = path.join("index.md").exists();
+        let index_path = path.join("index.md");
+        if !index_path.exists() {
+            out.push(DraftBrief {
+                brief: brief_id,
+                bucket: DraftBucket::Anomaly,
+                reason: "no index.md".to_string(),
+            });
+            continue;
+        }
+        let (bucket, reason) = match parse_brief_status(&index_path) {
+            Some(status) if is_terminal_status(&status) => continue,
+            Some(status) => match status.as_str() {
+                "backlog" => (DraftBucket::Backlog, String::new()),
+                "parked" => (DraftBucket::Parked, String::new()),
+                "draft" => (DraftBucket::Draft, String::new()),
+                other => (
+                    DraftBucket::Anomaly,
+                    format!("unrecognized status: {other}"),
+                ),
+            },
+            None => (DraftBucket::Anomaly, "no Status field".to_string()),
+        };
         out.push(DraftBrief {
             brief: brief_id,
-            has_index,
+            bucket,
+            reason,
         });
     }
-    // Reverse numeric order so the highest brief id appears first — recent
-    // drafts are the most salient and imminent, low brief ids are usually
-    // long-abandoned holdovers.
+    // Reverse numeric order so the highest brief id appears first within each
+    // bucket — recent cards are the most salient, low ids are usually
+    // long-abandoned holdovers. Rendering groups by bucket and keeps this order.
     out.sort_by(|a, b| brief_sort_key(&b.brief).cmp(&brief_sort_key(&a.brief)));
     out
 }
@@ -4652,8 +4711,20 @@ some non-bracket junk line
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// Write a card dir `<cards>/<id>/index.md` with a `Status: <status>`
+    /// frontmatter block.
+    fn write_card_with_status(cards: &std::path::Path, id: &str, status: &str) {
+        let dir = cards.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("index.md"),
+            format!("---\nStatus: {status}\n---\n\nbrief body\n"),
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn discover_draft_briefs_surfaces_cards_not_queued() {
+    fn discover_draft_briefs_buckets_by_status() {
         let cards = std::env::temp_dir().join(format!(
             "hive_cards_test_{}",
             std::time::SystemTime::now()
@@ -4663,32 +4734,110 @@ some non-bracket junk line
         ));
         std::fs::create_dir_all(&cards).unwrap();
 
-        // brief-005 has full index.md (simulates a complete, queued card)
-        let b5 = cards.join("brief-005-beehive");
-        std::fs::create_dir_all(&b5).unwrap();
-        std::fs::write(b5.join("index.md"), "brief body").unwrap();
+        // Real, status-keyed buckets.
+        write_card_with_status(&cards, "brief-030-backlog-work", "backlog");
+        write_card_with_status(&cards, "brief-031-on-hold", "parked");
+        write_card_with_status(&cards, "brief-032-awaiting-flip", "draft");
 
-        // brief-010 has only feedback.md (scratch, no brief yet)
-        let b10 = cards.join("brief-010-api-v0-1");
-        std::fs::create_dir_all(&b10).unwrap();
-        std::fs::write(b10.join("feedback.md"), "feedback notes").unwrap();
+        // Terminal cards NOT in recently_finished → dropped entirely.
+        write_card_with_status(&cards, "brief-020-shipped", "merged");
+        write_card_with_status(&cards, "brief-021-finished", "complete");
 
-        // brief-012 has index.md but (in caller's view) no symlink (simulates
-        // a drafted-but-not-queued brief).
-        let b12 = cards.join("brief-012-proposed");
-        std::fs::create_dir_all(&b12).unwrap();
-        std::fs::write(b12.join("index.md"), "brief body").unwrap();
+        // Anomalies: no index.md, and an unrecognized status value.
+        let noidx = cards.join("brief-040-scratch");
+        std::fs::create_dir_all(&noidx).unwrap();
+        std::fs::write(noidx.join("feedback.md"), "notes").unwrap();
+        write_card_with_status(&cards, "brief-041-garbage", "garbage");
 
+        // Excluded card (already active/queued/etc) never surfaces.
+        write_card_with_status(&cards, "brief-005-excluded", "draft");
         let mut exclude = HashSet::new();
-        exclude.insert("brief-005-beehive".to_string()); // already queued/merged
+        exclude.insert("brief-005-excluded".to_string());
 
         let drafts = discover_draft_briefs(&cards, &exclude);
+
+        let bucket_of = |id: &str| drafts.iter().find(|d| d.brief == id).map(|d| d.bucket);
+
+        // status → bucket
+        assert_eq!(
+            bucket_of("brief-030-backlog-work"),
+            Some(DraftBucket::Backlog)
+        );
+        assert_eq!(bucket_of("brief-031-on-hold"), Some(DraftBucket::Parked));
+        assert_eq!(
+            bucket_of("brief-032-awaiting-flip"),
+            Some(DraftBucket::Draft)
+        );
+
+        // Terminal cards are hidden.
+        assert_eq!(
+            bucket_of("brief-020-shipped"),
+            None,
+            "merged card must be hidden"
+        );
+        assert_eq!(
+            bucket_of("brief-021-finished"),
+            None,
+            "complete card must be hidden"
+        );
+
+        // Excluded card is hidden.
+        assert_eq!(bucket_of("brief-005-excluded"), None);
+
+        // Anomalies, labelled with the real reason.
+        let noindex = drafts
+            .iter()
+            .find(|d| d.brief == "brief-040-scratch")
+            .unwrap();
+        assert_eq!(noindex.bucket, DraftBucket::Anomaly);
+        assert_eq!(noindex.reason, "no index.md");
+
+        let garbage = drafts
+            .iter()
+            .find(|d| d.brief == "brief-041-garbage")
+            .unwrap();
+        assert_eq!(garbage.bucket, DraftBucket::Anomaly);
+        assert_eq!(
+            garbage.reason, "unrecognized status: garbage",
+            "unknown status shown verbatim — fail-visible"
+        );
+
+        // Newest-first order preserved across buckets.
         let ids: Vec<_> = drafts.iter().map(|d| d.brief.as_str()).collect();
-        // Reverse numeric order — recent drafts first.
-        assert_eq!(ids, vec!["brief-012-proposed", "brief-010-api-v0-1"]);
-        // has_index reflects the structural truth
-        assert!(drafts[0].has_index, "brief-012 has index.md");
-        assert!(!drafts[1].has_index, "brief-010 has no index.md");
+        assert_eq!(
+            ids,
+            vec![
+                "brief-041-garbage",
+                "brief-040-scratch",
+                "brief-032-awaiting-flip",
+                "brief-031-on-hold",
+                "brief-030-backlog-work",
+            ]
+        );
+
+        std::fs::remove_dir_all(&cards).ok();
+    }
+
+    #[test]
+    fn discover_draft_briefs_index_without_status_is_anomaly() {
+        let cards = std::env::temp_dir().join(format!(
+            "hive_cards_nostatus_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&cards).unwrap();
+
+        // index.md exists but carries no Status field — unparseable, so anomaly.
+        let b = cards.join("brief-050-no-status");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(b.join("index.md"), "just a body, no frontmatter").unwrap();
+
+        let drafts = discover_draft_briefs(&cards, &HashSet::new());
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].bucket, DraftBucket::Anomaly);
+        assert_eq!(drafts[0].reason, "no Status field");
 
         std::fs::remove_dir_all(&cards).ok();
     }
