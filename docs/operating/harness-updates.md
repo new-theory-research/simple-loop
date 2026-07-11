@@ -4,6 +4,18 @@ The simple-loop harness (daemon + queen + worker + validator) is live infrastruc
 
 **Status: living document.** Add entries from every harness-update session. This reflects what we've tripped on, not what we've imagined.
 
+## The one command: `loop update`
+
+From inside any loop-enabled project, `loop update` is the propagation edge (issues #20, #57). It:
+
+1. Locates the harness source from `PROVENANCE.json`'s `source_repo` (fails loud with guidance if it's missing — re-run `./install.sh` from your clone).
+2. `git pull --ff-only`s that source, then runs `install.sh` (which refuses a dirty tree unless `--force`). Reports the installed old→new SHA.
+3. Prints a since-baseline changelog (`git log --oneline base..HEAD` over `templates/ core/ lib/`) so you can see what migration work applies.
+4. Diff-aware refresh of this project's `.loop/prompts/`: identical → left alone; template-newer with an unmodified project copy → updated; a copy you've customized (differs from both the old and new template) → **preserved**, with a three-way-sync instruction naming the file. A missing daemon-required prompt is recreated, never silently skipped.
+5. If a daemon is running for this project, prints `loop stop && loop start` and why — it does **not** auto-restart.
+
+Safe to run while the daemon is live: prompts and `lib/*.py` are re-read per tick; only `lib/daemon.sh` needs the restart, which `loop update` surfaces as an instruction. The manual five-command incantation below is what `loop update` now automates — reach for it only when you need to diverge from the happy path.
+
 ## The decision tree
 
 ### 1. Where does the code live?

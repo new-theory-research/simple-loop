@@ -1622,8 +1622,114 @@ cmd_update() {
     require_loop_dir
 
     echo ""
-    echo "Updating simple-loop..."
+    echo "Updating simple-loop (harness propagation)..."
+    echo ""
 
+    local install_dir="$SIMPLE_LOOP_HOME"
+    local provenance_file="$install_dir/PROVENANCE.json"
+
+    # ── 1. Locate the harness source from PROVENANCE.json (fail loud) ──
+    # PROVENANCE.json is the install artifact; source_repo is the clone that
+    # `git pull` + install.sh run against. Without it there is no propagation
+    # edge — say so with guidance instead of silently doing a partial sync.
+    if [ ! -f "$provenance_file" ]; then
+        die "No PROVENANCE.json at $install_dir — can't locate the harness source.
+  Re-run ./install.sh from your simple-loop clone, then 'loop update' again."
+    fi
+
+    local source_repo old_installed_sha
+    source_repo=$(python3 -c "import json,sys;print(json.load(open('$provenance_file')).get('source_repo',''))" 2>/dev/null)
+    old_installed_sha=$(python3 -c "import json,sys;print(json.load(open('$provenance_file')).get('source_commit',''))" 2>/dev/null)
+
+    if [ -z "$source_repo" ] || [ "$source_repo" = "unknown" ] || [ ! -d "$source_repo" ]; then
+        die "PROVENANCE.json has no usable source_repo (got: '${source_repo:-<empty>}').
+  The harness source clone is required to propagate updates.
+  Re-run ./install.sh from your simple-loop clone to record it, then 'loop update' again."
+    fi
+
+    # The project's baseline harness commit — what .loop/prompts/ were copied
+    # from. Captured BEFORE we re-seed config below, so the three-way refresh
+    # and changelog compare against where this project actually last synced.
+    local project_base_sha
+    project_base_sha=$(python3 -c "import json,sys;print(json.load(open('$LOOP_DIR/config.json')).get('simple_loop',{}).get('commit',''))" 2>/dev/null)
+    [ -z "$project_base_sha" ] && project_base_sha="$old_installed_sha"
+
+    echo "  Source:           $source_repo"
+    echo "  Installed commit: ${old_installed_sha:-unknown}"
+    echo "  Project baseline: ${project_base_sha:-unknown}"
+    echo ""
+
+    # ── 2. Pull the source repo ──
+    echo "  Pulling harness source..."
+    local pull_log
+    pull_log=$(mktemp)
+    if git -C "$source_repo" pull --ff-only >"$pull_log" 2>&1; then
+        sed 's/^/    /' "$pull_log"
+    else
+        sed 's/^/    /' "$pull_log"
+        echo ""
+        echo "  ⚠  Pull did NOT fast-forward — installing from the source tree AS-IS."
+        echo "     Upstream commits you expected may be missing from this update."
+        echo "     Resolve manually in $source_repo, then re-run 'loop update'."
+        echo ""
+    fi
+    rm -f "$pull_log"
+
+    # ── 3. Run install.sh (inherits its dirty-tree refusal + PROVENANCE write) ──
+    echo ""
+    echo "  Running install.sh..."
+    local install_log
+    install_log=$(mktemp)
+    if ( cd "$source_repo" && bash install.sh ) >"$install_log" 2>&1; then
+        sed 's/^/    /' "$install_log"
+        rm -f "$install_log"
+    else
+        sed 's/^/    /' "$install_log"
+        rm -f "$install_log"
+        die "install.sh failed — nothing propagated.
+  If the source tree is dirty, commit or stash it (or re-run install.sh --force
+  from $source_repo), then 'loop update' again."
+    fi
+
+    local new_installed_sha
+    new_installed_sha=$(python3 -c "import json,sys;print(json.load(open('$provenance_file')).get('source_commit',''))" 2>/dev/null)
+    echo ""
+    echo "  Installed: ${old_installed_sha:-unknown} → ${new_installed_sha:-unknown}"
+
+    # ── 4. Re-seed the project's recorded harness commit to the new install ──
+    _seed_simple_loop_config "$LOOP_DIR/config.json"
+
+    # ── 5. Since-last-update changelog (templates/ core/ lib/ only) ──
+    echo ""
+    echo "  Changes since your baseline (${project_base_sha:-unknown} → ${new_installed_sha:-HEAD}), in templates/ core/ lib/:"
+    if [ -n "$project_base_sha" ] && [ "$project_base_sha" != "unknown" ] && \
+       git -C "$source_repo" rev-parse -q --verify "${project_base_sha}^{commit}" >/dev/null 2>&1; then
+        local changelog
+        changelog=$(git -C "$source_repo" log --oneline "${project_base_sha}..HEAD" -- templates/ core/ lib/ 2>/dev/null)
+        if [ -n "$changelog" ]; then
+            echo "$changelog" | sed 's/^/    /'
+        else
+            echo "    (none — already current)"
+        fi
+    else
+        echo "    (baseline commit unknown or not in source history — skipping changelog)"
+    fi
+
+    # ── 6. Diff-aware refresh of project .loop/prompts/ against templates ──
+    echo ""
+    echo "  Refreshing project prompts (.loop/prompts/):"
+    local templates_prompts="$TEMPLATES_DIR/prompts"
+    [ -d "$templates_prompts" ] || templates_prompts="$source_repo/templates/prompts"
+    local update_prompts_py="$LIB_DIR/update_prompts.py"
+    [ -f "$update_prompts_py" ] || update_prompts_py="$source_repo/lib/update_prompts.py"
+    python3 "$update_prompts_py" \
+        --templates-dir "$templates_prompts" \
+        --prompts-dir "$LOOP_DIR/prompts" \
+        --source-repo "$source_repo" \
+        --base-sha "${project_base_sha:-}"
+
+    # ── 7. Re-sync installed skills + modules (existing behaviors, unchanged) ──
+    echo ""
     local core_src
     core_src=$(find_core_dir 2>/dev/null) || die "Core directory not found. Is simple-loop installed?"
 
@@ -1696,9 +1802,21 @@ with open('$claude_md', 'w') as f:
         done <<< "$modules"
     fi
 
-    # Re-seed simple_loop provenance in case install was updated
-    if [ -f "$LOOP_DIR/config.json" ]; then
-        _seed_simple_loop_config "$LOOP_DIR/config.json"
+    # ── 8. Daemon restart notice (do NOT auto-restart — operator action) ──
+    # `loop update` is safe to run live: prompts hot-reload on the next tick,
+    # and the swapped lib/ files are re-read per tick. But lib/daemon.sh itself
+    # is only read at daemon startup — a running daemon keeps the OLD daemon.sh
+    # until restarted. Print the command; never pull it out from under itself.
+    if pid_alive; then
+        echo ""
+        echo "  ⚠  A daemon is running for THIS project (PID $(cat "$PID_FILE"))."
+        echo "     install.sh replaced lib/ (daemon.sh, actions.py, …). Prompts and"
+        echo "     lib/*.py hot-reload per tick, but lib/daemon.sh is read only at"
+        echo "     startup. Restart to guarantee the daemon runs the new harness:"
+        echo ""
+        echo "         loop stop && loop start"
+        echo ""
+        echo "     (Not auto-restarting — that's an operator action.)"
     fi
 
     echo ""
@@ -2247,7 +2365,8 @@ Project setup:
   init                     Set up .loop/ in current directory (interactive)
   add <module>             Install a module (research, build)
   remove <module>          Remove a module
-  update                   Update core + module skills and instructions
+  update                   Propagate harness updates: pull source, reinstall,
+                           refresh project prompts + skills, print restart notice
   modules                  List installed and available modules
 
 Work:
