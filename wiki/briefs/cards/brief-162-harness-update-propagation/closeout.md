@@ -1,6 +1,6 @@
 # Closeout — brief-162: harness-update propagation
 
-Merge SHA: (filled at merge)
+Merge SHA: 6748c17
 
 ## TL;DR
 

@@ -1,7 +1,7 @@
 ---
 ID: brief-162-harness-update-propagation
 Branch: brief-162-harness-update-propagation
-Status: queued
+Status: merged
 Model: sonnet
 Auto-merge: false
 Validator: core/agents/reviewer.md
