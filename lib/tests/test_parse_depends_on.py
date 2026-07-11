@@ -52,5 +52,68 @@ class TestParseDependsOnValue(unittest.TestCase):
         )
 
 
+class TestLanePrefixedIds(unittest.TestCase):
+    """Issue #50: lane-prefixed card ids (ft-*, capture-*, rq-*, …) were silently
+    dropped because the shape assumed a literal `brief-` prefix."""
+
+    def test_issue50_repro_both_tokens_extracted(self):
+        # The exact reproduction from the issue body — before the fix this
+        # returned [] (both tokens dropped to stderr, silently). The `(merged)`
+        # suffix is handled the same way `brief-* (merged)` is: parenthetical
+        # stripped before matching.
+        line = ("capture-004-per-key-identity, "
+                "ft-004-serve-finetuned-checkpoint (merged)")
+        self.assertEqual(
+            parse_depends_on_value(line),
+            ["capture-004-per-key-identity", "ft-004-serve-finetuned-checkpoint"],
+        )
+
+    def test_lane_prefixes_retained(self):
+        for tok in ("ft-006-newt-finetune-verb", "capture-004-per-key-identity",
+                    "rq-001-first-remote-run", "fleet-012-x", "serve-003-y",
+                    "harness-007-z"):
+            self.assertEqual(parse_depends_on_value(tok), [tok])
+
+    def test_lane_id_letter_suffix_retained(self):
+        self.assertEqual(parse_depends_on_value("capture-004a"), ["capture-004a"])
+
+    def test_lane_id_merged_suffix_stripped(self):
+        # `(merged)` annotation handled identically to the brief-* path.
+        self.assertEqual(
+            parse_depends_on_value("capture-002-nt-cloud-sink (merged)"),
+            ["capture-002-nt-cloud-sink"],
+        )
+
+    def test_lane_prefixed_multi_letter_suffix_still_dropped(self):
+        # Single-letter suffix is the convention; a double suffix is not an id.
+        self.assertEqual(parse_depends_on_value("capture-004ab-foo"), [])
+
+
+class TestBriefIdGolden(unittest.TestCase):
+    """Golden: the pre-#50 brief-* behavior is byte-for-byte unchanged."""
+
+    CASES = [
+        ("brief-010-foo", ["brief-010-foo"]),
+        ("brief-010-foo, brief-011-bar", ["brief-010-foo", "brief-011-bar"]),
+        ("brief-010-foo,brief-011-bar", ["brief-010-foo", "brief-011-bar"]),
+        ("brief-010-foo,", ["brief-010-foo"]),
+        ("brief-108a", ["brief-108a"]),
+        ("brief-253a-nt0-rename-producer", ["brief-253a-nt0-rename-producer"]),
+        ("brief-241-cont-b", ["brief-241-cont-b"]),
+        ("brief-078 (hard)", ["brief-078"]),
+        ("brief-253ab-foo", []),          # double suffix still dropped
+        ("none", []),                     # nonsense still dropped
+        ("_(intentionally empty)_", []),  # brief-082 wedge still dropped
+        ("", []),
+    ]
+
+    def test_brief_star_behavior_unchanged(self):
+        for raw, expected in self.CASES:
+            self.assertEqual(
+                parse_depends_on_value(raw), expected,
+                msg=f"golden mismatch for {raw!r}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
