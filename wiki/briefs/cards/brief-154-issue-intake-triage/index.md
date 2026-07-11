@@ -1,7 +1,7 @@
 ---
 ID: brief-154-issue-intake-triage
 Branch: brief-154-issue-intake-triage
-Status: queued
+Status: merged
 Model: opus
 Auto-merge: false
 Validator: core/agents/reviewer.md
