@@ -163,6 +163,15 @@ CONSECUTIVE_QUEEN_FAILURES=0
 WP_PIDS=()
 WP_BRIEFS=()
 
+# Watchdog PID registry (issue #77). Every spawn_watchdog appends its own
+# pid + start-time here so the shutdown trap (_reap_watchdogs / cleanup) can
+# kill orphan-prone watchdog subshells by identity — worker watchdogs nest
+# inside backgrounded worker-pool subshells (grandchildren of the daemon) and
+# `pkill -P $$` never reaches them. Truncated at startup: it is per-daemon-
+# lifetime, and a dead predecessor's watchdogs are its own orphans, protected
+# by the per-watchdog recycled-pid check, not this daemon's to reap.
+WATCHDOG_REGISTRY="$STATE_DIR/watchdog-pids"
+
 # Find lib directory (co-located with this script)
 DAEMON_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -181,6 +190,11 @@ print(installed_version_line('$INSTALL_ROOT'))
 
 # Ensure directories exist
 mkdir -p "$STATE_DIR/signals" "$LOG_DIR"
+
+# Start with an empty watchdog registry (issue #77) — a fresh daemon owns only
+# the watchdogs it spawns; a predecessor's orphans are guarded by their own
+# recycled-pid identity check, not reaped from a stale registry.
+: > "$WATCHDOG_REGISTRY"
 
 # Ensure state files exist
 [ -f "$RUNNING_FILE" ] || echo '{"active":[],"completed_pending_eval":[],"pending_merges":[],"awaiting_review":[]}' > "$RUNNING_FILE"
@@ -228,6 +242,101 @@ daemon_log() {
     # (and stderr) to daemon.log. `tee -a` here would double-write each line,
     # which made `loop logs -f` print every entry twice.
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+# ── Watchdog subprocess supervision (issue #77) ───────────────────────────────
+# A backgrounded `sleep N; kill $PID` watchdog holds its target's PID across the
+# whole timeout. Two ways that assassinates the wrong process:
+#   1. When the daemon dies WITHOUT running its trap (launchd SIGKILL, crash),
+#      the watchdog subshell orphans to init; when its sleep expires it fires
+#      kill against a now-RECYCLED pid — twice killing a healthy successor queen
+#      ~39s in, mislogged as a 600s wall-time cap (receipts 2026-07-11).
+#   2. Even on a clean trap, `pkill -P $$` reaps only DIRECT children; worker
+#      watchdogs nest inside backgrounded worker-pool subshells and survive.
+# spawn_watchdog closes both: it captures the target's start-time as an identity
+# token and re-verifies pid+start-time still match before it signals (a recycled
+# pid stands the watchdog down), and it registers its own pid+start-time so the
+# shutdown trap can reap it by identity.
+
+# Normalized process start-time, empty when the pid is gone. Identity token: a
+# recycled pid reports a different lstart, so equality proves same-process.
+_proc_starttime() {
+    ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//'
+}
+
+# Append a watchdog's pid + its own start-time to the registry. A pid line is
+# tiny, so the O_APPEND write is atomic even across concurrent worker subshells
+# — no lock needed. _reap_watchdogs identity-checks each entry before killing,
+# so stale/recycled/finished entries are inert and never need deregistering.
+_watchdog_register() {
+    printf '%s %s\n' "$1" "$(_proc_starttime "$1")" >> "$WATCHDOG_REGISTRY"
+}
+
+# Shutdown-trap helper: SIGTERM every still-live watchdog this daemon spawned.
+# Each registry pid is killed ONLY if its current start-time still matches the
+# one recorded at spawn — a recycled pid (different lstart) or a finished pid
+# (empty lstart) is skipped, so the reaper can never signal a stranger. Logs
+# each kill.
+_reap_watchdogs() {
+    [ -f "$WATCHDOG_REGISTRY" ] || return 0
+    local wpid stored now
+    while read -r wpid stored; do
+        [ -z "$wpid" ] && continue
+        now=$(_proc_starttime "$wpid")
+        [ -z "$now" ] && continue            # already gone
+        [ "$now" != "$stored" ] && continue  # recycled pid — never signal a stranger
+        daemon_log "SHUTDOWN: killing watchdog pid $wpid"
+        kill -TERM "$wpid" 2>/dev/null || true
+    done < "$WATCHDOG_REGISTRY"
+}
+
+# Background an identity-checked wall-time watchdog against a target and record
+# its pid in WATCHDOG_SPAWNED_PID (a global — command substitution can't be used
+# because the backgrounded subshell would hold the $() pipe open until it fires,
+# hanging the caller). Args:
+#   1 target_pid  pid to police (== pgid when the target was spawned via
+#                 os.setpgrp, so a pgid kill reaches its descendants)
+#   2 timeout     seconds to wait before firing
+#   3 flag        file to touch when the kill fires (empty = none); the caller
+#                 reads it to record the event as a timeout, not a clean exit
+#   4 pgid_kill   1 = signal the process group (-pid, fallback pid); 0 = pid only
+#   5 hard        1 = single SIGKILL, no grace (probe); 0 = SIGTERM, grace, SIGKILL
+#   6 label       human label for the stand-down log line
+spawn_watchdog() {
+    local target_pid="$1" timeout="$2" flag="$3" pgid_kill="$4" hard="$5" label="$6"
+    local target_start
+    target_start=$(_proc_starttime "$target_pid")
+    (
+        sleep "$timeout"
+        now=$(_proc_starttime "$target_pid")
+        [ -z "$now" ] && exit 0                       # target already exited cleanly
+        if [ "$now" != "$target_start" ]; then        # issue #77: recycled pid
+            daemon_log "WATCHDOG: target pid $target_pid recycled — standing down ($label)"
+            exit 0
+        fi
+        [ -n "$flag" ] && touch "$flag"
+        if [ "$hard" = "1" ]; then
+            if [ "$pgid_kill" = "1" ]; then
+                kill -KILL -"$target_pid" 2>/dev/null || kill -KILL "$target_pid" 2>/dev/null || true
+            else
+                kill -KILL "$target_pid" 2>/dev/null || true
+            fi
+            exit 0
+        fi
+        if [ "$pgid_kill" = "1" ]; then
+            kill -TERM -"$target_pid" 2>/dev/null || kill -TERM "$target_pid" 2>/dev/null
+        else
+            kill -TERM "$target_pid" 2>/dev/null
+        fi
+        sleep "$WORKER_KILL_GRACE_SECS"
+        if [ "$pgid_kill" = "1" ]; then
+            kill -KILL -"$target_pid" 2>/dev/null || kill -KILL "$target_pid" 2>/dev/null || true
+        else
+            kill -KILL "$target_pid" 2>/dev/null || true
+        fi
+    ) &
+    WATCHDOG_SPAWNED_PID=$!
+    _watchdog_register "$WATCHDOG_SPAWNED_PID"
 }
 
 # Worker-scoped log line. Flag-off: emits the message verbatim (byte-identical
@@ -501,18 +610,12 @@ Trigger reason: $reason" \
 
     # Watchdog: fires after QUEEN_WALL_TIME_SECS, SIGTERM-grace-SIGKILL the
     # process group. Leaves QUEEN_TIMEOUT_FLAG so the return path below records
-    # the kill as a failure rather than treating it as a normal exit-code.
-    (
-        sleep "$QUEEN_WALL_TIME_SECS"
-        if kill -0 "$QUEEN_PID" 2>/dev/null; then
-            touch "$QUEEN_TIMEOUT_FLAG"
-            kill -TERM -"$QUEEN_PID" 2>/dev/null || kill -TERM "$QUEEN_PID" 2>/dev/null
-            sleep "$WORKER_KILL_GRACE_SECS"
-            kill -KILL -"$QUEEN_PID" 2>/dev/null || true
-        fi
-    ) &
+    # the kill as a failure rather than treating it as a normal exit-code. The
+    # identity check inside spawn_watchdog (issue #77) means an orphaned copy of
+    # this watchdog can never kill a recycled QUEEN_PID.
+    spawn_watchdog "$QUEEN_PID" "$QUEEN_WALL_TIME_SECS" "$QUEEN_TIMEOUT_FLAG" 1 0 "queen #$TURN"
     local QUEEN_WATCHDOG_PID
-    QUEEN_WATCHDOG_PID=$!
+    QUEEN_WATCHDOG_PID=$WATCHDOG_SPAWNED_PID
 
     wait "$QUEEN_PID"
     local EXIT_CODE=$?
@@ -638,14 +741,10 @@ _cb_probe_api() {
         > "$probe_tmp" 2>/dev/null &
     local probe_pid=$!
 
-    # Watchdog: hard-kill after QUEEN_PROBE_TIMEOUT_SECS.
-    (
-        sleep "$QUEEN_PROBE_TIMEOUT_SECS"
-        if kill -0 "$probe_pid" 2>/dev/null; then
-            kill -KILL -"$probe_pid" 2>/dev/null || kill -KILL "$probe_pid" 2>/dev/null || true
-        fi
-    ) &
-    local probe_watchdog_pid=$!
+    # Watchdog: hard-kill after QUEEN_PROBE_TIMEOUT_SECS (identity-checked so an
+    # orphaned copy can't hard-kill a recycled pid — issue #77).
+    spawn_watchdog "$probe_pid" "$QUEEN_PROBE_TIMEOUT_SECS" "" 1 1 "cb-probe"
+    local probe_watchdog_pid=$WATCHDOG_SPAWNED_PID
 
     wait "$probe_pid"
     probe_exit=$?
@@ -1118,17 +1217,12 @@ with open('$PROGRESS_FILE', 'w') as f:
 
     # Timeout watchdog: fires after CYCLE_WALL_TIME_SECS, then SIGTERM-grace-SIGKILL
     # the process group. 10s grace gives in-flight git ops time to settle (KC3).
-    (
-        sleep "$CYCLE_WALL_TIME_SECS"
-        if kill -0 "$WORKER_PID" 2>/dev/null; then
-            touch "$WORKER_TIMEOUT_FLAG"
-            kill -TERM -"$WORKER_PID" 2>/dev/null || kill -TERM "$WORKER_PID" 2>/dev/null
-            sleep "$WORKER_KILL_GRACE_SECS"
-            kill -KILL -"$WORKER_PID" 2>/dev/null || true
-        fi
-    ) &
+    # Identity-checked (issue #77): this watchdog nests inside a backgrounded
+    # worker-pool subshell, so the shutdown trap reaps it via WATCHDOG_REGISTRY,
+    # and an orphaned copy can never kill a recycled WORKER_PID.
+    spawn_watchdog "$WORKER_PID" "$CYCLE_WALL_TIME_SECS" "$WORKER_TIMEOUT_FLAG" 1 0 "worker $brief_id c$iteration"
     local WATCHDOG_PID
-    WATCHDOG_PID=$!
+    WATCHDOG_PID=$WATCHDOG_SPAWNED_PID
 
     wait "$WORKER_PID"
     local WORKER_EXIT=$?
@@ -1587,17 +1681,13 @@ Verdict guide:
     local VALIDATOR_PID
     VALIDATOR_PID=$!
 
-    (
-        sleep "$VALIDATOR_WALL_TIME_SECS"
-        if kill -0 "$VALIDATOR_PID" 2>/dev/null; then
-            touch "$VALIDATOR_TIMEOUT_FLAG"
-            kill -TERM "$VALIDATOR_PID" 2>/dev/null
-            sleep "$WORKER_KILL_GRACE_SECS"
-            kill -KILL "$VALIDATOR_PID" 2>/dev/null || true
-        fi
-    ) &
+    # Identity-checked watchdog (issue #77). The validator claude call is NOT
+    # spawned in its own process group, so this is a plain-pid kill (pgid_kill=0);
+    # the recycled-pid guard still prevents an orphaned copy from killing a
+    # stranger.
+    spawn_watchdog "$VALIDATOR_PID" "$VALIDATOR_WALL_TIME_SECS" "$VALIDATOR_TIMEOUT_FLAG" 0 0 "validator $brief_id c$cycle"
     local VALIDATOR_WATCHDOG_PID
-    VALIDATOR_WATCHDOG_PID=$!
+    VALIDATOR_WATCHDOG_PID=$WATCHDOG_SPAWNED_PID
 
     wait "$VALIDATOR_PID"
     local V_EXIT=$?
@@ -1883,6 +1973,11 @@ cleanup() {
     echo ""
     daemon_log "SHUTDOWN: caught signal, exiting cleanly"
     notify ops "Daemon stopped"
+    # Issue #77: kill the whole watchdog family first. `pkill -P $$` reaps only
+    # direct children; worker watchdogs nest inside worker-pool subshells and
+    # would orphan to init, later firing kill against recycled pids.
+    # _reap_watchdogs identity-checks each registered watchdog before signaling.
+    _reap_watchdogs
     pkill -P $$ 2>/dev/null
     rm -f "$PID_FILE"
     exit 0
