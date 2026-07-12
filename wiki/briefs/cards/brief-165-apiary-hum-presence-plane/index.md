@@ -1,7 +1,7 @@
 ---
 ID: brief-165-apiary-hum-presence-plane
 Branch: brief-165-apiary-hum-presence-plane
-Status: queued
+Status: merged
 Model: opus
 Auto-merge: false
 Validator: core/agents/reviewer.md
