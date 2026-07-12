@@ -257,6 +257,11 @@ def _build_active_entry(brief_id, fm, events_for_brief):
         "parallel_safe": parallel_safe,
         "edit_surface": list(edit_surface),
         "worker_slot": disp.get("worker_slot", 0),
+        # issue #74 (Mattie's ruling 2026-07-11): a program is a single thread.
+        # Record the normalized lane so the dispatch-path lane mutex — and loop
+        # why's lane_mutex check — can compare an active brief's program without
+        # re-reading its card. card-is-truth: sourced from frontmatter.
+        "program": _card_program(fm),
     }
     return entry
 

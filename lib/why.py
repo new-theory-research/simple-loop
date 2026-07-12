@@ -42,6 +42,13 @@ into parallel_safe, which reuses the real concurrency gate):
                    threshold, ALL other dispatch is held until the board
                    empties. Reuses queue.head_solo_drain — dispatch()'s own
                    decision function.
+ 11. lane_mutex  — issue #74, Mattie's ruling 2026-07-11: Program: is the unit
+                   of parallelism — a lane is a single thread. At most one
+                   active brief per Program: value, independent of THROTTLE and
+                   Parallel-safe/edit-surface. Reuses actions.lane_mutex_blocker
+                   — dispatch()'s own gate. Unlabeled briefs (no Program:) are
+                   N/A (surface concurrency governs). Numbered 11 in the ruling's
+                   predicate ledger (the folded surface/edit gates fill 9–10).
 
 The operator's predicate 7 — "daemon awake" — is not a property of
 the brief and can't be answered by a pure function, so it is omitted here. A
@@ -284,6 +291,27 @@ def explain_dispatchability(project_dir, brief_id, running=None, lane=None):
         else:
             checks.append(Check("solo_drain", True,
                                 "no solo brief draining the board"))
+
+    # ── 11. lane_mutex (issue #74 — Program: is the unit of parallelism) ─
+    # Mattie's ruling 2026-07-11: a program is a single thread — at most one
+    # active brief per Program: value, independent of THROTTLE and
+    # Parallel-safe/edit-surface. Reuses actions.lane_mutex_blocker — the exact
+    # function dispatch() gates on — so this green matches the daemon's.
+    program = _queue._parse_card_program(card_path) if os.path.isfile(card_path) else ""
+    if not program:
+        checks.append(Check("lane_mutex", True,
+                            "card declares no Program: — lane mutex N/A "
+                            "(surface concurrency governs)"))
+    else:
+        holder = _actions.lane_mutex_blocker(project_dir, program, active)
+        if holder is None:
+            checks.append(Check("lane_mutex", True,
+                                f"no same-lane brief active — lane {program!r} free"))
+        else:
+            checks.append(Check("lane_mutex", False,
+                                f"lane {program!r} single-threaded — held behind "
+                                f"{holder.get('brief', '?')} "
+                                f"(active, slot {holder.get('worker_slot', '?')})"))
 
     return checks
 

@@ -246,7 +246,8 @@ class WhyTests(unittest.TestCase):
         self.assertEqual(
             set(c),
             {"queued", "lane", "parallel_safe", "depends_on",
-             "claim_ref", "not_running", "throttle", "solo_drain"})
+             "claim_ref", "not_running", "throttle", "solo_drain",
+             "lane_mutex"})
 
     # ── 7. throttle ──────────────────────────────────────────────────
     def test_throttle_at_cap(self):
@@ -327,6 +328,73 @@ class WhyTests(unittest.TestCase):
         self.assertTrue(c["solo_drain"].ok)
         self.assertIn("no solo brief draining", c["solo_drain"].receipt)
         self.assertTrue(self._dispatchable(c))
+
+    # ── 11. lane_mutex (issue #74 — one thread per program) ──────────
+    def test_lane_mutex_same_lane_held_even_parallel_safe(self):
+        # The ruling's core case: two serving-lane briefs, BOTH parallel-safe,
+        # disjoint surfaces — legal under the old surface model, forbidden now.
+        _write_card(self.project, "serve-010", status="queued",
+                    program="serving", parallel_safe="true", edit_surface="a/")
+        running = {"active": [
+            {"brief": "serve-005", "branch": "serve-005", "program": "serving",
+             "parallel_safe": True, "edit_surface": ["b/"], "worker_slot": 0},
+        ]}
+        c = _checks(self.project, "serve-010", running=running)
+        self.assertFalse(c["lane_mutex"].ok)
+        self.assertIn("'serving'", c["lane_mutex"].receipt)
+        self.assertIn("single-threaded", c["lane_mutex"].receipt)
+        self.assertIn("serve-005", c["lane_mutex"].receipt)
+        self.assertIn("slot 0", c["lane_mutex"].receipt)
+        self.assertFalse(self._dispatchable(c))
+
+    def test_lane_mutex_cross_lane_allowed(self):
+        # A different Program: co-runs — cross-lane concurrency is the point.
+        _write_card(self.project, "serve-010", status="queued",
+                    program="serving", parallel_safe="true", edit_surface="a/")
+        running = {"active": [
+            {"brief": "ft-003", "branch": "ft-003", "program": "finetune",
+             "parallel_safe": True, "edit_surface": ["b/"], "worker_slot": 0},
+        ]}
+        c = _checks(self.project, "serve-010", running=running)
+        self.assertTrue(c["lane_mutex"].ok)
+        self.assertIn("no same-lane brief active", c["lane_mutex"].receipt)
+
+    def test_lane_mutex_unlabeled_unaffected(self):
+        # No Program: → mutex N/A; surface-based concurrency still governs.
+        _write_card(self.project, "serve-010", status="queued")  # no Program:
+        running = {"active": [
+            {"brief": "serve-005", "branch": "serve-005", "program": "serving",
+             "worker_slot": 0},
+        ]}
+        c = _checks(self.project, "serve-010", running=running)
+        self.assertTrue(c["lane_mutex"].ok)
+        self.assertIn("no Program:", c["lane_mutex"].receipt)
+
+    def test_lane_mutex_normalization(self):
+        # Card `Program: Serving` normalizes to `serving`; the active entry's
+        # raw `Serving` normalizes too — same lane, held.
+        _write_card(self.project, "serve-010", status="queued",
+                    program="Serving", parallel_safe="true")
+        running = {"active": [
+            {"brief": "serve-005", "branch": "serve-005", "program": "Serving",
+             "parallel_safe": True, "worker_slot": 0},
+        ]}
+        c = _checks(self.project, "serve-010", running=running)
+        self.assertFalse(c["lane_mutex"].ok)
+        self.assertIn("'serving'", c["lane_mutex"].receipt)
+
+    def test_lane_mutex_program_read_from_card_fallback(self):
+        # Legacy running.json entry with no `program` field: the blocker falls
+        # back to the active brief's card (card-is-truth).
+        _write_card(self.project, "serve-005", status="active", program="serving")
+        _write_card(self.project, "serve-010", status="queued",
+                    program="serving", parallel_safe="true")
+        running = {"active": [
+            {"brief": "serve-005", "branch": "serve-005", "worker_slot": 0},
+        ]}
+        c = _checks(self.project, "serve-010", running=running)
+        self.assertFalse(c["lane_mutex"].ok)
+        self.assertIn("serve-005", c["lane_mutex"].receipt)
 
     # ── papercuts ledger ─────────────────────────────────────────────
     def test_papercut_appended_when_blocked(self):

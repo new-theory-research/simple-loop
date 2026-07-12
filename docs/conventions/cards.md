@@ -26,6 +26,34 @@ fields, note:
   cards' `Issues:` == `gh issue list --state open`) stays exact. When the card
   merges, its closeout closes those issues with the commit SHA.
 
+- **`Program:`** — the card's program lane (e.g. `serving`, `finetune`). This is
+  the **unit of parallelism**, and it is a **mutex**: at most one brief per
+  `Program:` value is active at a time — the lane is a single thread.
+
+  > "programs are single-threaded, and we can have a max # of threads going at a
+  > time. ft has one going at any time, serve has one going at any time, and if
+  > both are active, they can happen at once." — Mattie, 2026-07-11 (issue #74)
+
+  Two same-lane briefs are sequenced by `goals.md` order and `Depends-on:`, never
+  co-dispatched — **even when both are `Parallel-safe:` and their edit surfaces are
+  disjoint.** A lane is single-threaded regardless of `Parallel-safe:`; that is the
+  point. Concurrency lives *across* programs: two different `Program:` lanes run at
+  once (`Parallel-safe:`/edit-surface disjointness still governs *cross*-lane
+  eligibility, unchanged). Unlabeled cards (no `Program:`) keep the older
+  surface-based concurrency behavior — the ruling governs programs.
+
+  The dispatcher enforces this as a first-class gate (`lane_mutex_hold`, evaluated
+  before the `THROTTLE` and edit-surface gates); `loop why` reports it as the
+  `lane_mutex` check. Scoping w.r.t. issue #51 (fill unused `THROTTLE` slots): the
+  extra slots the slot-filler wants are **cross-program** slots only — the mutex and
+  the slot-filler are complementary, never a second thread in the same lane.
+
+  *Retired interim encoding:* before the first-class mutex (issue #74), the lane was
+  serialized by a shared fiction — every serving card declared `wiki/programs/serving/`
+  as a fake shared `Edit-surface:` so the overlap check serialized the lane as a side
+  effect (portal commit `0a2a0909`). That workaround is superseded; declare `Program:`
+  and let the mutex do it.
+
 ## Naming
 
 `brief-NNN-slug` — three-digit zero-padded number, descriptive kebab-case slug. Numbers are sequential across the project; slugs must be unique.
