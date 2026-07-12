@@ -181,6 +181,154 @@ else
 fi
 
 # ╔══════════════════════════════════════════════════════════════════╗
+# ║  AC4: propagation bookkeeping commits tracked re-seed (issue #78) ║
+# ╚══════════════════════════════════════════════════════════════════╝
+# `loop update` re-seeds simple_loop.commit into the TRACKED .loop/config.json
+# and refreshes the TRACKED .loop/prompts/*.md — leaving the clone dirty and
+# feeding stranded-commit push churn. _commit_propagation_bookkeeping folds both
+# into ONE in-place commit (no push). Exercised directly by sourcing bin/loop.
+echo ""
+echo "── AC4: propagation bookkeeping (issue #78) ────────────────────"
+
+# Source the CLI (help path is a no-op) so the function is callable in isolation.
+run_bookkeeping() {
+    local proj="$1"
+    (
+        source "$LOOP_BIN" help >/dev/null 2>&1 || true
+        PROJECT_DIR="$proj"
+        LOOP_DIR="$proj/.loop"
+        _commit_propagation_bookkeeping
+    )
+}
+
+# Fixture: a git project whose .loop/config.json + one prompt are TRACKED.
+make_git_project() {
+    local root="$1"
+    mkdir -p "$root/.loop/state" "$root/.loop/prompts"
+    cat > "$root/.loop/config.json" <<'JSON'
+{"project_name": "fixture", "modules": [], "simple_loop": {"commit": "abc1234"}}
+JSON
+    printf 'QUEEN COMMITTED\n' > "$root/.loop/prompts/queen.md"
+    ( cd "$root" && git init -q && git config user.email t@t && git config user.name t \
+      && git add -A && git commit -q -m init )
+}
+commit_count() { git -C "$1" rev-list --count HEAD 2>/dev/null; }
+
+# ── AC4a: tracked + modified => exactly one commit, both files staged ──
+P4="$TMP/proj4"
+make_git_project "$P4"
+BEFORE4="$(commit_count "$P4")"
+# Simulate an update: re-seed rewrote config.json, refresh rewrote a prompt.
+cat > "$P4/.loop/config.json" <<'JSON'
+{"project_name": "fixture", "modules": [], "simple_loop": {"commit": "def5678"}}
+JSON
+printf 'QUEEN REFRESHED\n' > "$P4/.loop/prompts/queen.md"
+
+OUT4="$(run_bookkeeping "$P4")"
+AFTER4="$(commit_count "$P4")"
+
+if [ "$((AFTER4 - BEFORE4))" -eq 1 ]; then
+    pass "[AC4a] exactly one commit created"
+else
+    fail "[AC4a] expected +1 commit, got before=$BEFORE4 after=$AFTER4"
+fi
+COMMITTED4="$(git -C "$P4" show --name-only --format= HEAD 2>/dev/null)"
+if echo "$COMMITTED4" | grep -q ".loop/config.json" && echo "$COMMITTED4" | grep -q ".loop/prompts/queen.md"; then
+    pass "[AC4a] commit stages BOTH baseline (config.json) and refreshed prompt"
+else
+    fail "[AC4a] commit missing baseline or prompt (got: $COMMITTED4)"
+fi
+if git -C "$P4" show -s --format=%s HEAD | grep -q "update propagation (baseline + prompts)"; then
+    pass "[AC4a] commit message names baseline + prompts propagation"
+else
+    fail "[AC4a] unexpected commit subject: $(git -C "$P4" show -s --format=%s HEAD)"
+fi
+if echo "$OUT4" | grep -qi "Committed propagation bookkeeping"; then
+    pass "[AC4a] update output documents the bookkeeping commit"
+else
+    fail "[AC4a] output did not document bookkeeping (got: $OUT4)"
+fi
+if git -C "$P4" diff --quiet HEAD -- .loop; then
+    pass "[AC4a] working tree clean after bookkeeping (no stranded dirt)"
+else
+    fail "[AC4a] .loop still dirty after bookkeeping commit"
+fi
+
+# ── AC4b: untracked project => no commit attempted, no error ──
+P5="$TMP/proj5"
+mkdir -p "$P5/.loop/prompts"
+( cd "$P5" && git init -q && git config user.email t@t && git config user.name t \
+  && printf 'readme\n' > README.md && git add README.md && git commit -q -m init )
+# .loop/* written but NEVER tracked
+cat > "$P5/.loop/config.json" <<'JSON'
+{"project_name": "fixture", "simple_loop": {"commit": "def5678"}}
+JSON
+printf 'QUEEN UNTRACKED\n' > "$P5/.loop/prompts/queen.md"
+BEFORE5="$(commit_count "$P5")"
+
+OUT5="$(run_bookkeeping "$P5")"; RC5=$?
+AFTER5="$(commit_count "$P5")"
+
+if [ "$RC5" -eq 0 ]; then
+    pass "[AC4b] untracked project => function returns 0 (no error)"
+else
+    fail "[AC4b] function errored on untracked project (rc=$RC5)"
+fi
+if [ "$AFTER5" = "$BEFORE5" ]; then
+    pass "[AC4b] untracked project => no commit attempted"
+else
+    fail "[AC4b] a commit was created despite untracked .loop (before=$BEFORE5 after=$AFTER5)"
+fi
+if [ -z "$OUT5" ]; then
+    pass "[AC4b] untracked project => no bookkeeping output"
+else
+    fail "[AC4b] unexpected output on untracked project: $OUT5"
+fi
+
+# ── AC4c: non-git project => no error, no commit ──
+P6="$TMP/proj6"
+mkdir -p "$P6/.loop/prompts"
+printf '{}\n' > "$P6/.loop/config.json"
+OUT6="$(run_bookkeeping "$P6")"; RC6=$?
+if [ "$RC6" -eq 0 ] && [ -z "$OUT6" ]; then
+    pass "[AC4c] non-git project => silent no-op, no error"
+else
+    fail "[AC4c] non-git project misbehaved (rc=$RC6 out=$OUT6)"
+fi
+
+# ── AC4d: commit failure => loud warning, update continues ──
+P7="$TMP/proj7"
+make_git_project "$P7"
+BEFORE7="$(commit_count "$P7")"
+cat > "$P7/.loop/config.json" <<'JSON'
+{"project_name": "fixture", "simple_loop": {"commit": "fail999"}}
+JSON
+printf 'QUEEN REFRESHED\n' > "$P7/.loop/prompts/queen.md"
+# Force the commit to fail deterministically (stands in for mid-merge/detached).
+mkdir -p "$P7/.git/hooks"
+printf '#!/bin/sh\nexit 1\n' > "$P7/.git/hooks/pre-commit"
+chmod +x "$P7/.git/hooks/pre-commit"
+
+OUT7="$(run_bookkeeping "$P7")"; RC7=$?
+AFTER7="$(commit_count "$P7")"
+
+if [ "$RC7" -eq 0 ]; then
+    pass "[AC4d] commit failure => function still returns 0 (update not aborted)"
+else
+    fail "[AC4d] function aborted on commit failure (rc=$RC7)"
+fi
+if echo "$OUT7" | grep -qi "Could not commit propagation bookkeeping"; then
+    pass "[AC4d] commit failure => loud one-line warning naming the files"
+else
+    fail "[AC4d] no warning on commit failure (got: $OUT7)"
+fi
+if [ "$AFTER7" = "$BEFORE7" ]; then
+    pass "[AC4d] commit failure => no bookkeeping commit landed"
+else
+    fail "[AC4d] a commit landed despite forced failure (before=$BEFORE7 after=$AFTER7)"
+fi
+
+# ╔══════════════════════════════════════════════════════════════════╗
 # ║  Summary                                                        ║
 # ╚══════════════════════════════════════════════════════════════════╝
 echo ""
