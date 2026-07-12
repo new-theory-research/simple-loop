@@ -2213,6 +2213,7 @@ impl CellsState {
 
 // ── DanceFloorState ───────────────────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct LogEvent {
     pub ts: Option<DateTime<Utc>>,
     pub actor: Option<String>,
@@ -2227,6 +2228,17 @@ pub struct LogEvent {
     /// so the dance floor keys the intent color off this flag rather than the
     /// actor string (which would otherwise fall through to the muted default).
     pub intent: bool,
+    /// brief-165 presence plane: the box a remote event came from (`lady-titania`,
+    /// …). `None` = a local row (this box). Lets the floor say *which* box a
+    /// remote worker is on.
+    pub box_name: Option<String>,
+    /// Server-stamped arrival time from the apiary. Cross-box interleaving and
+    /// remote staleness key on this (skew-immune), never on box-local `ts`.
+    /// `None` for local rows.
+    pub received_at: Option<DateTime<Utc>>,
+    /// Stable event identity `box:journal:offset`. Hive collapses duplicates on
+    /// this (at-least-once delivery can replay a batch). `None` for local rows.
+    pub id: Option<String>,
 }
 
 pub struct DanceFloorState {
@@ -2458,6 +2470,7 @@ pub fn load_daemon_log_events(log_path: &Path, max_age_secs: i64) -> Vec<LogEven
             malformed: false,
             from_daemon_log: true,
             intent: false,
+            ..Default::default()
         });
     }
     events
@@ -2496,12 +2509,25 @@ const INTENT_JOURNALS_ENV: &str = "HIVE_INTENT_JOURNALS";
 /// One line of the intent journal (portal `scripts/intent-journal.py`,
 /// `wiki/specs/harness-coordination.md` §4): `{ts, session, action, detail}`.
 /// A director session appends one line before a collision-prone action.
+///
+/// brief-165 presence plane: the line gains the additive `{box, lane, brief}`
+/// fields (spec §4's deferred richer shape — `session` *is* the spec's
+/// `director_id`, `brief` is the concrete `refs`, `box` is genuinely new). When
+/// an event arrives via the apiary it also carries `received_at` (server-stamped
+/// on ingest) and `id` (`box:journal:offset`). All new fields are `Option`, so
+/// old lines and local single-box runs parse byte-for-byte unchanged.
 #[derive(Deserialize)]
 struct RawIntentLine {
     ts: Option<String>,
     session: Option<String>,
     action: Option<String>,
     detail: Option<String>,
+    #[serde(rename = "box")]
+    box_name: Option<String>,
+    lane: Option<String>,
+    brief: Option<String>,
+    received_at: Option<String>,
+    id: Option<String>,
 }
 
 /// Shorten a session tag for the actor column: the first 8 chars when it looks
@@ -2588,14 +2614,18 @@ pub fn load_intent_journal_events(path: &Path) -> Vec<LogEvent> {
         } else {
             format!("{} — {}", action, detail)
         };
+        let received_at = entry.received_at.as_deref().and_then(parse_log_ts);
         events.push(LogEvent {
             ts,
             actor,
             event: Some(event),
-            brief: None,
+            brief: entry.brief,
             malformed: false,
             from_daemon_log: false,
             intent: true,
+            box_name: entry.box_name,
+            received_at,
+            id: entry.id,
         });
     }
     events
@@ -2634,6 +2664,7 @@ impl DanceFloorState {
                             malformed: false,
                             from_daemon_log: false,
                             intent: false,
+                            ..Default::default()
                         });
                     }
                     Err(_) => {
@@ -2646,6 +2677,7 @@ impl DanceFloorState {
                             malformed: true,
                             from_daemon_log: false,
                             intent: false,
+                            ..Default::default()
                         });
                     }
                 }
@@ -4135,6 +4167,42 @@ mod tests {
     }
 
     #[test]
+    fn intent_journal_line_roundtrips_presence_fields() {
+        // brief-165: a line carrying the additive {box, lane, brief, received_at,
+        // id} fields parses them onto the LogEvent (apiary-sourced remote row).
+        let line = br#"{"ts":"2026-07-11T10:00:00Z","session":"titania","action":"dispatch","detail":"worker brief-165","box":"lady-titania","lane":"harness-improvements","brief":"brief-165","received_at":"2026-07-11T10:00:02Z","id":"lady-titania:intent-journal.jsonl:512"}
+"#;
+        let path = intent_tempfile("presence", line);
+        let events = load_intent_journal_events(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.box_name.as_deref(), Some("lady-titania"));
+        assert_eq!(ev.brief.as_deref(), Some("brief-165"));
+        assert_eq!(ev.id.as_deref(), Some("lady-titania:intent-journal.jsonl:512"));
+        assert!(ev.received_at.is_some(), "server stamp parses for ordering");
+    }
+
+    #[test]
+    fn intent_journal_old_line_parses_without_presence_fields() {
+        // Byte-compatibility: a pre-165 line ({ts,session,action,detail} only)
+        // still parses; the new fields are simply None (feature additive-off).
+        let line = br#"{"ts":"2026-04-21T17:00:00Z","session":"scav","action":"push","detail":"branch X"}
+"#;
+        let path = intent_tempfile("oldline", line);
+        let events = load_intent_journal_events(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert!(ev.box_name.is_none());
+        assert!(ev.received_at.is_none());
+        assert!(ev.id.is_none());
+        assert_eq!(ev.actor.as_deref(), Some("scav"));
+    }
+
+    #[test]
     fn intent_journal_paths_merges_default_and_env_list() {
         // No env → just the in-project default.
         let just_default = intent_journal_paths_from(None);
@@ -4228,11 +4296,11 @@ mod tests {
                     let ts = entry.ts_str().and_then(parse_log_ts);
                     let actor = entry.derived_actor();
                     let event_msg = entry.event.or(entry.action);
-                    events.push(LogEvent { ts, actor, event: event_msg, brief: entry.brief, malformed: false, from_daemon_log: false, intent: false });
+                    events.push(LogEvent { ts, actor, event: event_msg, brief: entry.brief, malformed: false, from_daemon_log: false, intent: false, ..Default::default() });
                 }
                 Err(_) => {
                     let preview = line.chars().take(60).collect::<String>();
-                    events.push(LogEvent { ts: None, actor: None, event: Some(format!("[malformed] {}", preview)), brief: None, malformed: true, from_daemon_log: false, intent: false });
+                    events.push(LogEvent { ts: None, actor: None, event: Some(format!("[malformed] {}", preview)), brief: None, malformed: true, from_daemon_log: false, intent: false, ..Default::default() });
                 }
             }
         }

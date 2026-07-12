@@ -512,6 +512,22 @@ def append_event(project_dir, event_type, brief, **fields):
         "brief": brief,
     }
     payload.update(fields)
+    # brief-165 presence plane: stamp the additive {box, lane} fields from the
+    # environment when a caller did not pass them and the env names a value.
+    # LOOP_LANE is exported by lib/daemon.sh; LOOP_BOX names the machine. Both
+    # absent → byte-identical to the pre-165 single-box line (additive only).
+    if payload.get("lane") is None:
+        _lane = os.environ.get("LOOP_LANE") or None
+        if _lane:
+            payload["lane"] = _lane
+        else:
+            payload.pop("lane", None)
+    if payload.get("box") is None:
+        _box = os.environ.get("LOOP_BOX") or None
+        if _box:
+            payload["box"] = _box
+        else:
+            payload.pop("box", None)
     with open(events_path, "a") as f:
         f.write(json.dumps(payload) + "\n")
     return payload
