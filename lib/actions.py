@@ -1267,6 +1267,38 @@ def ensure_worktree(paths, brief, branch, config=None):
     return wt_dir
 
 
+def branch_reusable_on_origin(project_dir, remote, branch):
+    """Gate branch reuse on what origin advertises RIGHT NOW (issues #83/#84).
+
+    dispatch()'s `git fetch <remote>` (no --prune) refreshes tracking refs for
+    branches that still exist on origin, but leaves a stale
+    refs/remotes/<remote>/<branch> behind for a branch that was DELETED on
+    origin. ensure_worktree() would then resurrect that deleted branch off the
+    stale ref — with whatever contaminated content it points at (the #83
+    receipt) — instead of cutting fresh from main. A local-only remote-tracking
+    ref is NOT evidence; only a ref origin advertises now counts.
+
+    Uses `git ls-remote` (single-branch, cheap) as the source of truth. Returns
+    (reusable: bool, offline_note: str | None):
+      - branch on origin now          → (True, None): tracking ref left intact.
+      - branch absent (new or deleted) → (False, None): any stale local
+        remote-tracking ref dropped, so ensure_worktree() cuts fresh from main.
+      - ls-remote failed (offline/auth) → (False, "<reason>"): stale ref dropped
+        and we fail toward fresh-from-main — the SAFE direction for a smoke, a
+        fresh branch off main cannot carry resurrected state. Caller logs loudly.
+    """
+    ls = git(project_dir, "ls-remote", "--heads", remote, branch, check=False)
+    if ls.returncode != 0:
+        git(project_dir, "update-ref", "-d",
+            f"refs/remotes/{remote}/{branch}", check=False)
+        return False, (redact_secrets((ls.stderr or "").strip()) or f"rc={ls.returncode}")
+    if ls.stdout.strip():
+        return True, None
+    git(project_dir, "update-ref", "-d",
+        f"refs/remotes/{remote}/{branch}", check=False)
+    return False, None
+
+
 def remove_worktree(paths, brief):
     """Remove a worktree for a brief."""
     wt_dir = worktree_dir_for(paths, brief)
@@ -1687,6 +1719,23 @@ def dispatch(paths):
         os.remove(paths["pending_dispatch"])
         return False
 
+    # Never reuse a STALE branch ref (issues #83/#84). The fetch above does not
+    # --prune, so a branch deleted on origin leaves refs/remotes/<remote>/<branch>
+    # behind and ensure_worktree() would resurrect it with contaminated content.
+    # Gate reuse on what origin advertises right now; a stale local ref is dropped
+    # so ensure_worktree() cuts fresh from main. On offline/auth failure we fail
+    # toward fresh-from-main (safe for a smoke) and log loudly.
+    _reusable, _offline_note = branch_reusable_on_origin(project_dir, remote, branch)
+    if _offline_note is not None:
+        print(
+            f"dispatch: cannot confirm {branch} on {remote} ({_offline_note}) — "
+            f"cutting fresh from {main_branch} (fail toward fresh-from-main: a "
+            f"smoke branch off main cannot carry resurrected state)",
+            file=sys.stderr,
+        )
+        log_action(paths, "dispatch_branch_confirm_failed",
+                   {"brief": brief, "branch": branch, "reason": _offline_note})
+
     # Create worktree with new branch
     wt_dir = ensure_worktree(paths, brief, branch, config)
 
@@ -1818,6 +1867,21 @@ def dispatch(paths):
     print(f"Dispatched {brief} on branch {branch} "
           f"(slot={worker_slot}, throttle={throttle})")
     return True
+
+
+# Wave-1b (brief-155 / #54 #55 #83): daemon-volatile bookkeeping files that must
+# NEVER be tracked on main. Worker branches force-add progress.json (git add -f)
+# so the committed branch carries it for the assess.py/auto_merge.py git_show
+# read path; branches cut BEFORE the untracking commit still carry a stale
+# runtime-events.jsonl. A merge can drag either into main's tree. merge() strips
+# any that end up tracked at HEAD — in a single follow-up commit — so main's tip
+# tree stays clean and old branches can never re-track them (the resurrection
+# class, #83). The physical files stay on disk (gitignored, daemon-local);
+# runtime-events now travels via the hum sidecar (brief-165), not git main.
+STRIP_ON_MAIN = [
+    os.path.join(".loop", "state", "progress.json"),
+    os.path.join(".loop", "state", "runtime-events.jsonl"),
+]
 
 
 # ─── Action: merge ────────────────────────────────────────────────────
@@ -2119,26 +2183,39 @@ def merge(paths):
     except Exception:
         pass
 
-    # ── Strip progress.json from main's tree (issue #64) ────────────────────
+    # ── Strip daemon-volatile bookkeeping from main's tree (#64, #83) ───────
     # Worker branches force-add .loop/state/progress.json (git add -f) so the
     # committed branch carries fresh progress for the git_show read path in
-    # assess.py / auto_merge.py. The merge above brings that tracked file into
-    # main — but main must NEVER track it (Wave-1b migration goal: keep loop
-    # bookkeeping off main to kill the merge-contamination class, #54/#55). If
-    # the merge left it tracked at HEAD, untrack it with a follow-up commit
-    # before the push so main's tip tree stays clean. Keep the physical file on
-    # disk (it is daemon-local, gitignored). runtime-events.jsonl is NOT
-    # stripped: it is legitimately committed to main via dispatch plumbing and
-    # has no branch read path.
-    _progress_rel = os.path.join(".loop", "state", "progress.json")
-    if git(project_dir, "ls-files", "--error-unmatch", _progress_rel,
-           check=False).returncode == 0:
-        git(project_dir, "rm", "--cached", "--quiet", _progress_rel, check=False)
+    # assess.py / auto_merge.py; branches cut before the wave-1b untracking
+    # (brief-155) also carry a stale .loop/state/runtime-events.jsonl. The merge
+    # above can drag either tracked file into main — but main must NEVER track
+    # them (wave-1b goal: keep loop bookkeeping off main to kill the merge-
+    # contamination/resurrection class, #54/#55/#83). Strip any that ended up
+    # tracked at HEAD in a SINGLE follow-up commit before the push, so main's
+    # tip tree stays clean and old branches can never re-track them. The
+    # physical files stay on disk (daemon-local, gitignored). See STRIP_ON_MAIN.
+    _to_strip = [
+        rel for rel in STRIP_ON_MAIN
+        if git(project_dir, "ls-files", "--error-unmatch", rel,
+               check=False).returncode == 0
+    ]
+    if _to_strip:
+        for rel in _to_strip:
+            git(project_dir, "rm", "--cached", "--quiet", rel, check=False)
+        # Bare commit (NOT `commit -- <paths>`): a pathspec commit is `--only`,
+        # which rebuilds the tree from HEAD plus the WORKING-TREE content of the
+        # named paths — silently throwing away the `git rm --cached` deletions
+        # and re-tracking any file still present on disk (these files ARE still
+        # on disk: daemon-local, gitignored). The staged removals must be
+        # committed from the index. The post-merge index equals HEAD apart from
+        # these removals (the autostash pop above restores the working tree
+        # unstaged), so a bare commit records exactly the strip and nothing else.
         git(project_dir, "commit", "-m",
-            f"loop: strip progress.json off main after merge {brief} (issue #64)",
-            "--", _progress_rel, check=False)
-        log_action(paths, "merge_strip_progress_json", {"brief": brief})
-        print(f"merge: stripped progress.json off main's tree after {brief} (issue #64)")
+            f"loop: strip daemon-volatile bookkeeping off main after merge "
+            f"{brief} (#64/#83)",
+            check=False)
+        log_action(paths, "merge_strip_on_main", {"brief": brief, "stripped": _to_strip})
+        print(f"merge: stripped {', '.join(_to_strip)} off main's tree after {brief}")
 
     # Remove worktree before deleting branch
     remove_worktree(paths, brief)
