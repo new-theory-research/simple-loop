@@ -119,6 +119,13 @@ QUEEN_FAIL_THRESHOLD="${QUEEN_FAIL_THRESHOLD:-3}"
 # Health-probe timeout for auto-resume (lightweight ping, not a full queen).
 # Short enough to not block the tick; long enough to survive a slow connect.
 QUEEN_PROBE_TIMEOUT_SECS="${QUEEN_PROBE_TIMEOUT_SECS:-30}"
+# Rate/usage/session-limit backoff cap (issue #81). When the claude CLI reports a
+# limit but the log carries NO parseable reset time, handle_rate_limit backs off
+# exponentially (doubling per consecutive no-reset hit) and CAPS the nap here so
+# the daemon never hot-loops on a known "come back later" (receipt 2026-07-12: a
+# session limit hot-looped 26 min) yet never oversleeps a plausible limit window.
+# Default 1h matches the pre-#81 flat fallback. Config-overridable.
+RATE_LIMIT_BACKOFF_CAP_SECS="${RATE_LIMIT_BACKOFF_CAP_SECS:-3600}"
 # Issue #15: consecutive identical failures at a repeat-failure site (delivered
 # gate, dispatch, sync) before the site stops silently retrying and raises the
 # EXISTING escalate.json with the receipt (default 3). Config-overridable.
@@ -158,6 +165,9 @@ THROTTLE="$(printf '%s' "$THROTTLE" | tr -cd '0-9')"
 CONSECUTIVE_SKIPS=0
 CONSECUTIVE_WORKER_FAILURES=0
 CONSECUTIVE_QUEEN_FAILURES=0
+# issue #81: consecutive no-reset-time limit hits drive handle_rate_limit's
+# exponential backoff. Reset when a reset time parses or the queen succeeds.
+RATE_LIMIT_BACKOFF_SECS=0
 
 # Parallel-worker registry (daemon-process lifetime; reaped at each tick
 # start). Parallel indexed arrays — bash 3.2 has no associative arrays and no
@@ -528,33 +538,73 @@ except Exception as e:
 " 2>>"$log_file"
 }
 
-# Handle rate limit: parse reset time, sleep until then.
+# Classify a claude-CLI failure log as a rate/usage/session limit (issue #81).
+# The CLI emits several shapes for the SAME "you're throttled, come back later"
+# condition; every one must route into handle_rate_limit's wall-clock sleep, not
+# the generic retry path (which hot-loops ~every 30s — receipt 2026-07-12 00:44,
+# a session limit spun the daemon for 26 min). Captured shapes:
+#   "out of extra usage"                                    (pre-#81, extra-usage)
+#   "You've hit your session limit · resets 1:10am (…)"     (2026-07-12 receipt)
+#   "Max usage limit reached" / "…usage limit reached"      (Max-plan variants)
+# Match the stable substrings case-insensitively; "session limit"/"usage limit"
+# are specific enough to avoid false positives on ordinary agent output.
+is_rate_limit_log() {
+    local log_file="$1"
+    [ -f "$log_file" ] || return 1
+    grep -qiE "out of extra usage|session limit|usage limit" "$log_file" 2>/dev/null
+}
+
+# Handle rate limit: parse reset time and sleep until then; if no reset time is
+# present, exponential-backoff (capped) instead of hot-looping (issue #81).
 handle_rate_limit() {
     local log_file="$1"
-    RESET_INFO=$(grep -o "resets [0-9]*[ap]m" "$log_file" 2>/dev/null | head -1)
+    # Reset time may carry minutes ("resets 1:10am") or be hour-only ("resets 1am").
+    # The pre-#81 pattern only matched the hour-only form and dropped "1:10am" on
+    # the floor → fell through to the flat 1h fallback. Capture minutes optionally.
+    RESET_INFO=$(grep -oE "resets [0-9]{1,2}(:[0-9]{2})?[ap]m" "$log_file" 2>/dev/null | head -1)
     if [ -n "$RESET_INFO" ]; then
-        RESET_HOUR=$(echo "$RESET_INFO" | grep -o '[0-9]*')
-        RESET_AMPM=$(echo "$RESET_INFO" | grep -o '[ap]m')
+        RESET_HOUR=$(echo "$RESET_INFO" | grep -oE '[0-9]{1,2}' | head -1)
+        RESET_MIN=$(echo "$RESET_INFO" | grep -oE ':[0-9]{2}' | tr -d ':')
+        [ -z "$RESET_MIN" ] && RESET_MIN=0
+        RESET_MIN=$((10#$RESET_MIN))   # strip any leading zero for arithmetic safety
+        RESET_AMPM=$(echo "$RESET_INFO" | grep -oE '[ap]m')
         if [ "$RESET_AMPM" = "pm" ] && [ "$RESET_HOUR" -ne 12 ]; then
             RESET_HOUR=$((RESET_HOUR + 12))
         elif [ "$RESET_AMPM" = "am" ] && [ "$RESET_HOUR" -eq 12 ]; then
             RESET_HOUR=0
         fi
         NOW_EPOCH=$(date +%s)
-        RESET_TODAY=$(date -v${RESET_HOUR}H -v0M -v0S +%s 2>/dev/null || date -d "today ${RESET_HOUR}:00:00" +%s 2>/dev/null)
+        RESET_TODAY=$(date -v${RESET_HOUR}H -v${RESET_MIN}M -v0S +%s 2>/dev/null || date -d "today ${RESET_HOUR}:${RESET_MIN}:00" +%s 2>/dev/null)
         if [ -n "$RESET_TODAY" ]; then
             if [ "$RESET_TODAY" -le "$NOW_EPOCH" ]; then
                 RESET_TODAY=$((RESET_TODAY + 86400))
             fi
             SLEEP_SECS=$(( RESET_TODAY - NOW_EPOCH + 300 ))
-            daemon_log "RATE LIMITED: sleeping $((SLEEP_SECS / 3600))h $(((SLEEP_SECS % 3600) / 60))m until ${RESET_HOUR}:00"
-            notify ops "Rate limited — sleeping until ${RESET_HOUR}:00"
+            RATE_LIMIT_BACKOFF_SECS=0   # a parseable reset clears the no-reset streak
+            RESET_LABEL=$(printf '%d:%02d' "$RESET_HOUR" "$RESET_MIN")
+            daemon_log "RATE LIMITED: sleeping $((SLEEP_SECS / 3600))h $(((SLEEP_SECS % 3600) / 60))m until ${RESET_LABEL}"
+            notify ops "Rate limited — sleeping until ${RESET_LABEL}"
             wall_sleep "$SLEEP_SECS"
             return
         fi
     fi
-    daemon_log "RATE LIMITED: couldn't parse reset time. Sleeping 1h."
-    wall_sleep 3600
+    # No parseable reset time. NEVER hot-loop on a known come-back-later: back off
+    # exponentially (doubling per consecutive no-reset hit) and CAP at
+    # RATE_LIMIT_BACKOFF_CAP_SECS. The cap bounds the nap so we don't oversleep a
+    # plausible limit window, and the growth stops the ~30s spin that burned 26 min
+    # on 2026-07-12. The streak resets when a reset time parses (above) or the queen
+    # next succeeds (_cb_record_queen_result "success").
+    if [ "${RATE_LIMIT_BACKOFF_SECS:-0}" -le 0 ]; then
+        RATE_LIMIT_BACKOFF_SECS=60
+    else
+        RATE_LIMIT_BACKOFF_SECS=$(( RATE_LIMIT_BACKOFF_SECS * 2 ))
+    fi
+    if [ "$RATE_LIMIT_BACKOFF_SECS" -gt "$RATE_LIMIT_BACKOFF_CAP_SECS" ]; then
+        RATE_LIMIT_BACKOFF_SECS="$RATE_LIMIT_BACKOFF_CAP_SECS"
+    fi
+    daemon_log "RATE LIMITED: no reset time in log — backing off ${RATE_LIMIT_BACKOFF_SECS}s (cap ${RATE_LIMIT_BACKOFF_CAP_SECS}s)"
+    notify ops "Rate limited (no reset time) — backing off ${RATE_LIMIT_BACKOFF_SECS}s"
+    wall_sleep "$RATE_LIMIT_BACKOFF_SECS"
 }
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -666,7 +716,7 @@ json.dump({"ts": ts, "reason": reason, "exit_code": exit_code, "log_tail": log_t
 ' "$_qe_ts" "claude exit $EXIT_CODE" "$EXIT_CODE" "$TURN_LOG" \
             > "$_qe_tmp" && mv "$_qe_tmp" "$STATE_DIR/last-queen-error.json" || rm -f "$_qe_tmp"
 
-        if [ "$TURN_DURATION" -le 10 ] && grep -q "out of extra usage" "$TURN_LOG" 2>/dev/null; then
+        if [ "$TURN_DURATION" -le 10 ] && is_rate_limit_log "$TURN_LOG"; then
             handle_rate_limit "$TURN_LOG"
             return 1
         fi
@@ -765,6 +815,7 @@ _cb_record_queen_result() {
     local result="$1"
     if [ "$result" = "success" ]; then
         CONSECUTIVE_QUEEN_FAILURES=0
+        RATE_LIMIT_BACKOFF_SECS=0   # issue #81: limits cleared → reset no-reset backoff streak
         return 0
     fi
     # fail path
@@ -1279,7 +1330,7 @@ with open('$PROGRESS_FILE', 'w') as f:
         notify ops "$brief_id: worker FAILED (exit $WORKER_EXIT)"
         CONSECUTIVE_WORKER_FAILURES=$((CONSECUTIVE_WORKER_FAILURES + 1))
 
-        if [ "$WORKER_DURATION" -le 10 ] && grep -q "out of extra usage" "$WORKER_LOG" 2>/dev/null; then
+        if [ "$WORKER_DURATION" -le 10 ] && is_rate_limit_log "$WORKER_LOG"; then
             handle_rate_limit "$WORKER_LOG"
             return 1
         fi
@@ -1716,7 +1767,7 @@ Verdict guide:
     if [ "$V_EXIT" -ne 0 ]; then
         daemon_log "VALIDATOR: FAILED (exit $V_EXIT, ${V_DURATION}s)"
         notify ops "$brief_id: validator FAILED (exit $V_EXIT)"
-        if [ "$V_DURATION" -le 10 ] && grep -q "out of extra usage" "$VALIDATOR_LOG" 2>/dev/null; then
+        if [ "$V_DURATION" -le 10 ] && is_rate_limit_log "$VALIDATOR_LOG"; then
             handle_rate_limit "$VALIDATOR_LOG"
             return 1
         fi

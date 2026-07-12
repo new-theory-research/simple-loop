@@ -233,7 +233,10 @@ fi
 echo ""
 echo "── Wiring: daemon scheduling paths use wall_sleep ──────────────"
 
-for site in 'wall_sleep "\$SKIP_SLEEP"' 'wall_sleep "\$SLEEP_SECS"' 'wall_sleep 3600'; do
+# The rate-limit no-reset fallback naps via wall_sleep too. Pre-#81 this was a
+# flat `wall_sleep 3600`; #81 replaced it with a capped exponential backoff
+# (`wall_sleep "$RATE_LIMIT_BACKOFF_SECS"`) — still a wall_sleep, never a hot loop.
+for site in 'wall_sleep "\$SKIP_SLEEP"' 'wall_sleep "\$SLEEP_SECS"' 'wall_sleep "\$RATE_LIMIT_BACKOFF_SECS"'; do
     if grep -q "$site" "$DAEMON_SH"; then
         pass "[wiring] daemon.sh uses: $site"
     else
