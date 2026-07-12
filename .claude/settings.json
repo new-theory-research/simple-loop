@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Task|Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/intent-hook-record.py\"",
+            "timeout": 10,
+            "statusMessage": "Recording intent (harness-coordination §4)"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/intent-hook-inject.py\"",
+            "timeout": 10,
+            "statusMessage": "Reading fresh peer intent (delta-cursor)"
+          }
+        ]
+      }
+    ]
+  }
+}
