@@ -2276,6 +2276,12 @@ pub struct ActorPresence {
     /// Brief ids currently dispatched (running.json `active[]`) — live truth
     /// for worker slots, independent of the log window.
     pub active_workers: Vec<String>,
+    /// Newest heartbeat timestamp across all merged sources (local + apiary).
+    /// Heartbeats never render as feed rows — with multiple boxes their
+    /// per-minute cadence would drown the floor — but they are honest liveness
+    /// fuel: the queen line falls back to this when there's no queen activity
+    /// yet, so "the loop is pinging" reads as idle rather than "none yet".
+    pub last_heartbeat: Option<DateTime<Utc>>,
 }
 
 /// Whether a class is present, quiet, or has never appeared. Kept separate
@@ -2383,6 +2389,9 @@ pub fn compute_actor_presence(daemon_log_path: &Path, running_path: &Path) -> Ac
         workers,
         validators,
         active_workers,
+        // Fuelled by the merged feed in DanceFloorState::load (heartbeats from
+        // all sources), not by this daemon.log-only scan.
+        last_heartbeat: None,
     }
 }
 
@@ -2422,6 +2431,13 @@ pub fn parse_daemon_log_line(line: &str) -> Option<(DateTime<Utc>, String, Strin
         "WORKER" => "worker",
         "VALIDATOR" => "validator",
         s if s == "CONDUCTOR" || s.starts_with("CONDUCTOR") => "conductor",
+        // The daemon writes the queen's turns as `QUEEN #N: invoking|complete`
+        // (and bare `QUEEN:` for dedup/state lines). The `#N` rides in the
+        // actor field because the split is on the first `: `, so match both the
+        // bare and the numbered prefix. Normalize to `conductor` so a single
+        // classification feeds both the dance floor and the presence strip —
+        // one dialect, not two (the strip's queen slot keys on `conductor`).
+        s if s == "QUEEN" || s.starts_with("QUEEN #") || s.starts_with("QUEEN#") => "conductor",
         "DAEMON ACTION" | "DAEMON" => "daemon",
         s if s.starts_with("WORKER[") => "worker",
         _ => return None, // skip unrecognized prefixes (git output, blank lines, etc.)
@@ -2703,6 +2719,70 @@ pub fn remote_liveness(received_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -
     }
 }
 
+/// Lifecycle event names the daemon emits as plumbing (brief cycle, budget,
+/// mutex, escalation, startup). A remote row carrying one of these — and no
+/// session tag or role-named event — is daemon orchestration, so it renders as
+/// `daemon` rather than an anonymous `?`.
+fn is_lifecycle_name(lower: &str) -> bool {
+    const LIFECYCLE: &[&str] = &[
+        "dispatched",
+        "completed",
+        "approved",
+        "merged",
+        "superseded",
+        "heartbeat",
+        "wake",
+        "over_budget",
+        "lane_mutex_hold",
+        "repeat_failure_escalated",
+        "startup",
+        "daemon",
+    ];
+    LIFECYCLE.iter().any(|k| lower.contains(k))
+}
+
+/// Classify a remote apiary event into `(actor, intent)`. Every shape resolves
+/// to a concrete actor — a remote row must never render the mystery `?` that a
+/// `None` actor produces downstream.
+///
+/// - A `session` tag = a director session: render its short tag, and flag it
+///   `intent` when the row also carries an `action` (the intent-journal shape:
+///   `git push` / `dispatch` / `coordination`), so it picks up the intent
+///   styling the local intent rows use.
+/// - No session, but the event name names a role (queen/worker/validator/…) →
+///   that role.
+/// - No session, a lifecycle-plumbing name → `daemon`.
+/// - Anything else → the honest `remote` label, never punctuation.
+pub fn classify_apiary_actor(
+    session: Option<&str>,
+    action: Option<&str>,
+    event: Option<&str>,
+) -> (Option<String>, bool) {
+    if let Some(s) = session.map(str::trim).filter(|s| !s.is_empty()) {
+        // A director session — intent when it carries a journal `action`.
+        return (Some(short_session_tag(s)), action.is_some());
+    }
+    let name = event.or(action).unwrap_or("");
+    let lower = name.to_lowercase();
+    let role = if lower.contains("queen") || lower.contains("conductor") {
+        "queen"
+    } else if lower.contains("validator") {
+        "validator"
+    } else if lower.contains("reviewer") {
+        "reviewer"
+    } else if lower.contains("scout") {
+        "scout"
+    } else if lower.contains("worker") {
+        "worker"
+    } else if is_lifecycle_name(&lower) {
+        "daemon"
+    } else {
+        // Unknown shape — an honest label, never `?`.
+        "remote"
+    };
+    (Some(role.to_string()), false)
+}
+
 /// Parse an apiary `GET /v1/events` JSON body into dance-floor events. Pure over
 /// the response string so the merge is testable without a network. A malformed
 /// body yields zero events (best-effort ephemera, never breaks the floor).
@@ -2714,10 +2794,19 @@ pub fn parse_apiary_events(body: &str) -> Vec<LogEvent> {
     for e in resp.events {
         let ts = e.ts.as_deref().and_then(parse_log_ts);
         let received_at = e.received_at.as_deref().and_then(parse_log_ts);
-        let actor = e.session.as_deref().map(short_session_tag);
+        // Classify the actor from the event's shape. Remote rows used to render a
+        // bare `?` when they carried no `session` (runtime/lifecycle lines); the
+        // classifier maps every shape to an honest actor — a role where the name
+        // says so, a session tag for director intent, `daemon` for lifecycle
+        // plumbing, and `remote` as the last-resort label. Punctuation is never
+        // an actor.
+        let (actor, is_intent) = classify_apiary_actor(
+            e.session.as_deref(),
+            e.action.as_deref(),
+            e.event.as_deref(),
+        );
         // Two shapes ride the bus: intent lines carry `action`(+`detail`); runtime
         // lines carry `event`. Render either into the one event string.
-        let is_intent = e.action.is_some();
         let text = if let Some(action) = e.action {
             let detail = e.detail.unwrap_or_default();
             if detail.is_empty() { action } else { format!("{} — {}", action, detail) }
@@ -2785,6 +2874,66 @@ fn read_loop_config(loop_dir: &Path) -> std::collections::HashMap<String, String
         }
     }
     config
+}
+
+/// Config key naming this box's apiary identity. The portal-daemon writes it
+/// into `.loop/config.local.sh` (`BOX="morgan-lefay"`); it is the same string
+/// the daemon stamps onto every event it publishes to the apiary.
+const BOX_KEY: &str = "BOX";
+
+/// Resolve THIS box's apiary identity, lowercased. Config `BOX` wins (the value
+/// the daemon publishes under); absent that, fall back to the lowercased short
+/// hostname. `None` only when neither is available — then no self-filtering
+/// happens and the apiary echoes render (fail-open, never hide local truth by
+/// accident). Pure over the config map so the precedence is unit-testable.
+fn resolve_local_box(config: &std::collections::HashMap<String, String>) -> Option<String> {
+    if let Some(b) = config.get(BOX_KEY) {
+        let b = b.trim();
+        if !b.is_empty() {
+            return Some(b.to_lowercase());
+        }
+    }
+    short_hostname().map(|h| h.to_lowercase())
+}
+
+/// The short hostname (first dot-delimited component). Shells out to `hostname`
+/// — hive already spawns `curl`/`git`, so no new crate dep. `None` if the call
+/// fails or yields nothing.
+fn short_hostname() -> Option<String> {
+    let out = std::process::Command::new("hostname").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout);
+    let short = name.trim().split('.').next().unwrap_or("").trim();
+    if short.is_empty() {
+        None
+    } else {
+        Some(short.to_string())
+    }
+}
+
+/// Resolve this box's identity from the live `.loop` config plus hostname.
+fn local_box_identity() -> Option<String> {
+    resolve_local_box(&read_loop_config(Path::new(LOOP_CONFIG_DIR)))
+}
+
+/// Drop apiary rows that originated on THIS box. The apiary's render value is
+/// *other* boxes — this box renders itself from its own journals, so an event
+/// whose `box` equals our identity is a duplicate echo of a local row. Rows
+/// with no `box` (shouldn't occur for apiary payloads) and all rows when the
+/// local identity is unknown are kept (fail-open). Case-insensitive match.
+pub fn filter_local_box(events: Vec<LogEvent>, local_box: Option<&str>) -> Vec<LogEvent> {
+    let Some(local) = local_box else {
+        return events;
+    };
+    events
+        .into_iter()
+        .filter(|e| match &e.box_name {
+            Some(b) => !b.trim().eq_ignore_ascii_case(local),
+            None => true,
+        })
+        .collect()
 }
 
 /// A resolved apiary endpoint.
@@ -2937,6 +3086,36 @@ impl LogEvent {
     pub fn sort_ts(&self) -> Option<DateTime<Utc>> {
         self.received_at.or(self.ts)
     }
+
+    /// True when this event is a heartbeat ping. Heartbeats fuel the presence
+    /// strip's liveness but never render as feed rows (from any box) — at a
+    /// per-minute cadence across several boxes they would bury the real dance.
+    /// Matches the daemon's `heartbeat*` event/action names, case-insensitively.
+    pub fn is_heartbeat(&self) -> bool {
+        self.event
+            .as_deref()
+            .map(|e| e.to_lowercase().contains("heartbeat"))
+            .unwrap_or(false)
+    }
+}
+
+/// Split heartbeats out of a merged feed: returns the newest heartbeat timestamp
+/// (presence-strip fuel) and mutates `events` to drop every heartbeat row. One
+/// pass so the "fuel the strip, never the feed" split is a single decision over
+/// all sources (local journals + apiary), not per-source dialects.
+pub fn drain_heartbeats(events: &mut Vec<LogEvent>) -> Option<DateTime<Utc>> {
+    let mut newest: Option<DateTime<Utc>> = None;
+    events.retain(|e| {
+        if e.is_heartbeat() {
+            if let Some(ts) = e.sort_ts() {
+                newest = Some(newest.map_or(ts, |n| n.max(ts)));
+            }
+            false
+        } else {
+            true
+        }
+    });
+    newest
 }
 
 impl DanceFloorState {
@@ -3014,6 +3193,11 @@ impl DanceFloorState {
         // strip never renders a failed fetch as a deliberate local-only view.
         let apiary_status = match fetch_apiary_events(apiary_enabled) {
             ApiaryFetch::Ok(remote) => {
+                // Same-box suppression: the apiary echoes every box's events,
+                // including our own. This box renders itself from its local
+                // journals, so an apiary row stamped with our identity is a
+                // duplicate — drop it before it double-renders.
+                let remote = filter_local_box(remote, local_box_identity().as_deref());
                 events.extend(remote);
                 ApiaryStatus::Live
             }
@@ -3025,6 +3209,12 @@ impl DanceFloorState {
         // Collapse at-least-once redeliveries on `id` before sorting/capping, so
         // a replayed batch renders exactly once (braces to the apiary's belt).
         events = dedup_on_id(events);
+
+        // Heartbeats fuel the presence strip's liveness, never the feed. Drain
+        // them from the merged rows (all sources) and keep the newest timestamp
+        // so the strip's queen line can read "idle" instead of "none yet" when
+        // the loop is pinging but the queen hasn't run.
+        let last_heartbeat = drain_heartbeats(&mut events);
 
         // Interleave by the effective sort key: remote rows on server-stamped
         // `received_at` (skew-immune), local rows on box-local `ts`. None sorts
@@ -3043,10 +3233,11 @@ impl DanceFloorState {
         // Presence is computed from an unwindowed daemon.log scan + running.json,
         // never from `events` above (which is windowed to 30 min and can drop a
         // quiet class entirely). Same load cadence, one extra pass.
-        let presence = compute_actor_presence(
+        let mut presence = compute_actor_presence(
             daemon_log_path,
             Path::new(".loop/state/running.json"),
         );
+        presence.last_heartbeat = last_heartbeat;
 
         DanceFloorState { events, presence, apiary_status }
     }
@@ -6949,5 +7140,218 @@ some non-bracket junk line
         assert_eq!(fmt_short_age(120), "2m");
         assert_eq!(fmt_short_age(7200), "2h");
         assert_eq!(fmt_short_age(172800), "2d");
+    }
+
+    // ── apiary-view polish (hive-apiary-view-polish) ──────────────────────────
+
+    fn evt_box(box_name: &str) -> LogEvent {
+        LogEvent {
+            ts: Some(Utc::now()),
+            actor: Some("worker".to_string()),
+            event: Some("completed".to_string()),
+            box_name: Some(box_name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    // Fix 1: same-box suppression ------------------------------------------------
+
+    #[test]
+    fn resolve_local_box_prefers_config_lowercased() {
+        let mut cfg = std::collections::HashMap::new();
+        cfg.insert("BOX".to_string(), "Morgan-LeFay".to_string());
+        assert_eq!(resolve_local_box(&cfg).as_deref(), Some("morgan-lefay"));
+    }
+
+    #[test]
+    fn resolve_local_box_falls_back_to_hostname_when_no_config() {
+        // No BOX key → falls back to short hostname (some non-empty string on any
+        // real host). We only assert the fallback path runs; the exact hostname
+        // is environment-specific.
+        let cfg = std::collections::HashMap::new();
+        let resolved = resolve_local_box(&cfg);
+        if let Some(h) = &resolved {
+            assert_eq!(*h, h.to_lowercase(), "hostname fallback must be lowercased");
+        }
+    }
+
+    #[test]
+    fn filter_local_box_excludes_self_keeps_others() {
+        let events = vec![
+            evt_box("morgan-lefay"),
+            evt_box("lady-titania"),
+            evt_box("Morgan-LeFay"), // case-insensitive self match
+        ];
+        let kept = filter_local_box(events, Some("morgan-lefay"));
+        assert_eq!(kept.len(), 1, "only the other box survives");
+        assert_eq!(kept[0].box_name.as_deref(), Some("lady-titania"));
+    }
+
+    #[test]
+    fn filter_local_box_fail_open_when_identity_unknown() {
+        let events = vec![evt_box("morgan-lefay"), evt_box("lady-titania")];
+        let kept = filter_local_box(events, None);
+        assert_eq!(kept.len(), 2, "unknown identity keeps every row (fail-open)");
+    }
+
+    #[test]
+    fn filter_local_box_keeps_rows_without_box() {
+        let mut local_row = evt_box("ignored");
+        local_row.box_name = None;
+        let kept = filter_local_box(vec![local_row], Some("morgan-lefay"));
+        assert_eq!(kept.len(), 1, "a box-less row is never suppressed");
+    }
+
+    // Fix 2: actor classification for apiary rows -------------------------------
+
+    #[test]
+    fn classify_apiary_actor_mapping_table() {
+        // (session, action, event) → (expected actor, expected intent)
+        let cases: &[(Option<&str>, Option<&str>, Option<&str>, &str, bool)] = &[
+            // Director intent journal shapes: session tag + journal action.
+            (Some("titania"), Some("git push"), None, "titania", true),
+            (Some("titania"), Some("dispatch"), None, "titania", true),
+            (Some("titania"), Some("coordination"), None, "titania", true),
+            // A session with no action is still a session actor, not intent.
+            (Some("titania"), None, Some("completed"), "titania", false),
+            // Lifecycle plumbing (no session) → daemon.
+            (None, None, Some("dispatched"), "daemon", false),
+            (None, None, Some("completed"), "daemon", false),
+            (None, None, Some("approved"), "daemon", false),
+            (None, None, Some("merged"), "daemon", false),
+            (None, None, Some("superseded"), "daemon", false),
+            (None, None, Some("heartbeat"), "daemon", false),
+            (None, None, Some("wake"), "daemon", false),
+            (None, None, Some("over_budget"), "daemon", false),
+            (None, None, Some("lane_mutex_hold"), "daemon", false),
+            (None, None, Some("repeat_failure_escalated"), "daemon", false),
+            (None, None, Some("daemon:startup_repair"), "daemon", false),
+            // Role-named runtime events → that role.
+            (None, None, Some("QUEEN #4: invoking"), "queen", false),
+            (None, None, Some("worker spawned"), "worker", false),
+            (None, None, Some("validator cycle 2"), "validator", false),
+            (None, None, Some("reviewer verdict"), "reviewer", false),
+            (None, None, Some("scout observation"), "scout", false),
+            // Unknown shape → honest `remote`, never `?`.
+            (None, None, Some("mystery blob"), "remote", false),
+            (None, None, None, "remote", false),
+        ];
+        for (session, action, event, want_actor, want_intent) in cases {
+            let (actor, intent) = classify_apiary_actor(*session, *action, *event);
+            assert_eq!(
+                actor.as_deref(),
+                Some(*want_actor),
+                "shape (s={session:?}, a={action:?}, e={event:?}) actor"
+            );
+            assert_eq!(
+                intent, *want_intent,
+                "shape (s={session:?}, a={action:?}, e={event:?}) intent"
+            );
+            assert_ne!(actor.as_deref(), Some("?"), "no shape may render `?`");
+        }
+    }
+
+    #[test]
+    fn parse_apiary_events_never_yields_none_actor() {
+        // A runtime lifecycle row with no session used to land actor=None → `?`.
+        let body = r#"{"events":[
+            {"event":"completed","box":"lady-titania","brief":"ft-005"},
+            {"action":"git push","session":"titania","box":"lady-titania"},
+            {"event":"mystery","box":"lady-titania"}
+        ]}"#;
+        let events = parse_apiary_events(body);
+        assert_eq!(events.len(), 3);
+        for e in &events {
+            assert!(e.actor.is_some(), "every apiary row carries an actor");
+        }
+        assert_eq!(events[0].actor.as_deref(), Some("daemon"));
+        assert_eq!(events[1].actor.as_deref(), Some("titania"));
+        assert!(events[1].intent, "journal-action row is intent-styled");
+        assert_eq!(events[2].actor.as_deref(), Some("remote"));
+    }
+
+    // Fix 3: heartbeats fuel the strip, never the feed --------------------------
+
+    #[test]
+    fn is_heartbeat_matches_heartbeat_events_only() {
+        let hb = LogEvent {
+            event: Some("heartbeat #12".to_string()),
+            ..Default::default()
+        };
+        let not_hb = LogEvent {
+            event: Some("completed".to_string()),
+            ..Default::default()
+        };
+        assert!(hb.is_heartbeat());
+        assert!(!not_hb.is_heartbeat());
+    }
+
+    #[test]
+    fn drain_heartbeats_removes_from_feed_and_returns_newest_fuel() {
+        let t1: DateTime<Utc> = "2026-04-30T10:00:00Z".parse().unwrap();
+        let t2: DateTime<Utc> = "2026-04-30T10:01:00Z".parse().unwrap();
+        let mut events = vec![
+            LogEvent {
+                ts: Some(t1),
+                event: Some("heartbeat".to_string()),
+                ..Default::default()
+            },
+            LogEvent {
+                ts: Some(Utc::now()),
+                event: Some("completed".to_string()),
+                actor: Some("worker".to_string()),
+                ..Default::default()
+            },
+            LogEvent {
+                // remote heartbeat: keyed on received_at via sort_ts
+                received_at: Some(t2),
+                event: Some("heartbeat".to_string()),
+                box_name: Some("lady-titania".to_string()),
+                ..Default::default()
+            },
+        ];
+        let fuel = drain_heartbeats(&mut events);
+        // Feed: heartbeats gone, real row stays.
+        assert_eq!(events.len(), 1, "heartbeats never render as feed rows");
+        assert_eq!(events[0].event.as_deref(), Some("completed"));
+        // Fuel: newest heartbeat timestamp survives for the presence strip.
+        assert_eq!(fuel, Some(t2), "newest heartbeat fuels the strip");
+    }
+
+    // Fix 4: presence strip queen detection from real QUEEN log lines -----------
+
+    #[test]
+    fn parse_daemon_log_recognizes_queen_lines() {
+        for line in [
+            "[2026-04-21 11:00:00] QUEEN #5: invoking (no_active)",
+            "[2026-04-21 11:00:05] QUEEN #5: complete (12s)",
+            "[2026-04-21 11:00:06] QUEEN: escalate.json resolved — resetting dedup",
+        ] {
+            let (_, actor, _) = parse_daemon_log_line(line)
+                .unwrap_or_else(|| panic!("QUEEN line must parse: {line}"));
+            assert_eq!(actor, "conductor", "QUEEN normalizes to the queen slot");
+        }
+    }
+
+    #[test]
+    fn scan_daemon_last_seen_tracks_queen_from_real_log_line() {
+        // A real daemon.log queen turn must feed the presence strip's queen slot.
+        // Build the line with a fresh local timestamp so the tz-aware parse lands
+        // inside the active window (the daemon writes local time, no TZ suffix).
+        let now_local = chrono::Local::now();
+        let line = format!(
+            "[{}] QUEEN #7: invoking (no_active)",
+            now_local.format("%Y-%m-%d %H:%M:%S")
+        );
+        let (queen, _, _) = scan_daemon_last_seen([line]);
+        assert!(
+            queen.last_seen.is_some(),
+            "QUEEN log line must populate the queen last-seen"
+        );
+        assert_eq!(
+            presence_status(queen.last_seen, Utc::now(), 300),
+            PresenceStatus::Active,
+            "a fresh QUEEN turn reads as active, not none-yet"
+        );
     }
 }
