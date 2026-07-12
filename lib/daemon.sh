@@ -2922,7 +2922,7 @@ except Exception as e:
     #
     # Interaction with slots_available (issue #51): the two are disjoint by
     # active-count — queue_stuck requires an EMPTY board (_QS_ACTIVE == 0),
-    # while a slots_available wake only injects when trigger == NONE, which
+    # while a slots_available wake injects whenever no queen would otherwise fire (trigger NONE, or the live trigger dedup-suppressed — fix-51c), which
     # requires an active-but-running brief (active >= 1; an empty board is
     # `no_active`, never NONE). So `_SLOTS_BRIEF` is always empty on a
     # queue_stuck-eligible tick. The `-z "$_SLOTS_BRIEF"` clause makes that
