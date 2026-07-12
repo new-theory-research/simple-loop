@@ -9,7 +9,7 @@ Human-gate: review
 Target repo: ScavieFae/simple-loop master
 Parallel-safe: false
 Program: harness-improvements
-Issues: ["#15", "#27", "#39", "#58", "#59"]
+Issues: ["#15", "#27", "#39", "#58", "#59", "#71"]
 Depends-on: none
 Tags: [harness, blocked, parked, escalation, lifecycle, busy-loop]
 ---
