@@ -26,5 +26,18 @@ site/
 __pycache__/
 .loop/state/progress.json
 .loop/state/runtime-events.jsonl
-.claude/
+# .claude/ is local session state — ignore all of it EXCEPT the committed
+# harness project settings (brief-165: the vendored intent hooks live here).
+.claude/*
+!.claude/settings.json
 .loop/state/hive.stderr.log
+
+# brief-165 presence plane — disposable watchable-layer state, never committed.
+# The intent journal + all cursors are ephemeral (same disposable-cursor shape).
+.loop/state/intent-journal.jsonl
+.loop/state/intent-cursors/
+.loop/state/hum-cursors/
+# apiary local ring-buffer store (loss-tolerant by contract).
+apiary.db
+apiary.db-wal
+apiary.db-shm

@@ -107,6 +107,32 @@ cp "$SCRIPT_DIR/templates/brief-template.md" "$INSTALL_DIR/templates/"
 cp "$SCRIPT_DIR/templates/prompts/"*.md "$INSTALL_DIR/templates/prompts/"
 cp "$SCRIPT_DIR/templates/com.scaviefae.simpleloop.plist" "$INSTALL_DIR/templates/"
 
+# brief-165 presence plane — vendor the intent hooks + the hum plist template +
+# the presence-plane services (hum shipper, apiary bus) into the install so the
+# harness carries them, not portal. Models the core/skills copy loop above.
+# Test files stay source-only (same rule as lib/).
+if [ -d "$SCRIPT_DIR/scripts" ]; then
+    mkdir -p "$INSTALL_DIR/scripts"
+    for _s in "$SCRIPT_DIR"/scripts/intent-journal.py \
+              "$SCRIPT_DIR"/scripts/intent-hook-record.py \
+              "$SCRIPT_DIR"/scripts/intent-hook-inject.py; do
+        [ -f "$_s" ] || continue
+        cp "$_s" "$INSTALL_DIR/scripts/"
+        echo "  Intent hook: $(basename "$_s")"
+    done
+fi
+if [ -d "$SCRIPT_DIR/hum" ]; then
+    mkdir -p "$INSTALL_DIR/hum"
+    cp "$SCRIPT_DIR/hum/hum.py" "$INSTALL_DIR/hum/" 2>/dev/null || true
+    cp "$SCRIPT_DIR/hum/com.scaviefae.hum.plist" "$INSTALL_DIR/templates/" 2>/dev/null || true
+    echo "  Presence: hum shipper + com.scaviefae.hum.plist template"
+fi
+if [ -d "$SCRIPT_DIR/apiary" ]; then
+    mkdir -p "$INSTALL_DIR/apiary"
+    cp "$SCRIPT_DIR/apiary/apiary.py" "$INSTALL_DIR/apiary/" 2>/dev/null || true
+    echo "  Presence: apiary bus (local-run; deploy is Mattie's gate)"
+fi
+
 # Copy docs (conventions, operating docs, templates used by `loop init`)
 if [ -d "$SCRIPT_DIR/docs" ]; then
     cp -r "$SCRIPT_DIR/docs" "$INSTALL_DIR/docs"

@@ -2213,6 +2213,7 @@ impl CellsState {
 
 // ── DanceFloorState ───────────────────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct LogEvent {
     pub ts: Option<DateTime<Utc>>,
     pub actor: Option<String>,
@@ -2227,6 +2228,17 @@ pub struct LogEvent {
     /// so the dance floor keys the intent color off this flag rather than the
     /// actor string (which would otherwise fall through to the muted default).
     pub intent: bool,
+    /// brief-165 presence plane: the box a remote event came from (`lady-titania`,
+    /// …). `None` = a local row (this box). Lets the floor say *which* box a
+    /// remote worker is on.
+    pub box_name: Option<String>,
+    /// Server-stamped arrival time from the apiary. Cross-box interleaving and
+    /// remote staleness key on this (skew-immune), never on box-local `ts`.
+    /// `None` for local rows.
+    pub received_at: Option<DateTime<Utc>>,
+    /// Stable event identity `box:journal:offset`. Hive collapses duplicates on
+    /// this (at-least-once delivery can replay a batch). `None` for local rows.
+    pub id: Option<String>,
 }
 
 pub struct DanceFloorState {
@@ -2458,6 +2470,7 @@ pub fn load_daemon_log_events(log_path: &Path, max_age_secs: i64) -> Vec<LogEven
             malformed: false,
             from_daemon_log: true,
             intent: false,
+            ..Default::default()
         });
     }
     events
@@ -2496,12 +2509,28 @@ const INTENT_JOURNALS_ENV: &str = "HIVE_INTENT_JOURNALS";
 /// One line of the intent journal (portal `scripts/intent-journal.py`,
 /// `wiki/specs/harness-coordination.md` §4): `{ts, session, action, detail}`.
 /// A director session appends one line before a collision-prone action.
+///
+/// brief-165 presence plane: the line gains the additive `{box, lane, brief}`
+/// fields (spec §4's deferred richer shape — `session` *is* the spec's
+/// `director_id`, `brief` is the concrete `refs`, `box` is genuinely new). When
+/// an event arrives via the apiary it also carries `received_at` (server-stamped
+/// on ingest) and `id` (`box:journal:offset`). All new fields are `Option`, so
+/// old lines and local single-box runs parse byte-for-byte unchanged.
 #[derive(Deserialize)]
 struct RawIntentLine {
     ts: Option<String>,
     session: Option<String>,
     action: Option<String>,
     detail: Option<String>,
+    #[serde(rename = "box")]
+    box_name: Option<String>,
+    // `lane` is parsed for byte-compat with the richer schema and forward use;
+    // the floor does not yet render a lane column (v0 display-only limitation).
+    #[allow(dead_code)]
+    lane: Option<String>,
+    brief: Option<String>,
+    received_at: Option<String>,
+    id: Option<String>,
 }
 
 /// Shorten a session tag for the actor column: the first 8 chars when it looks
@@ -2588,17 +2617,177 @@ pub fn load_intent_journal_events(path: &Path) -> Vec<LogEvent> {
         } else {
             format!("{} — {}", action, detail)
         };
+        let received_at = entry.received_at.as_deref().and_then(parse_log_ts);
         events.push(LogEvent {
             ts,
             actor,
             event: Some(event),
-            brief: None,
+            brief: entry.brief,
             malformed: false,
             from_daemon_log: false,
             intent: true,
+            box_name: entry.box_name,
+            received_at,
+            id: entry.id,
         });
     }
     events
+}
+
+// ── Apiary presence source (brief-165 piece 4) ────────────────────────────────
+
+/// Env naming the apiary base URL (e.g. `http://127.0.0.1:8787`). Absent =
+/// feature off: zero events, zero errors (mirrors the absent-journal posture).
+const APIARY_URL_ENV: &str = "HIVE_APIARY_URL";
+/// Env carrying the shared per-box token. Defaults to the dev token so a local
+/// two-box run works out of the box; production sets it explicitly.
+const APIARY_TOKEN_ENV: &str = "HIVE_APIARY_TOKEN";
+/// A remote row goes DEAD (never green) once its server-stamped `received_at` is
+/// older than this cadence. Silence on another box = DEAD, not busy.
+const REMOTE_DEAD_AFTER_SECS: i64 = 90;
+
+/// One event as the apiary hands it back: the original presence fields plus the
+/// server-stamped `received_at`. Every field optional — the apiary is dumb
+/// storage and hive tolerates any shape.
+#[derive(Deserialize)]
+struct ApiaryEvent {
+    ts: Option<String>,
+    session: Option<String>,
+    action: Option<String>,
+    detail: Option<String>,
+    event: Option<String>,
+    #[serde(rename = "box")]
+    box_name: Option<String>,
+    #[allow(dead_code)]
+    lane: Option<String>,
+    brief: Option<String>,
+    received_at: Option<String>,
+    id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ApiaryResponse {
+    events: Vec<ApiaryEvent>,
+}
+
+/// Liveness of a remote row, keyed on server-clock `received_at`. There is no
+/// "busy" state across boxes: silence past cadence and a missing stamp are both
+/// DEAD. Box-local `ts` clock skew never enters this decision.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoteLiveness {
+    /// `received_at` within cadence.
+    Live,
+    /// Seen, but older than cadence — coral, never green.
+    Dead,
+    /// No server stamp at all — DEAD, not green.
+    Missing,
+}
+
+/// Classify a remote row's liveness from its `received_at` relative to `now`.
+/// Pure so the DEAD-not-green rule is unit-testable against a fixed clock.
+pub fn remote_liveness(received_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> RemoteLiveness {
+    match received_at {
+        None => RemoteLiveness::Missing,
+        Some(ra) => {
+            let age = (now - ra).num_seconds();
+            if age <= REMOTE_DEAD_AFTER_SECS {
+                RemoteLiveness::Live
+            } else {
+                RemoteLiveness::Dead
+            }
+        }
+    }
+}
+
+/// Parse an apiary `GET /v1/events` JSON body into dance-floor events. Pure over
+/// the response string so the merge is testable without a network. A malformed
+/// body yields zero events (best-effort ephemera, never breaks the floor).
+pub fn parse_apiary_events(body: &str) -> Vec<LogEvent> {
+    let Ok(resp) = serde_json::from_str::<ApiaryResponse>(body) else {
+        return vec![];
+    };
+    let mut out = Vec::with_capacity(resp.events.len());
+    for e in resp.events {
+        let ts = e.ts.as_deref().and_then(parse_log_ts);
+        let received_at = e.received_at.as_deref().and_then(parse_log_ts);
+        let actor = e.session.as_deref().map(short_session_tag);
+        // Two shapes ride the bus: intent lines carry `action`(+`detail`); runtime
+        // lines carry `event`. Render either into the one event string.
+        let is_intent = e.action.is_some();
+        let text = if let Some(action) = e.action {
+            let detail = e.detail.unwrap_or_default();
+            if detail.is_empty() { action } else { format!("{} — {}", action, detail) }
+        } else {
+            e.event.unwrap_or_default()
+        };
+        out.push(LogEvent {
+            ts,
+            actor,
+            event: Some(text),
+            brief: e.brief,
+            malformed: false,
+            from_daemon_log: false,
+            intent: is_intent,
+            box_name: e.box_name,
+            received_at,
+            id: e.id,
+        });
+    }
+    out
+}
+
+/// Fetch presence events from the apiary if `HIVE_APIARY_URL` is set. Best-effort
+/// over `curl` (hive already shells out to git/kill; zero new crate deps). Any
+/// failure — unset env, unreachable service, non-JSON — yields zero events and
+/// no error: the apiary path degrades to invisible, never to broken.
+pub fn load_apiary_events() -> Vec<LogEvent> {
+    let Ok(base) = std::env::var(APIARY_URL_ENV) else {
+        return vec![]; // feature off
+    };
+    if base.trim().is_empty() {
+        return vec![];
+    }
+    let token = std::env::var(APIARY_TOKEN_ENV).unwrap_or_else(|_| "dev-token".to_string());
+    // since=0: pull the ring and let hive dedup on id + window to 500. v0 keeps
+    // hive stateless; the bounded buffer keeps the payload sane.
+    let url = format!("{}/v1/events?since=0", base.trim_end_matches('/'));
+    let output = std::process::Command::new("curl")
+        .args(["-s", "--max-time", "3", "-H", &format!("X-Apiary-Token: {}", token), &url])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            parse_apiary_events(&String::from_utf8_lossy(&o.stdout))
+        }
+        _ => vec![],
+    }
+}
+
+/// Collapse duplicate rows on `id`, keeping the first occurrence. Rows without an
+/// `id` (local rows) are never deduped against each other. This is the braces to
+/// the apiary's optional belt: at-least-once delivery can replay a batch, so hive
+/// renders each `id` exactly once regardless of what the apiary stored.
+pub fn dedup_on_id(events: Vec<LogEvent>) -> Vec<LogEvent> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(events.len());
+    for ev in events {
+        if let Some(id) = &ev.id {
+            if !seen.insert(id.clone()) {
+                continue; // duplicate id — already rendered
+            }
+        }
+        out.push(ev);
+    }
+    out
+}
+
+impl LogEvent {
+    /// Sort key for interleaving: cross-box rows order by the server-stamped
+    /// `received_at` (skew-immune); a local row (no server stamp) falls back to
+    /// its box-local `ts`. Keeps within-box order on `ts`, cross-box on
+    /// `received_at`, exactly as the presence-plane spec requires.
+    pub fn sort_ts(&self) -> Option<DateTime<Utc>> {
+        self.received_at.or(self.ts)
+    }
 }
 
 impl DanceFloorState {
@@ -2634,6 +2823,7 @@ impl DanceFloorState {
                             malformed: false,
                             from_daemon_log: false,
                             intent: false,
+                            ..Default::default()
                         });
                     }
                     Err(_) => {
@@ -2646,6 +2836,7 @@ impl DanceFloorState {
                             malformed: true,
                             from_daemon_log: false,
                             intent: false,
+                            ..Default::default()
                         });
                     }
                 }
@@ -2663,8 +2854,19 @@ impl DanceFloorState {
             events.extend(load_intent_journal_events(&path));
         }
 
-        // Sort by timestamp (None timestamps sort last), then cap
-        events.sort_by(|a, b| match (a.ts, b.ts) {
+        // brief-165: remote presence via the apiary. Absent HIVE_APIARY_URL =
+        // feature off (zero events). Remote rows carry a box tag + server stamp
+        // and land in the SAME merge — no new render path.
+        events.extend(load_apiary_events());
+
+        // Collapse at-least-once redeliveries on `id` before sorting/capping, so
+        // a replayed batch renders exactly once (braces to the apiary's belt).
+        events = dedup_on_id(events);
+
+        // Interleave by the effective sort key: remote rows on server-stamped
+        // `received_at` (skew-immune), local rows on box-local `ts`. None sorts
+        // last. Then cap to the window.
+        events.sort_by(|a, b| match (a.sort_ts(), b.sort_ts()) {
             (Some(at), Some(bt)) => at.cmp(&bt),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -4135,6 +4337,130 @@ mod tests {
     }
 
     #[test]
+    fn intent_journal_line_roundtrips_presence_fields() {
+        // brief-165: a line carrying the additive {box, lane, brief, received_at,
+        // id} fields parses them onto the LogEvent (apiary-sourced remote row).
+        let line = br#"{"ts":"2026-07-11T10:00:00Z","session":"titania","action":"dispatch","detail":"worker brief-165","box":"lady-titania","lane":"harness-improvements","brief":"brief-165","received_at":"2026-07-11T10:00:02Z","id":"lady-titania:intent-journal.jsonl:512"}
+"#;
+        let path = intent_tempfile("presence", line);
+        let events = load_intent_journal_events(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.box_name.as_deref(), Some("lady-titania"));
+        assert_eq!(ev.brief.as_deref(), Some("brief-165"));
+        assert_eq!(ev.id.as_deref(), Some("lady-titania:intent-journal.jsonl:512"));
+        assert!(ev.received_at.is_some(), "server stamp parses for ordering");
+    }
+
+    #[test]
+    fn intent_journal_old_line_parses_without_presence_fields() {
+        // Byte-compatibility: a pre-165 line ({ts,session,action,detail} only)
+        // still parses; the new fields are simply None (feature additive-off).
+        let line = br#"{"ts":"2026-04-21T17:00:00Z","session":"scav","action":"push","detail":"branch X"}
+"#;
+        let path = intent_tempfile("oldline", line);
+        let events = load_intent_journal_events(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert!(ev.box_name.is_none());
+        assert!(ev.received_at.is_none());
+        assert!(ev.id.is_none());
+        assert_eq!(ev.actor.as_deref(), Some("scav"));
+    }
+
+    #[test]
+    fn apiary_parse_two_boxes_interleave_and_tag_box() {
+        // brief-165 money path: a GET body with rows from two boxes parses into
+        // dance-floor events, each tagged with its box, ready to interleave.
+        let body = r#"{"events":[
+            {"ts":"2026-07-11T10:00:00Z","session":"titania","action":"dispatch","detail":"worker b-1","box":"lady-titania","brief":"brief-1","received_at":"2026-07-11T10:00:01Z","id":"lady-titania:j:0","cursor":1},
+            {"ts":"2026-07-11T10:00:02Z","event":"merged","box":"scaviefae","brief":"brief-2","received_at":"2026-07-11T10:00:03Z","id":"scaviefae:j:0","cursor":2}
+        ]}"#;
+        let events = parse_apiary_events(body);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].box_name.as_deref(), Some("lady-titania"));
+        assert!(events[0].intent, "action-shaped row is intent");
+        assert_eq!(events[1].box_name.as_deref(), Some("scaviefae"));
+        assert!(!events[1].intent, "event-shaped row is not intent");
+        assert_eq!(events[1].event.as_deref(), Some("merged"));
+        assert!(events[0].received_at.is_some());
+    }
+
+    #[test]
+    fn apiary_parse_malformed_body_yields_zero() {
+        assert_eq!(parse_apiary_events("not json").len(), 0);
+        assert_eq!(parse_apiary_events("{}").len(), 0); // no `events` key
+    }
+
+    #[test]
+    fn dedup_on_id_collapses_replays_keeps_local_untouched() {
+        // At-least-once replay: same id twice → one row. Local rows (id None) are
+        // never deduped against each other.
+        let mk = |id: Option<&str>, text: &str| LogEvent {
+            ts: None, actor: None, event: Some(text.to_string()), brief: None,
+            malformed: false, from_daemon_log: false, intent: false,
+            box_name: None, received_at: None, id: id.map(String::from),
+        };
+        let input = vec![
+            mk(Some("box:j:0"), "first"),
+            mk(Some("box:j:0"), "replay"),   // dup id → dropped
+            mk(None, "local a"),
+            mk(None, "local b"),             // both local rows survive
+        ];
+        let out = dedup_on_id(input);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].event.as_deref(), Some("first")); // first occurrence kept
+        assert_eq!(out[2].event.as_deref(), Some("local b"));
+    }
+
+    #[test]
+    fn remote_liveness_dead_not_green_on_silence() {
+        let now = Utc::now();
+        // Fresh stamp → Live.
+        assert_eq!(
+            remote_liveness(Some(now - chrono::Duration::seconds(10)), now),
+            RemoteLiveness::Live
+        );
+        // Silence past cadence → DEAD (never green).
+        assert_eq!(
+            remote_liveness(Some(now - chrono::Duration::seconds(600)), now),
+            RemoteLiveness::Dead
+        );
+        // No server stamp → DEAD (Missing), not green.
+        assert_eq!(remote_liveness(None, now), RemoteLiveness::Missing);
+    }
+
+    #[test]
+    fn sort_ts_prefers_received_at_for_remote_falls_back_to_ts_local() {
+        let ts = parse_log_ts("2026-07-11T10:00:00Z");
+        let ra = parse_log_ts("2026-07-11T09:00:00Z");
+        let remote = LogEvent {
+            ts, actor: None, event: None, brief: None, malformed: false,
+            from_daemon_log: false, intent: false, box_name: Some("b".into()),
+            received_at: ra, id: None,
+        };
+        // Remote row sorts on received_at (09:00), not box-local ts (10:00).
+        assert_eq!(remote.sort_ts(), ra);
+        let local = LogEvent {
+            ts, actor: None, event: None, brief: None, malformed: false,
+            from_daemon_log: false, intent: false, box_name: None,
+            received_at: None, id: None,
+        };
+        assert_eq!(local.sort_ts(), ts); // local falls back to ts
+    }
+
+    #[test]
+    fn apiary_source_off_when_env_unset() {
+        // Feature off: no HIVE_APIARY_URL → zero events, zero errors.
+        std::env::remove_var("HIVE_APIARY_URL");
+        assert_eq!(load_apiary_events().len(), 0);
+    }
+
+    #[test]
     fn intent_journal_paths_merges_default_and_env_list() {
         // No env → just the in-project default.
         let just_default = intent_journal_paths_from(None);
@@ -4228,11 +4554,11 @@ mod tests {
                     let ts = entry.ts_str().and_then(parse_log_ts);
                     let actor = entry.derived_actor();
                     let event_msg = entry.event.or(entry.action);
-                    events.push(LogEvent { ts, actor, event: event_msg, brief: entry.brief, malformed: false, from_daemon_log: false, intent: false });
+                    events.push(LogEvent { ts, actor, event: event_msg, brief: entry.brief, malformed: false, from_daemon_log: false, intent: false, ..Default::default() });
                 }
                 Err(_) => {
                     let preview = line.chars().take(60).collect::<String>();
-                    events.push(LogEvent { ts: None, actor: None, event: Some(format!("[malformed] {}", preview)), brief: None, malformed: true, from_daemon_log: false, intent: false });
+                    events.push(LogEvent { ts: None, actor: None, event: Some(format!("[malformed] {}", preview)), brief: None, malformed: true, from_daemon_log: false, intent: false, ..Default::default() });
                 }
             }
         }
