@@ -124,9 +124,13 @@ else
     fail "THROTTLE full → wake fired (throttle gate should have closed)"
 fi
 
-# ── Case 4: draining solo head → no wake ─────────────────────────────────────
+# ── Case 4: draining UNLABELED solo head → no wake ───────────────────────────
+# An unlabeled solo head keeps legacy single-slot semantics — it genuinely needs
+# the board to drain, so it suppresses the labeled brief behind it. (A LABELED
+# cross-lane solo head would itself be dispatchable under the #74 cross-lane
+# rule — the correct new behavior — so the drain test uses an unlabeled head.)
 P="$TMP/c4"; make_project "$P" 3 "SOLO_DRAIN_AFTER_SECS=1"
-add_card "$P" capture-001 queued capture false capture/x
+add_card "$P" solo-001 queued "" false misc/x
 add_card "$P" fleets-002 queued fleets true fleets/y
 set_running "$P" '[{"brief":"serve-009","branch":"serve-009","parallel_safe":true,"edit_surface":["serving/z"]}]'
 # Backdate the commit so the solo head reads as past the drain threshold.
@@ -134,9 +138,30 @@ git -C "$P" add -A
 GIT_AUTHOR_DATE="2020-01-01T00:00:00" GIT_COMMITTER_DATE="2020-01-01T00:00:00" \
     git -C "$P" commit -qm cards >/dev/null 2>&1
 if [ -z "$(slots_out "$P" | sed -n 1p)" ]; then
-    pass "draining solo head at queue head → no wake (solo_drain suppresses slot-filling)"
+    pass "draining unlabeled solo head at queue head → no wake (solo_drain suppresses slot-filling)"
 else
     fail "draining solo head → wake fired (solo_drain should suppress it)"
+fi
+
+# ── Case 4b: serving stacks the queue head, cross-lane no-flag brief wakes ────
+# Fix-51b: four serving briefs stack the queue head with the serving lane HELD
+# by an active brief; behind them a finetune brief with Parallel-safe:false
+# (the single-slot default). Per-lane head scan skips the serving heads (mutex),
+# and the #74 cross-lane rule admits ft-013 despite no Parallel-safe → it wakes.
+P="$TMP/c4b"; make_project "$P" 3
+add_card "$P" serve-009 active serving true serving/
+add_card "$P" serve-005 queued serving true serving/5
+add_card "$P" serve-006 queued serving true serving/6
+add_card "$P" serve-007 queued serving true serving/7
+add_card "$P" serve-008 queued serving true serving/8
+add_card "$P" ft-013 queued finetune false finetune/
+set_running "$P" '[{"brief":"serve-009","branch":"serve-009","program":"serving","parallel_safe":true,"edit_surface":["serving/"]}]'
+commit_cards "$P"
+CAND="$(slots_out "$P" | sed -n 1p)"
+if [ "$CAND" = "ft-013" ]; then
+    pass "serving stacks the head, lane held → cross-lane no-flag ft-013 wakes (starvation + #74)"
+else
+    fail "cross-lane no-flag brief behind a stacked lane → expected ft-013, got '$CAND'"
 fi
 
 # ── Dedup decision (mirrors lib/daemon.sh Phase 1.5) ─────────────────────────

@@ -166,8 +166,14 @@ def explain_dispatchability(project_dir, brief_id, running=None, lane=None):
                                 f"lane {program!r} not in daemon roster {roster!r}"))
 
     # ── 3. parallel_safe (evaluated against the live board) ──────────
+    # Reuses actions.concurrency_blocker — the EXACT gate dispatch() applies —
+    # so this green is the daemon's dispatch-green. Cross-lane rule (Mattie
+    # 2026-07-11): a labeled candidate whose Program: differs from every active
+    # brief's lane is admitted without Parallel-safe (the lane mutex is the
+    # safety); declared edit-surface collisions still refuse cross-lane.
     parallel_safe, edit_surface = _actions.parse_concurrency_frontmatter(card_path)
     active = running.get("active", [])
+    program = _queue._parse_card_program(card_path) if os.path.isfile(card_path) else ""
     if not active:
         if parallel_safe:
             checks.append(Check("parallel_safe", True,
@@ -175,24 +181,30 @@ def explain_dispatchability(project_dir, brief_id, running=None, lane=None):
         else:
             checks.append(Check("parallel_safe", True,
                                 "Parallel-safe absent — defaults false (single slot); board empty, dispatchable"))
-    elif not parallel_safe:
-        checks.append(Check("parallel_safe", False,
-                            f"Parallel-safe absent — defaults false (single slot); {len(active)} brief(s) active → blocked by {active[0].get('brief','?')}"))
     else:
-        block = None
-        for entry in active:
-            if not entry.get("parallel_safe", False):
-                block = ("active brief not parallel-safe", entry.get("brief", "?"))
-                break
-            if _actions.edit_surfaces_overlap(edit_surface, entry.get("edit_surface", [])):
-                block = ("edit-surface overlap", entry.get("brief", "?"))
-                break
-        if block:
+        verdict = _actions.concurrency_blocker(
+            project_dir, program, parallel_safe, edit_surface, active)
+        norm = (program or "").strip().lower()
+        cross_lane = bool(norm) and all(
+            _actions._entry_program(project_dir, e) != norm for e in active)
+        if verdict is None:
+            if cross_lane:
+                checks.append(Check("parallel_safe", True,
+                                    f"cross-lane ({program!r}) vs active board — "
+                                    "lane mutex is the safety; surfaces disjoint"))
+            else:
+                checks.append(Check("parallel_safe", True,
+                                    "Parallel-safe: true — no edit-surface overlap with active board"))
+        elif verdict["reason"] == "new_brief_not_parallel_safe":
             checks.append(Check("parallel_safe", False,
-                                f"Parallel-safe: true but {block[0]} with active {block[1]}"))
+                                f"Parallel-safe absent — defaults false (single slot); "
+                                f"{len(active)} brief(s) active → blocked by {verdict['blocked_by']}"))
         else:
-            checks.append(Check("parallel_safe", True,
-                                "Parallel-safe: true — no edit-surface overlap with active board"))
+            phrase = ("edit-surface overlap" if verdict["reason"] == "edit_surface_overlap"
+                      else "active brief not parallel-safe")
+            prefix = "cross-lane" if verdict["cross_lane"] else "Parallel-safe: true"
+            checks.append(Check("parallel_safe", False,
+                                f"{prefix} but {phrase} with active {verdict['blocked_by']}"))
 
     # ── 4. depends_on (the enforcer's exact verdict) ─────────────────
     depends_on, merged_ids, unmet = _actions.depends_on_verdict(project_dir, card_rel)
@@ -316,7 +328,7 @@ def explain_dispatchability(project_dir, brief_id, running=None, lane=None):
     return checks
 
 
-def slots_available_candidate(project_dir, running=None, lane=None, cap=3):
+def slots_available_candidate(project_dir, running=None, lane=None, cap=8):
     """Pure wake-check for the daemon's slots_available trigger (issue #51).
 
     Return the brief_id of the first cross-lane dispatchable candidate, or ""
@@ -334,14 +346,51 @@ def slots_available_candidate(project_dir, running=None, lane=None, cap=3):
     A brief counts only when EVERY explain_dispatchability check passes, so all
     of these hold by construction — no separate re-derivation.
 
-    Cost is bounded: enumerate is lane-scoped and cheap, and at most `cap`
-    queue-head candidates are evaluated (short-circuits on the first green).
+    Per-lane head scan (fix-51b): evaluating the first N OVERALL queue
+    candidates lets ONE lane stacking the queue head starve every other lane's
+    candidacy (tonight's receipt: four serving briefs at the queue head hid a
+    dispatchable capture brief at position ~5). Instead, group candidates by
+    Program: lane, take each DISTINCT lane's HEAD (only the head of a lane can
+    dispatch — the lane mutex serializes the rest), and evaluate those. Lanes
+    already held by an active brief are skipped by a cheap mutex pre-filter
+    (their head can never dispatch). Unlabeled candidates form their own
+    pseudo-lane, evaluated last (they keep legacy surface-based semantics). The
+    first full-green head wins. Bounded by `cap` distinct heads (naturally
+    small — the number of distinct lanes).
     """
     running = _load_running(project_dir, running)
     lane_spec = _resolve_lane(project_dir, lane)
     candidates = _queue.enumerate_dispatchable(
         project_dir, running=running, lane=lane_spec)
-    for cand in candidates[:cap]:
+
+    active = running.get("active", [])
+    active_lanes = {_actions._entry_program(project_dir, e) for e in active}
+
+    lane_heads = []          # labeled-lane heads, in queue order of appearance
+    unlabeled_head = None
+    seen_lanes = set()
+    for cand in candidates:
+        card_path = os.path.join(
+            project_dir, "wiki", "briefs", "cards", cand["brief"], "index.md")
+        program = (_queue._parse_card_program(card_path) or "").strip().lower()
+        if not program:
+            if unlabeled_head is None:
+                unlabeled_head = cand
+            continue
+        if program in seen_lanes:
+            continue
+        seen_lanes.add(program)
+        # Cheap mutex pre-filter: a lane held by an active brief can never
+        # dispatch its head — skip without an explain pass.
+        if program in active_lanes:
+            continue
+        lane_heads.append(cand)
+
+    heads = list(lane_heads)
+    if unlabeled_head is not None:
+        heads.append(unlabeled_head)
+
+    for cand in heads[:cap]:
         brief_id = cand["brief"]
         checks = explain_dispatchability(
             project_dir, brief_id, running=running, lane=lane_spec)

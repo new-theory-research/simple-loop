@@ -1435,6 +1435,69 @@ def lane_mutex_blocker(project_dir, program, active):
     return None
 
 
+def concurrency_blocker(project_dir, candidate_program, parallel_safe,
+                        edit_surface, active):
+    """The dispatch concurrency gate, factored out so dispatch() and lib/why.py
+    share ONE decision (green == dispatch-green).
+
+    Returns None when the candidate clears the active board, else a dict:
+      {"reason", "blocked_by", "overlap_paths", "cross_lane"}.
+
+    Cross-lane rule (Mattie's ruling, 2026-07-11, issue #74 companion):
+    "programs are single-threaded ... if both are active, they can happen at
+    once." A LABELED candidate whose Program: differs from EVERY active brief's
+    lane is admitted WITHOUT requiring Parallel-safe — the lane mutex is the
+    safety for cross-lane, not the Parallel-safe flag. The edit-surface OVERLAP
+    check is retained regardless: two briefs that BOTH declare surfaces are
+    still refused when those surfaces collide. The empty-list claims-everything
+    sentinel does NOT apply cross-lane (a cross-lane brief that declares no
+    surface is still admitted — the lane mutex already guarantees no same-lane
+    collision). Same-lane and unlabeled candidates keep the legacy single-slot
+    semantics exactly (a same-lane candidate is caught by the lane mutex gate
+    before it ever reaches here in dispatch(); an unlabeled candidate has no
+    lane, so surface concurrency governs as before).
+    """
+    if not active:
+        return None
+    program = (candidate_program or "").strip().lower()
+    cross_lane = bool(program) and all(
+        _entry_program(project_dir, e) != program for e in active)
+
+    if cross_lane:
+        # Lane mutex is the safety; only two DECLARED, colliding surfaces refuse.
+        for entry in active:
+            other_es = entry.get("edit_surface", [])
+            if edit_surface and other_es and edit_surfaces_overlap(edit_surface, other_es):
+                overlap_paths = sorted(
+                    {p for p in edit_surface for q in other_es if _paths_overlap(p, q)} |
+                    {q for p in edit_surface for q in other_es if _paths_overlap(p, q)})
+                return {"reason": "edit_surface_overlap",
+                        "blocked_by": entry.get("brief", ""),
+                        "overlap_paths": overlap_paths, "cross_lane": True}
+        return None
+
+    # Legacy single-slot semantics (same-lane or unlabeled candidate).
+    if not parallel_safe:
+        return {"reason": "new_brief_not_parallel_safe",
+                "blocked_by": active[0].get("brief", ""),
+                "overlap_paths": [], "cross_lane": False}
+    for entry in active:
+        other_ps = entry.get("parallel_safe", False)
+        other_es = entry.get("edit_surface", [])
+        if not other_ps:
+            return {"reason": "active_brief_not_parallel_safe",
+                    "blocked_by": entry.get("brief", ""),
+                    "overlap_paths": [], "cross_lane": False}
+        if edit_surfaces_overlap(edit_surface, other_es):
+            overlap_paths = sorted(
+                {p for p in edit_surface for q in other_es if _paths_overlap(p, q)} |
+                {q for p in edit_surface for q in other_es if _paths_overlap(p, q)})
+            return {"reason": "edit_surface_overlap",
+                    "blocked_by": entry.get("brief", ""),
+                    "overlap_paths": overlap_paths, "cross_lane": False}
+    return None
+
+
 def _lane_mutex_report_once(paths, brief, held_by):
     """First-hold-per-(brief, held_by) dedup for the lane-mutex receipt.
 
@@ -1581,37 +1644,20 @@ def dispatch(paths):
     parallel_safe, edit_surface = parse_concurrency_frontmatter(brief_file_abs)
 
     if active:
-        block_reason = None
-        blocked_by = None
-        overlap_paths = []
-        if not parallel_safe:
-            block_reason = "new_brief_not_parallel_safe"
-            blocked_by = active[0].get("brief", "")
-        else:
-            for entry in active:
-                other_ps = entry.get("parallel_safe", False)
-                other_es = entry.get("edit_surface", [])
-                if not other_ps:
-                    block_reason = "active_brief_not_parallel_safe"
-                    blocked_by = entry.get("brief", "")
-                    break
-                if edit_surfaces_overlap(edit_surface, other_es):
-                    block_reason = "edit_surface_overlap"
-                    blocked_by = entry.get("brief", "")
-                    overlap_paths = sorted(
-                        {p for p in edit_surface for q in other_es if _paths_overlap(p, q)} |
-                        {q for p in edit_surface for q in other_es if _paths_overlap(p, q)}
-                    )
-                    break
-
-        if block_reason:
+        # Shared gate (green == dispatch-green with lib/why.py). Cross-lane
+        # candidates no longer need Parallel-safe — the lane mutex above is the
+        # safety; declared edit-surface collisions still refuse. See
+        # concurrency_blocker for Mattie's cross-lane ruling.
+        verdict = concurrency_blocker(
+            project_dir, candidate_program, parallel_safe, edit_surface, active)
+        if verdict:
             log_action(paths, "concurrency_skip", {
                 "brief": brief,
-                "blocked_by": blocked_by,
-                "reason": block_reason,
-                "overlap_paths": overlap_paths,
+                "blocked_by": verdict["blocked_by"],
+                "reason": verdict["reason"],
+                "overlap_paths": verdict["overlap_paths"],
             })
-            print(f"concurrency_skip: {brief} blocked by {blocked_by} ({block_reason})",
+            print(f"concurrency_skip: {brief} blocked by {verdict['blocked_by']} ({verdict['reason']})",
                   file=sys.stderr)
             os.remove(paths["pending_dispatch"])
             return False
