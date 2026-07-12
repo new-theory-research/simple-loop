@@ -841,12 +841,38 @@ impl PendingReason {
     /// - `PendingDispatch` → In flight (conductor queued, daemon will pick up)
     /// - `AwaitingEval` → In flight (conductor hasn't evaluated yet)
     /// - `AwaitingReview` → Decide (worker completed, Mattie approves/rejects)
-    pub fn needs_human(&self) -> bool {
-        matches!(
-            self,
-            PendingReason::Escalate | PendingReason::AwaitingReview | PendingReason::Unknown
-        )
+    ///
+    /// Which Cells shelf this pending brief belongs on. The three shelves mean
+    /// different things and must stay distinct:
+    ///   Decide    — "your judgment is requested" (escalations, human reviews)
+    ///   In flight — "the daemon is working; zero action on you"
+    ///   Anomaly   — "something is inconsistent" (state we can't classify)
+    ///
+    /// `Unknown` is unclassifiable runtime state, so it belongs in Anomalies,
+    /// not Decide — a judgment shelf shouldn't be polluted by "we don't know
+    /// what this is". This is a shelf move, never a hide: an Unknown brief is
+    /// still rendered, just under the amber Anomalies header with an honest
+    /// runtime reason. (Show-don't-hide — same principle as the card-level
+    /// Anomaly bucket in `discover_draft_briefs`.) Once startup repair learns
+    /// to reconcile orphaned workers (#71), this runtime-Unknown class should
+    /// nearly vanish.
+    pub fn shelf(&self) -> PendingShelf {
+        match self {
+            PendingReason::Escalate | PendingReason::AwaitingReview => PendingShelf::Decide,
+            PendingReason::PendingMerge
+            | PendingReason::PendingDispatch
+            | PendingReason::AwaitingEval => PendingShelf::InFlight,
+            PendingReason::Unknown => PendingShelf::Anomaly,
+        }
     }
+}
+
+/// Which Cells shelf a pending brief triages to. See `PendingReason::shelf`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingShelf {
+    Decide,
+    InFlight,
+    Anomaly,
 }
 
 pub struct PendingBrief {
@@ -2205,6 +2231,143 @@ pub struct LogEvent {
 
 pub struct DanceFloorState {
     pub events: Vec<LogEvent>,
+    /// Computed actor-presence summary. Derived from running.json + a full
+    /// (unwindowed) daemon.log scan, so it never expires with the 30-minute
+    /// feed window. Absence of signal (a class truly never seen) must render
+    /// differently from signal of absence (the windowed feed simply dropped
+    /// the rows) — presence is a computed fact, not a windowed row.
+    pub presence: ActorPresence,
+}
+
+/// Last-activity fact for one actor class, from an unwindowed daemon.log scan.
+#[derive(Default, Clone)]
+pub struct ActorLastSeen {
+    pub last_seen: Option<DateTime<Utc>>,
+    /// Brief id on the most recent line for this class, if the line named one.
+    pub last_brief: Option<String>,
+    /// Validator cycle number parsed from the most recent line ("cycle N").
+    pub last_cycle: Option<usize>,
+}
+
+/// Computed presence across the actor classes the dance floor tracks. Workers
+/// carry a live count from running.json `active[]`; queen/validators carry
+/// last-seen recency from the full daemon.log scan.
+#[derive(Default)]
+pub struct ActorPresence {
+    pub queen: ActorLastSeen,
+    pub workers: ActorLastSeen,
+    pub validators: ActorLastSeen,
+    /// Brief ids currently dispatched (running.json `active[]`) — live truth
+    /// for worker slots, independent of the log window.
+    pub active_workers: Vec<String>,
+}
+
+/// Whether a class is present, quiet, or has never appeared. Kept separate
+/// from formatting so the "active vs quiet vs none-yet" decision is unit
+/// testable against a fixed `now`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PresenceStatus {
+    /// The class has never emitted a line — "none yet", not "quiet".
+    NoneYet,
+    /// Seen within the active window.
+    Active,
+    /// Seen, but longer ago than the active window; carries a short age string.
+    Quiet(String),
+}
+
+/// Classify a class's recency relative to `now`. `active_within_secs` is the
+/// window under which a class reads as currently active.
+pub fn presence_status(
+    last_seen: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    active_within_secs: i64,
+) -> PresenceStatus {
+    match last_seen {
+        None => PresenceStatus::NoneYet,
+        Some(ts) => {
+            let age = (now - ts).num_seconds().max(0);
+            if age <= active_within_secs {
+                PresenceStatus::Active
+            } else {
+                PresenceStatus::Quiet(fmt_short_age(age))
+            }
+        }
+    }
+}
+
+/// Compact age string: `45s`, `42m`, `3h`, `2d`.
+pub fn fmt_short_age(secs: i64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
+/// Parse a validator cycle number from a message like "cycle 4" / "cycle-4".
+fn parse_validator_cycle(msg: &str) -> Option<usize> {
+    let lower = msg.to_ascii_lowercase();
+    let idx = lower.find("cycle")?;
+    let tail = &lower[idx + "cycle".len()..];
+    let digits: String = tail
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// Scan daemon.log lines (unwindowed) for the latest activity per actor class.
+/// Returns (queen, workers, validators). Pure over an iterator of lines so it
+/// can be tested without touching the filesystem.
+pub fn scan_daemon_last_seen<I: IntoIterator<Item = String>>(
+    lines: I,
+) -> (ActorLastSeen, ActorLastSeen, ActorLastSeen) {
+    let mut queen = ActorLastSeen::default();
+    let mut workers = ActorLastSeen::default();
+    let mut validators = ActorLastSeen::default();
+    for line in lines {
+        let Some((ts, actor, message)) = parse_daemon_log_line(&line) else {
+            continue;
+        };
+        let slot = match actor.as_str() {
+            "conductor" => &mut queen,
+            "worker" => &mut workers,
+            "validator" => &mut validators,
+            _ => continue,
+        };
+        if slot.last_seen.map(|prev| ts >= prev).unwrap_or(true) {
+            slot.last_seen = Some(ts);
+            slot.last_brief = extract_brief_from_message(&message);
+            slot.last_cycle = parse_validator_cycle(&message);
+        }
+    }
+    (queen, workers, validators)
+}
+
+/// Compute the full actor-presence summary from disk: a full daemon.log scan
+/// for queen/validator recency plus running.json `active[]` for live workers.
+/// One pass over daemon.log; no per-frame cost beyond the existing load cadence.
+pub fn compute_actor_presence(daemon_log_path: &Path, running_path: &Path) -> ActorPresence {
+    let (queen, workers, validators) = match fs::File::open(daemon_log_path) {
+        Ok(f) => scan_daemon_last_seen(BufReader::new(f).lines().map_while(Result::ok)),
+        Err(_) => Default::default(),
+    };
+    let active_workers: Vec<String> = fs::read_to_string(running_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<RunningJson>(&s).ok())
+        .map(|r| r.active.iter().map(|a| a.brief.clone()).collect())
+        .unwrap_or_default();
+    ActorPresence {
+        queen,
+        workers,
+        validators,
+        active_workers,
+    }
 }
 
 /// Parse a single line from daemon.log format: `[YYYY-MM-DD HH:MM:SS] ACTOR: message`
@@ -2511,7 +2674,16 @@ impl DanceFloorState {
         if events.len() > 500 {
             events.drain(..events.len() - 500);
         }
-        DanceFloorState { events }
+
+        // Presence is computed from an unwindowed daemon.log scan + running.json,
+        // never from `events` above (which is windowed to 30 min and can drop a
+        // quiet class entirely). Same load cadence, one extra pass.
+        let presence = compute_actor_presence(
+            daemon_log_path,
+            Path::new(".loop/state/running.json"),
+        );
+
+        DanceFloorState { events, presence }
     }
 }
 
@@ -3160,6 +3332,273 @@ pub fn load_run_cards(runs_dir: &Path, signals_dir: &Path) -> Vec<RunCard> {
     cards
 }
 
+// ── brief detail (Cells → Enter) ────────────────────────────────────────────
+//
+// Read-only view data for a single brief card. Parsed from `index.md` on
+// demand (when the user hits Enter in the Cells pane), never per frame. No
+// network, no git — pure filesystem read of the card the caller names.
+
+/// Card-file-derived detail for one brief. Runtime state (worker slot,
+/// dispatched_at, validator cycle) is attached by the caller from hive
+/// state — this struct carries only what the card file itself declares.
+pub struct CardDetail {
+    pub brief_id: String,
+    /// `Status:` frontmatter value, original case. None when absent.
+    pub status: Option<String>,
+    /// `Program:` frontmatter (the program/lane the brief belongs to).
+    pub program: Option<String>,
+    pub model: Option<String>,
+    pub human_gate: Option<String>,
+    /// `Auto-merge:` — kept as the raw string ("true"/"false"). None when the
+    /// field is absent; the renderer shows "absent → false" honestly.
+    pub auto_merge: Option<String>,
+    /// `Parallel-safe:` — same absent-honest treatment as auto_merge.
+    pub parallel_safe: Option<String>,
+    pub branch: Option<String>,
+    /// `Depends-on:` ids (parsed by the shared `parse_depends_on` helper).
+    pub depends_on: Vec<String>,
+    /// `Issues:` ids like `#50` extracted from the frontmatter array.
+    pub issues: Vec<String>,
+    /// Plain-language intent — the `!!! abstract "Intent"` body, else the
+    /// `## Plain version` section, else the first prose paragraph.
+    pub intent: Option<String>,
+    /// Directory holding the card (`wiki/briefs/cards/{brief_id}`).
+    pub card_dir: String,
+    /// False when `index.md` was missing/unreadable — the rest is defaults.
+    pub card_exists: bool,
+}
+
+/// Parse a brief card's `index.md` into a `CardDetail`. Reads the file once;
+/// returns a defaulted (card_exists: false) struct when it can't be read.
+pub fn parse_card_detail(brief_id: &str, cards_dir: &Path) -> CardDetail {
+    let card_dir = cards_dir.join(brief_id);
+    let index_path = card_dir.join("index.md");
+    let content = fs::read_to_string(&index_path).ok();
+    let card_exists = content.is_some();
+    let content = content.unwrap_or_default();
+    CardDetail {
+        brief_id: brief_id.to_string(),
+        status: frontmatter_field(&content, "status"),
+        program: frontmatter_field(&content, "program"),
+        model: frontmatter_field(&content, "model"),
+        human_gate: frontmatter_field(&content, "human-gate"),
+        auto_merge: frontmatter_field(&content, "auto-merge"),
+        parallel_safe: frontmatter_field(&content, "parallel-safe"),
+        branch: frontmatter_field(&content, "branch"),
+        depends_on: parse_depends_on(&index_path),
+        issues: parse_issues_field(&content),
+        intent: extract_card_intent(&content),
+        card_dir: card_dir.to_string_lossy().to_string(),
+        card_exists,
+    }
+}
+
+/// Read a single YAML-frontmatter field (case-insensitive key). Returns the
+/// trimmed value in original case, or None when absent/empty/`_none_`.
+fn frontmatter_field(content: &str, key: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.first().map(|l| l.trim()) != Some("---") {
+        return None;
+    }
+    let want = format!("{}:", key.to_ascii_lowercase());
+    for line in lines.iter().skip(1) {
+        if line.trim() == "---" {
+            break;
+        }
+        if line.to_ascii_lowercase().trim_start().starts_with(&want) {
+            let after = line.trim_start()[want.len()..].trim();
+            let val = after.trim_matches(|c: char| ".,;".contains(c)).trim();
+            if val.is_empty() || val.eq_ignore_ascii_case("_none_") {
+                return None;
+            }
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+/// Extract issue ids (`#NN`) from the frontmatter `Issues:` array value.
+/// Tolerant of the JSON-array form `["#2", "#25"]` and bare comma lists.
+fn parse_issues_field(content: &str) -> Vec<String> {
+    let Some(raw) = frontmatter_field(content, "issues") else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    let chars: Vec<char> = raw.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '#' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 {
+                out.push(chars[i..j].iter().collect());
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Extract the plain-language intent from a card body.
+///
+/// Precedence: the `!!! abstract "Intent"` admonition body, then the
+/// `## Plain version` section's first paragraph, then the first prose
+/// paragraph after the `# ` title. Markdown is stripped to plain text and
+/// collapsed onto a single wrappable line. Returns None only when the body
+/// has no usable prose at all.
+pub fn extract_card_intent(md: &str) -> Option<String> {
+    let lines: Vec<&str> = md.lines().collect();
+
+    // 1. `!!! abstract "Intent"` admonition — body is the indented block that
+    //    follows, ending at the first non-blank line that isn't indented.
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("!!!") && t.to_ascii_lowercase().contains("intent") {
+            let mut body: Vec<String> = Vec::new();
+            for next in &lines[i + 1..] {
+                if next.trim().is_empty() {
+                    if body.is_empty() {
+                        continue;
+                    }
+                    // A blank inside the admonition ends the first paragraph.
+                    break;
+                }
+                let is_indented = next.starts_with("    ") || next.starts_with('\t');
+                if !is_indented {
+                    break;
+                }
+                body.push(next.trim().to_string());
+            }
+            let joined = body.join(" ");
+            let cleaned = clean_intent_text(&joined);
+            if !cleaned.is_empty() {
+                return Some(cleaned);
+            }
+        }
+    }
+
+    // 2. `## Plain version` section — take its first prose paragraph, skipping
+    //    fenced code blocks.
+    if let Some(text) = section_first_paragraph(&lines, "## plain version") {
+        return Some(text);
+    }
+
+    // 3. Fallback: first prose paragraph after the `# ` title.
+    first_prose_paragraph(&lines)
+}
+
+/// First prose paragraph inside the section whose header (lowercased, trimmed)
+/// matches `header`. Skips code fences; stops at the next `## ` header.
+fn section_first_paragraph(lines: &[&str], header: &str) -> Option<String> {
+    let start = lines
+        .iter()
+        .position(|l| l.trim().to_ascii_lowercase() == header)?;
+    let mut para: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in &lines[start + 1..] {
+        let t = line.trim();
+        if t.starts_with("## ") {
+            break;
+        }
+        if t.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if t.is_empty() {
+            if para.is_empty() {
+                continue;
+            }
+            break;
+        }
+        para.push(t.to_string());
+    }
+    let cleaned = clean_intent_text(&para.join(" "));
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// First plain prose paragraph after the `# ` title — the last-resort intent.
+fn first_prose_paragraph(lines: &[&str]) -> Option<String> {
+    let title_idx = lines.iter().position(|l| l.trim_start().starts_with("# "));
+    let scan_from = title_idx.map(|i| i + 1).unwrap_or(0);
+    let mut para: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in &lines[scan_from..] {
+        let t = line.trim();
+        if t.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if t.is_empty() {
+            if para.is_empty() {
+                continue;
+            }
+            break;
+        }
+        // Skip headers, admonition markers, and metadata-ish lines when
+        // hunting for the first *prose* paragraph.
+        if t.starts_with('#') || t.starts_with("!!!") || t.starts_with("---") {
+            if para.is_empty() {
+                continue;
+            }
+            break;
+        }
+        para.push(t.to_string());
+    }
+    let cleaned = clean_intent_text(&para.join(" "));
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Strip inline markdown (bold, code, links) and collapse whitespace so the
+/// intent renders as one clean wrappable line.
+fn clean_intent_text(s: &str) -> String {
+    let no_links = strip_md_links(s);
+    let stripped = no_links.replace("**", "").replace("__", "").replace('`', "");
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Convert `[text](url)` to `text`; leave other brackets untouched.
+fn strip_md_links(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '[' {
+            if let Some(close) = chars[i + 1..].iter().position(|&c| c == ']') {
+                let close = i + 1 + close;
+                if close + 1 < chars.len() && chars[close + 1] == '(' {
+                    if let Some(paren) = chars[close + 2..].iter().position(|&c| c == ')') {
+                        let paren = close + 2 + paren;
+                        out.extend(&chars[i + 1..close]);
+                        i = paren + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3772,7 +4211,7 @@ mod tests {
     fn load_dance_floor_from_path(path: &std::path::Path) -> DanceFloorState {
         let file = match std::fs::File::open(path) {
             Ok(f) => f,
-            Err(_) => return DanceFloorState { events: vec![] },
+            Err(_) => return DanceFloorState { events: vec![], presence: Default::default() },
         };
         let reader = std::io::BufReader::new(file);
         let mut events: Vec<LogEvent> = Vec::new();
@@ -3800,7 +4239,7 @@ mod tests {
         if events.len() > 500 {
             events.drain(..events.len() - 500);
         }
-        DanceFloorState { events }
+        DanceFloorState { events, presence: Default::default() }
     }
 
     // ── interval_mode tests ───────────────────────────────────────────────────
@@ -4409,13 +4848,16 @@ some non-bracket junk line
     }
 
     #[test]
-    fn pending_reason_needs_human_classifies_correctly() {
-        assert!(PendingReason::Escalate.needs_human());
-        assert!(PendingReason::Unknown.needs_human());
-        assert!(PendingReason::AwaitingReview.needs_human());
-        assert!(!PendingReason::PendingMerge.needs_human());
-        assert!(!PendingReason::PendingDispatch.needs_human());
-        assert!(!PendingReason::AwaitingEval.needs_human());
+    fn pending_reason_shelf_routes_unknown_to_anomaly() {
+        // Judgment shelf: escalations + human reviews.
+        assert_eq!(PendingReason::Escalate.shelf(), PendingShelf::Decide);
+        assert_eq!(PendingReason::AwaitingReview.shelf(), PendingShelf::Decide);
+        // Daemon-working shelf.
+        assert_eq!(PendingReason::PendingMerge.shelf(), PendingShelf::InFlight);
+        assert_eq!(PendingReason::PendingDispatch.shelf(), PendingShelf::InFlight);
+        assert_eq!(PendingReason::AwaitingEval.shelf(), PendingShelf::InFlight);
+        // Unclassifiable runtime state → Anomalies, not Decide.
+        assert_eq!(PendingReason::Unknown.shelf(), PendingShelf::Anomaly);
     }
 
     #[test]
@@ -5768,5 +6210,134 @@ some non-bracket junk line
         assert_eq!(cards[0].run_id, "2026-05-02-real-r1");
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&sig_dir).ok();
+    }
+
+    // ── card intent extraction ─────────────────────────────────────────────
+
+    #[test]
+    fn extract_intent_from_admonition_block() {
+        let md = "---\nID: brief-1\n---\n\n# Brief: a thing\n\n\
+            !!! abstract \"Intent\"\n    \
+            An `Auto-merge: false` brief **re-queued** merged to main — the\n    \
+            human-gate silently bypassed. Fix it. (portal#50.)\n\n\
+            ## Plain version\n\nsome other text\n";
+        let intent = extract_card_intent(md).unwrap();
+        assert!(intent.starts_with("An Auto-merge: false brief re-queued merged to main"));
+        // markdown stripped: no backticks, no bold markers
+        assert!(!intent.contains('`'));
+        assert!(!intent.contains("**"));
+        // single collapsed line (no newlines)
+        assert!(!intent.contains('\n'));
+        assert!(intent.contains("(portal#50.)"));
+    }
+
+    #[test]
+    fn extract_intent_admonition_wins_over_plain_version() {
+        let md = "# Title\n\n\
+            !!! abstract \"Intent\"\n    The admonition sentence.\n\n\
+            ## Plain version\n\nThe plain version paragraph.\n";
+        assert_eq!(extract_card_intent(md).unwrap(), "The admonition sentence.");
+    }
+
+    #[test]
+    fn extract_intent_plain_version_fallback() {
+        let md = "---\nID: brief-2\n---\n\n# Brief: no admonition here\n\n\
+            ## Plain version\n\n\
+            `fleet-001` was Auto-merge false. It [held](url) correctly the first\n\
+            time but merged the second. Same replay family.\n\n\
+            ```\nsome code\n```\n\n## Investigate first\n";
+        let intent = extract_card_intent(md).unwrap();
+        assert!(intent.starts_with("fleet-001 was Auto-merge false"));
+        assert!(intent.contains("held correctly")); // link text kept, url dropped
+        assert!(!intent.contains("url"));
+        assert!(!intent.contains("some code")); // fenced code excluded
+    }
+
+    #[test]
+    fn extract_intent_missing_both_uses_first_paragraph() {
+        let md = "---\nID: brief-3\n---\n\n# Brief: just prose\n\n\
+            This is the first prose paragraph describing the work in plain\n\
+            terms without any admonition or plain-version section.\n\n\
+            ## Details\n\nmore text\n";
+        let intent = extract_card_intent(md).unwrap();
+        assert!(intent.starts_with("This is the first prose paragraph"));
+        assert!(!intent.contains("more text"));
+    }
+
+    #[test]
+    fn parse_card_detail_reads_frontmatter_and_issues() {
+        let dir = std::env::temp_dir().join(format!("hive_card_detail_{}", std::process::id()));
+        let card = dir.join("brief-99-demo");
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::write(
+            card.join("index.md"),
+            "---\nID: brief-99-demo\nBranch: brief-99-demo\nStatus: queued\n\
+             Model: opus\nAuto-merge: false\nHuman-gate: review\nParallel-safe: false\n\
+             Program: harness-improvements\nDepends-on: _none_\nIssues: [\"#12\", \"#34\"]\n---\n\n\
+             # Brief: demo\n\n!!! abstract \"Intent\"\n    Do the demo thing.\n",
+        )
+        .unwrap();
+        let d = parse_card_detail("brief-99-demo", &dir);
+        assert!(d.card_exists);
+        assert_eq!(d.status.as_deref(), Some("queued"));
+        assert_eq!(d.model.as_deref(), Some("opus"));
+        assert_eq!(d.auto_merge.as_deref(), Some("false"));
+        assert_eq!(d.human_gate.as_deref(), Some("review"));
+        assert_eq!(d.program.as_deref(), Some("harness-improvements"));
+        assert!(d.depends_on.is_empty()); // _none_
+        assert_eq!(d.issues, vec!["#12".to_string(), "#34".to_string()]);
+        assert_eq!(d.intent.as_deref(), Some("Do the demo thing."));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_card_detail_missing_card_is_honest() {
+        let dir = std::env::temp_dir().join(format!("hive_card_missing_{}", std::process::id()));
+        let d = parse_card_detail("brief-nope", &dir);
+        assert!(!d.card_exists);
+        assert!(d.auto_merge.is_none()); // absent → renderer shows "false" honestly
+        assert!(d.intent.is_none());
+    }
+
+    // ── actor presence (dance-floor strip) ─────────────────────────────────
+
+    #[test]
+    fn scan_daemon_last_seen_tracks_latest_per_class() {
+        // Fresh worker line, older validator line, no queen line at all.
+        let now = chrono::Local::now();
+        let fresh = (now - chrono::Duration::minutes(1)).format("%Y-%m-%d %H:%M:%S");
+        let old = (now - chrono::Duration::minutes(42)).format("%Y-%m-%d %H:%M:%S");
+        let lines = vec![
+            format!("[{}] WORKER: dispatched brief-008-thing", fresh),
+            format!("[{}] VALIDATOR: brief-008-thing cycle 4 complete", old),
+            "not a log line".to_string(),
+        ];
+        let (queen, workers, validators) = scan_daemon_last_seen(lines);
+
+        // Queen never appeared → NoneYet.
+        assert_eq!(
+            presence_status(queen.last_seen, chrono::Utc::now(), 300),
+            PresenceStatus::NoneYet
+        );
+        // Worker fresh → Active, brief captured.
+        assert_eq!(
+            presence_status(workers.last_seen, chrono::Utc::now(), 300),
+            PresenceStatus::Active
+        );
+        assert_eq!(workers.last_brief.as_deref(), Some("brief-008-thing"));
+        // Validator old-only → Quiet with an age string, cycle parsed.
+        match presence_status(validators.last_seen, chrono::Utc::now(), 300) {
+            PresenceStatus::Quiet(age) => assert!(age.ends_with('m') || age.ends_with('h')),
+            other => panic!("expected Quiet, got {other:?}"),
+        }
+        assert_eq!(validators.last_cycle, Some(4));
+    }
+
+    #[test]
+    fn fmt_short_age_units() {
+        assert_eq!(fmt_short_age(45), "45s");
+        assert_eq!(fmt_short_age(120), "2m");
+        assert_eq!(fmt_short_age(7200), "2h");
+        assert_eq!(fmt_short_age(172800), "2d");
     }
 }
