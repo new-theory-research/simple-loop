@@ -1341,9 +1341,15 @@ fn render_presence_strip<'a>(
     let now = chrono::Utc::now();
     const ACTIVE_WITHIN: i64 = 180; // seconds
 
-    // queen: recency-based (idle when not fresh).
+    // queen: recency-based (idle when not fresh). When there's no queen activity
+    // at all, a heartbeat still proves the loop is pinging — read that as "idle",
+    // not "none yet". Heartbeats are liveness fuel, never a claim the queen ran,
+    // so they only rescue the NoneYet case; they never upgrade queen to active.
     let queen = match state::presence_status(p.queen.last_seen, now, ACTIVE_WITHIN) {
-        state::PresenceStatus::NoneYet => "queen — none yet".to_string(),
+        state::PresenceStatus::NoneYet => match p.last_heartbeat {
+            Some(hb) => format!("queen idle {}", state::fmt_short_age((now - hb).num_seconds().max(0))),
+            None => "queen — none yet".to_string(),
+        },
         state::PresenceStatus::Active => "queen active".to_string(),
         state::PresenceStatus::Quiet(age) => format!("queen idle {age}"),
     };
@@ -2936,6 +2942,36 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── presence strip: queen heartbeat fuel (hive-apiary-view-polish) ─────
+
+    fn strip_text(p: &state::ActorPresence) -> String {
+        render_presence_strip(p, None)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn presence_strip_queen_none_yet_without_any_signal() {
+        let p = state::ActorPresence::default();
+        assert!(strip_text(&p).contains("queen — none yet"));
+    }
+
+    #[test]
+    fn presence_strip_queen_idle_when_only_heartbeat_fuel() {
+        // No queen activity, but a recent heartbeat proves the loop is pinging —
+        // reads "idle", never "none yet", and never falsely "active".
+        let p = state::ActorPresence {
+            last_heartbeat: Some(chrono::Utc::now() - chrono::Duration::seconds(20)),
+            ..Default::default()
+        };
+        let text = strip_text(&p);
+        assert!(text.contains("queen idle"), "heartbeat fuels idle: {text}");
+        assert!(!text.contains("queen — none yet"));
+        assert!(!text.contains("queen active"), "heartbeat never claims active");
+    }
 
     // ── Cells row-selection navigation ─────────────────────────────────────
 
