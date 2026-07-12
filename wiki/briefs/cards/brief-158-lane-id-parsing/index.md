@@ -63,3 +63,11 @@ duplicated byte-for-byte in `lib/queue.py` and `lib/state.py` (comment-linked,
 not shared) — add a shared helper or a cross-module agreement test before the
 two can drift; (2) consider a shell test pinning daemon.sh's LOOP_LANE
 whitespace-normalization (the spaced-list lane split-brain the review caught).
+
+## Review handoff (2026-07-12, from the loop-why merge review)
+
+The enumerator excludes running briefs by EXACT id match while every other
+consumer uses `_brief_id_matches` (fuzzy dash-prefix) — a truncated history id
+plus a full-slug card diverges the two (why.py conservatively reports BLOCKED
+where the enumerator would re-candidate). Reconcile matching semantics here
+with the rest of the lane/ID model — one definition, not two.
