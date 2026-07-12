@@ -23,6 +23,9 @@ site/
 .loop/state/last-queen-success.json
 # issue #15: repeat-failure fingerprint counter — daemon-local volatile state.
 .loop/state/failure-fingerprints.json
+# ntfy-notification-policy: queue_stuck alarm dedup counter — daemon-local
+# volatile state (mirrors failure-fingerprints.json).
+.loop/state/queue-stuck-dedup.json
 __pycache__/
 .loop/state/progress.json
 .loop/state/runtime-events.jsonl

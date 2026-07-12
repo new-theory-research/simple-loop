@@ -48,10 +48,12 @@ if [ -z "$FUNC_PARK" ]; then
 fi
 eval "$FUNC_PARK"
 
-# Stubs the wrapper references.
+# Stubs the wrapper references. notify() now takes `notify <class> <message>`
+# (ntfy-notification-policy) — capture both so the class and text are asserted.
 _NOTIFY_COUNT=0
 _NOTIFY_LAST=""
-notify() { _NOTIFY_COUNT=$((_NOTIFY_COUNT + 1)); _NOTIFY_LAST="$1"; }
+_NOTIFY_CLASS=""
+notify() { _NOTIFY_COUNT=$((_NOTIFY_COUNT + 1)); _NOTIFY_CLASS="$1"; _NOTIFY_LAST="$2"; }
 daemon_log() { :; }
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -170,6 +172,8 @@ over_budget_park "$BRIEF" 6 6
     || fail "[AC2] notify fired $_NOTIFY_COUNT times (expected 1)"
 echo "$_NOTIFY_LAST" | grep -q "over budget" && pass "[AC2] notify text names the over-budget park" \
     || fail "[AC2] notify text wrong (='$_NOTIFY_LAST')"
+[ "$_NOTIFY_CLASS" = "brief_escalated" ] && pass "[AC2] notify class is brief_escalated" \
+    || fail "[AC2] notify class wrong (='$_NOTIFY_CLASS')"
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  AC3: no repeat-fire — structural dedup + escalate.json guard    ║

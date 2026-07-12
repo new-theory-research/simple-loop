@@ -118,6 +118,18 @@ ESCALATE_AFTER_FAILURES="${ESCALATE_AFTER_FAILURES:-3}"
 # within a normal scout/conductor cadence while bounding worst-case stuck time.
 CONDUCTOR_DEDUP_TTL_SECS="${CONDUCTOR_DEDUP_TTL_SECS:-1800}"
 
+# ntfy notification policy (ntfy-notification-policy branch). notify() takes a
+# CLASS as its first arg; NTFY_EVENTS is the comma-separated allowlist of classes
+# that actually push. Mattie's ruling (2026-07-12): ntfy should fire only on brief
+# lifecycle + a stuck-queue alarm — everything operational is class `ops`, which
+# is absent from the default list and therefore silenced. Config-overridable.
+NTFY_EVENTS="${NTFY_EVENTS:-brief_started,brief_escalated,brief_completed,queue_stuck}"
+# queue_stuck alarm: consecutive ticks with queued work but zero dispatch and zero
+# active work before ONE queue_stuck push fires (re-armed on the next successful
+# dispatch). Counter persisted in QUEUE_STUCK_STATE (gitignored). Config-overridable.
+QUEUE_STUCK_TICKS="${QUEUE_STUCK_TICKS:-6}"
+QUEUE_STUCK_STATE="$STATE_DIR/queue-stuck-dedup.json"
+
 # Parallel worker execution (off by default → byte-identical legacy behavior).
 # When "true", the tick spawns workers in the background and a reaper harvests
 # finished ones at the start of each tick, so THROTTLE briefs iterate
@@ -227,13 +239,90 @@ wlog() {
 }
 
 notify() {
+    # notify <class> <message>. class ∈ {brief_started, brief_escalated,
+    # brief_completed, queue_stuck, ops}. NTFY_EVENTS (config) is the allowlist:
+    # a class not in that list is silently dropped. Zero-cost when NTFY_TOPIC is
+    # empty — checked FIRST, exactly as before. Mattie's policy (2026-07-12): push
+    # only brief lifecycle + queue-stuck; everything operational is class `ops`,
+    # which is absent from the default allowlist and therefore silenced.
     [ -z "$NTFY_TOPIC" ] && return
+    local class="$1"
+    local msg="$2"
+    case ",${NTFY_EVENTS}," in
+        *",${class},"*) ;;
+        *) return ;;
+    esac
     local title="${PROJECT_NAME:-Simple Loop}"
     curl -s \
         -H "Title: $title" \
         -H "Priority: high" \
-        -d "$1" \
+        -d "$msg" \
         "https://ntfy.sh/$NTFY_TOPIC" >/dev/null 2>&1
+}
+
+# ── queue_stuck alarm state machine (ntfy-notification-policy) ────────────────
+# Counter persisted in QUEUE_STUCK_STATE (gitignored, mirrors the
+# failure-fingerprints.json pattern: daemon-local volatile state). A tick whose
+# stuck condition is met — queued work exists, nothing dispatched, nothing active
+# — increments `ticks`; on the QUEUE_STUCK_TICKS-th such tick it echoes "notify"
+# exactly ONCE (latches notified=true so it never re-fires), else "silent". A
+# non-stuck tick resets the counter but NOT the latch — re-arming is deliberately
+# reserved for a successful dispatch (_queue_stuck_rearm), so a transient active
+# worker can't re-trigger the same episode.
+_queue_stuck_tick() {
+    python3 - "$QUEUE_STUCK_STATE" "$1" "$QUEUE_STUCK_TICKS" <<'PY'
+import json, sys, os
+path, stuck, threshold = sys.argv[1], sys.argv[2] == "true", int(sys.argv[3])
+try:
+    st = json.load(open(path))
+except Exception:
+    st = {}
+ticks = int(st.get("ticks", 0))
+notified = bool(st.get("notified", False))
+verdict = "silent"
+if not stuck:
+    ticks = 0
+else:
+    ticks += 1
+    if ticks >= threshold and not notified:
+        verdict = "notify"
+        notified = True
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump({"ticks": ticks, "notified": notified}, f)
+os.replace(tmp, path)
+print(verdict)
+PY
+}
+
+# Re-arm the queue_stuck alarm: a successful dispatch clears both the counter and
+# the notified latch so the NEXT stuck episode can alarm again.
+_queue_stuck_rearm() {
+    python3 - "$QUEUE_STUCK_STATE" <<'PY'
+import json, sys, os
+path = sys.argv[1]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump({"ticks": 0, "notified": False}, f)
+os.replace(tmp, path)
+PY
+}
+
+# Called at each daemon-side dispatch success. Fires brief_started ONCE for the
+# freshly dispatched brief (once per brief-dispatch, not per worker iteration —
+# dispatch runs once as the brief flips queued→active) and re-arms queue_stuck.
+# Also raises the per-tick dispatch flag the queue_stuck evaluator reads.
+on_dispatch_success() {
+    local brief="$1"
+    [ -z "$brief" ] || [ "$brief" = "-" ] && { _DISPATCHED_THIS_TICK=true; _queue_stuck_rearm; return; }
+    local slot lane
+    slot=$(python3 -c "import json;rc=json.load(open('$RUNNING_FILE'));a=rc.get('active',[]);print(next((i for i,b in enumerate(a) if b.get('brief')=='$brief'), len(a)))" 2>/dev/null || echo "?")
+    lane="${LOOP_LANE:-default}"
+    notify brief_started "$brief started (lane $lane, slot $slot)"
+    _DISPATCHED_THIS_TICK=true
+    _queue_stuck_rearm
 }
 
 # Sleep <seconds> against a WALL-CLOCK target, in slices of WALL_SLICE_SECS,
@@ -339,7 +428,7 @@ handle_rate_limit() {
             fi
             SLEEP_SECS=$(( RESET_TODAY - NOW_EPOCH + 300 ))
             daemon_log "RATE LIMITED: sleeping $((SLEEP_SECS / 3600))h $(((SLEEP_SECS % 3600) / 60))m until ${RESET_HOUR}:00"
-            notify "Rate limited — sleeping until ${RESET_HOUR}:00"
+            notify ops "Rate limited — sleeping until ${RESET_HOUR}:00"
             wall_sleep "$SLEEP_SECS"
             return
         fi
@@ -434,7 +523,7 @@ Trigger reason: $reason" \
     if [ -f "$QUEEN_TIMEOUT_FLAG" ]; then
         rm -f "$QUEEN_TIMEOUT_FLAG"
         daemon_log "QUEEN #$TURN: wall-time cap exceeded ${QUEEN_WALL_TIME_SECS}s — killed (${TURN_DURATION}s)"
-        notify "Queen killed: wall-time cap (${QUEEN_WALL_TIME_SECS}s)"
+        notify ops "Queen killed: wall-time cap (${QUEEN_WALL_TIME_SECS}s)"
         local _qe_tmp _qe_ts
         _qe_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
         _qe_tmp=$(mktemp)
@@ -447,7 +536,7 @@ Trigger reason: $reason" \
 
     if [ "$EXIT_CODE" -ne 0 ]; then
         daemon_log "QUEEN #$TURN: FAILED (exit $EXIT_CODE, ${TURN_DURATION}s)"
-        notify "Queen FAILED (exit $EXIT_CODE)"
+        notify ops "Queen FAILED (exit $EXIT_CODE)"
 
         local _qe_tmp _qe_ts
         _qe_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -573,7 +662,7 @@ _cb_record_queen_result() {
     daemon_log "CIRCUIT BREAKER: queen failure $CONSECUTIVE_QUEEN_FAILURES/$QUEEN_FAIL_THRESHOLD"
     if [ "$CONSECUTIVE_QUEEN_FAILURES" -ge "$QUEEN_FAIL_THRESHOLD" ]; then
         daemon_log "CIRCUIT BREAKER: threshold reached — writing pause.json, backing off"
-        notify "Circuit breaker tripped: $CONSECUTIVE_QUEEN_FAILURES consecutive queen failures"
+        notify ops "Circuit breaker tripped: $CONSECUTIVE_QUEEN_FAILURES consecutive queen failures"
         _cb_write_pause
     fi
 }
@@ -608,7 +697,7 @@ record_failure_and_maybe_escalate() {
     case "$rc" in
         10)
             daemon_log "REPEAT-FAILURE: $site failed ${ESCALATE_AFTER_FAILURES}x identically on ${brief} — stopped retrying, escalate.json raised (receipt: $reason)"
-            notify "Repeat failure: $site ${ESCALATE_AFTER_FAILURES}x on ${brief} — escalated (parked)"
+            notify brief_escalated "Repeat failure: $site ${ESCALATE_AFTER_FAILURES}x on ${brief} — escalated (parked)"
             ;;
         11)
             # Already escalated for this fingerprint — the desk already has the
@@ -696,7 +785,7 @@ print(first or '$now')
         first_iteration_ts="$first_ts" last_iteration_ts="$now" 2>/dev/null || true
 
     # 4) notify() last.
-    notify "$brief_id: over budget ($iterations_used/$budget cycles) — parked to awaiting_review + escalated"
+    notify brief_escalated "$brief_id: over budget ($iterations_used/$budget cycles) — parked to awaiting_review + escalated"
 }
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -843,7 +932,7 @@ run_worker_iteration() {
             python3 "$DAEMON_LIB_DIR/actions.py" move-to-awaiting-review "$brief_id" "$PROJECT_DIR" \
                 rebase-blocked "rebase conflict against main — human resolution required" \
                 2>>"$LOG_DIR/daemon.log" || true
-            notify "$brief_id: rebase conflict → routed to awaiting_review"
+            notify brief_escalated "$brief_id: rebase conflict → routed to awaiting_review"
             return 0
         fi
     fi
@@ -1060,7 +1149,7 @@ with open('$PROGRESS_FILE', 'w') as f:
     if [ -f "$WORKER_TIMEOUT_FLAG" ]; then
         rm -f "$WORKER_TIMEOUT_FLAG"
         wlog "WORKER: cycle wall-time exceeded ${CYCLE_WALL_TIME_SECS}s — killed worker for $brief_id cycle $iteration"
-        notify "$brief_id: cycle wall-time exceeded (${CYCLE_WALL_TIME_SECS}s) — routed to awaiting_review"
+        notify brief_escalated "$brief_id: cycle wall-time exceeded (${CYCLE_WALL_TIME_SECS}s) — routed to awaiting_review"
         parse_metrics "$WORKER_JSON" "$WORKER_LOG" "worker" "{'brief': '$brief_id', 'model': '$WORKER_MODEL', 'exit_code': $WORKER_EXIT, 'timed_out': True}"
         rm -f "$WORKER_JSON"
         python3 "$DAEMON_LIB_DIR/actions.py" move-to-awaiting-review "$brief_id" "$PROJECT_DIR" \
@@ -1078,11 +1167,11 @@ with open('$PROGRESS_FILE', 'w') as f:
     if [ "$WORKER_EXIT" -eq 0 ]; then
         git -C "$WORKTREE_DIR" push -u --force-with-lease "$GIT_REMOTE" "$branch" 2>&1 || wlog "WORKER: push failed (non-fatal)"
         wlog "WORKER: iteration complete (${WORKER_DURATION}s), pushed to $branch"
-        notify "$brief_id: iteration done (${WORKER_DURATION}s)"
+        notify ops "$brief_id: iteration done (${WORKER_DURATION}s)"
         CONSECUTIVE_WORKER_FAILURES=0
     else
         wlog "WORKER: iteration FAILED (exit $WORKER_EXIT, ${WORKER_DURATION}s)"
-        notify "$brief_id: worker FAILED (exit $WORKER_EXIT)"
+        notify ops "$brief_id: worker FAILED (exit $WORKER_EXIT)"
         CONSECUTIVE_WORKER_FAILURES=$((CONSECUTIVE_WORKER_FAILURES + 1))
 
         if [ "$WORKER_DURATION" -le 10 ] && grep -q "out of extra usage" "$WORKER_LOG" 2>/dev/null; then
@@ -1350,7 +1439,7 @@ print(','.join(missing))
 
     if [ -n "$MISSING_ARTIFACTS" ]; then
         daemon_log "VALIDATOR: presence check FAILED for $brief_id cycle $cycle — missing: $MISSING_ARTIFACTS"
-        notify "$brief_id cycle $cycle: validator BLOCK — missing artifacts ($MISSING_ARTIFACTS)"
+        notify ops "$brief_id cycle $cycle: validator BLOCK — missing artifacts ($MISSING_ARTIFACTS)"
 
         local NOW_ISO_PRE
         NOW_ISO_PRE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -1517,7 +1606,7 @@ Verdict guide:
     if [ -f "$VALIDATOR_TIMEOUT_FLAG" ]; then
         rm -f "$VALIDATOR_TIMEOUT_FLAG"
         daemon_log "VALIDATOR: wall-time exceeded ${VALIDATOR_WALL_TIME_SECS}s — killed validator for $brief_id cycle $cycle"
-        notify "$brief_id: validator wall-time exceeded (${VALIDATOR_WALL_TIME_SECS}s)"
+        notify ops "$brief_id: validator wall-time exceeded (${VALIDATOR_WALL_TIME_SECS}s)"
     fi
 
     parse_metrics "$VALIDATOR_JSON" "$VALIDATOR_LOG" "validator" "{'brief': '$brief_id', 'cycle': $cycle, 'commit': '${commit_sha:0:12}', 'exit_code': $V_EXIT}"
@@ -1525,7 +1614,7 @@ Verdict guide:
 
     if [ "$V_EXIT" -ne 0 ]; then
         daemon_log "VALIDATOR: FAILED (exit $V_EXIT, ${V_DURATION}s)"
-        notify "$brief_id: validator FAILED (exit $V_EXIT)"
+        notify ops "$brief_id: validator FAILED (exit $V_EXIT)"
         if [ "$V_DURATION" -le 10 ] && grep -q "out of extra usage" "$VALIDATOR_LOG" 2>/dev/null; then
             handle_rate_limit "$VALIDATOR_LOG"
             return 1
@@ -1583,7 +1672,7 @@ SYNTHEOF
         git -C "$WORKTREE_DIR" commit -m "[scav] validator: $brief_id cycle $cycle review" -q 2>/dev/null
         git -C "$WORKTREE_DIR" push -u --force-with-lease "$GIT_REMOTE" "$branch" 2>&1 || daemon_log "VALIDATOR: push failed (non-fatal)"
         daemon_log "VALIDATOR: review committed for $brief_id cycle $cycle (${V_DURATION}s)"
-        notify "$brief_id: validator review cycle $cycle"
+        notify ops "$brief_id: validator review cycle $cycle"
     fi
 
     return 0
@@ -1785,7 +1874,7 @@ cleanup() {
     SHUTTING_DOWN=1
     echo ""
     daemon_log "SHUTDOWN: caught signal, exiting cleanly"
-    notify "Daemon stopped"
+    notify ops "Daemon stopped"
     pkill -P $$ 2>/dev/null
     rm -f "$PID_FILE"
     exit 0
@@ -1811,7 +1900,7 @@ print(len(actions))
     daemon_log "STARTUP REPAIR: complete (${REPAIR_COUNT:-0} action(s))"
 fi
 
-notify "Daemon started (PID $$)"
+notify ops "Daemon started (PID $$)"
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Main Loop                                                      ║
@@ -1946,7 +2035,7 @@ sync_project_checkout() {
             "  \"consecutive_failures\": $SYNC_FAIL_COUNT" \
             '}' > "$SIGNALS_DIR/escalate.json"
         daemon_log "GIT SYNC: escalate.json written after $SYNC_FAIL_COUNT consecutive failed syncs"
-        notify "GIT SYNC: $SYNC_FAIL_COUNT consecutive failed syncs ($ahead ahead / $behind behind) — escalated"
+        notify brief_escalated "GIT SYNC: $SYNC_FAIL_COUNT consecutive failed syncs ($ahead ahead / $behind behind) — escalated"
         python3 "$DAEMON_LIB_DIR/state.py" append-event "$PROJECT_DIR" repeat_failure_escalated "-" \
             site=sync consecutive_failures="$SYNC_FAIL_COUNT" ahead="$ahead" behind="$behind" 2>/dev/null || true
     fi
@@ -1964,6 +2053,9 @@ while true; do
     CONDUCTOR_FIRED_THIS_TICK=0
     WORKER_FIRED_THIS_TICK=0
     VALIDATOR_FIRED_THIS_TICK=0
+    # queue_stuck bookkeeping: raised by on_dispatch_success when a brief is
+    # dispatched this tick (queen or daemon path). Read in Phase 4.7.
+    _DISPATCHED_THIS_TICK=false
 
     # Reap finished background workers from prior ticks (WORKER_PARALLEL only;
     # no-op when the registry is empty, so flag-off ticks are unchanged).
@@ -2019,7 +2111,7 @@ while true; do
     # --- Pause check ---
     if [ -f "$SIGNALS_DIR/pause.json" ]; then
         daemon_log "PAUSED: $(cat "$SIGNALS_DIR/pause.json")"
-        notify "Paused"
+        notify ops "Paused"
 
         # Detect whether this pause was written by the circuit breaker.
         # If so, run a lightweight API probe each 60s; on success, remove
@@ -2045,7 +2137,7 @@ except Exception:
                 daemon_log "CIRCUIT BREAKER: probing API health..."
                 if _cb_probe_api; then
                     daemon_log "CIRCUIT BREAKER: API probe succeeded — resuming and resetting failure counter"
-                    notify "Circuit breaker: API recovered — resuming"
+                    notify ops "Circuit breaker: API recovered — resuming"
                     CONSECUTIVE_QUEEN_FAILURES=0
                     rm -f "$SIGNALS_DIR/pause.json"
                     break
@@ -2057,7 +2149,7 @@ except Exception:
 
         if [ -f "$SIGNALS_DIR/resume.json" ]; then
             daemon_log "RESUMED: $(cat "$SIGNALS_DIR/resume.json")"
-            notify "Resumed"
+            notify ops "Resumed"
             CONSECUTIVE_QUEEN_FAILURES=0
             rm -f "$SIGNALS_DIR/pause.json" "$SIGNALS_DIR/resume.json"
         fi
@@ -2284,7 +2376,7 @@ print('')
                     python3 "$DAEMON_ACTIONS" move-to-awaiting-review "$active_entry" "$PROJECT_DIR" \
                         staleness-gated "branch is $CB commits behind main — staleness gate triggered, hand-merge required (see wiki/operating-docs/incidents/2026-04-24-brief-049-050-merge-watchlist.md)" \
                         2>>"$LOG_DIR/daemon.log" && DID_WORK=true
-                    notify "$active_entry merge refused: $CB commits behind main (staleness gate)"
+                    notify brief_escalated "$active_entry merge refused: $CB commits behind main (staleness gate)"
                 fi
             fi
 
@@ -2305,7 +2397,7 @@ print('')
                     if [ "$_AM_RC" -eq 0 ]; then
                         DID_WORK=true
                         clear_failure_fingerprint "auto-merge-gate" "$active_entry"
-                        notify "$active_entry complete → queued for auto-merge"
+                        notify brief_completed "$active_entry completed — auto-merge queued"
                     else
                         _AM_REASON=$(printf '%s\n' "$_AM_ERR" | grep -E 'REFUSED|gate:' | head -1)
                         [ -z "$_AM_REASON" ] && _AM_REASON="move-to-pending-merges failed (rc=$_AM_RC)"
@@ -2322,7 +2414,7 @@ print('')
                     daemon_log "DAEMON ACTION: move-to-awaiting-review $active_entry (human approval required)"
                     python3 "$DAEMON_ACTIONS" move-to-awaiting-review "$active_entry" "$PROJECT_DIR" \
                         complete 2>>"$LOG_DIR/daemon.log" && DID_WORK=true
-                    notify "$active_entry complete → awaiting human review (run: loop approve $active_entry)"
+                    notify brief_completed "$active_entry completed — awaiting review (run: loop approve $active_entry)"
                 fi
             fi
         fi
@@ -2346,7 +2438,7 @@ print('')
             DEP_ID="${DEPS_VERDICT#blocked:}"
             BLOCKED_BRIEF=$(python3 -c "import json; print(json.load(open('$STATE_DIR/pending-dispatch.json')).get('brief',''))" 2>/dev/null || echo "unknown")
             daemon_log "DAEMON ACTION: dispatch blocked — $BLOCKED_BRIEF depends-on $DEP_ID (not yet merged)"
-            notify "$BLOCKED_BRIEF dispatch blocked: depends on $DEP_ID (not merged yet)"
+            notify ops "$BLOCKED_BRIEF dispatch blocked: depends on $DEP_ID (not merged yet)"
             rm -f "$STATE_DIR/pending-dispatch.json"
         else
             daemon_log "DAEMON ACTION: processing pending dispatch"
@@ -2361,6 +2453,7 @@ print('')
             [ -z "$_DISPATCH_BRIEF" ] && _DISPATCH_BRIEF="-"
             if python3 "$DAEMON_ACTIONS" dispatch "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log"; then
                 clear_failure_fingerprint "dispatch" "$_DISPATCH_BRIEF"
+                on_dispatch_success "$_DISPATCH_BRIEF"
             else
                 daemon_log "DAEMON ACTION: dispatch failed, retrying once"
                 sleep 5
@@ -2369,6 +2462,7 @@ print('')
                 [ -n "$_D_ERR" ] && printf '%s\n' "$_D_ERR" >> "$LOG_DIR/daemon.log"
                 if [ "$_D_RC" -eq 0 ]; then
                     clear_failure_fingerprint "dispatch" "$_DISPATCH_BRIEF"
+                    on_dispatch_success "$_DISPATCH_BRIEF"
                 else
                     daemon_log "DAEMON ACTION: dispatch retry failed"
                     _D_REASON=$(printf '%s\n' "$_D_ERR" | grep -iE 'error|fail|refus|conflict' | head -1)
@@ -2402,7 +2496,7 @@ except: print(0)
         daemon_log "DAEMON ACTION: processing pending_merges queue ($PENDING_MERGE_COUNT entries)"
         python3 "$DAEMON_ACTIONS" process-pending-merges "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log"
         if [ $? -eq 0 ]; then
-            notify "Brief merged to $GIT_MAIN_BRANCH"
+            notify ops "Brief merged to $GIT_MAIN_BRANCH"
         fi
         DID_WORK=true
         ASSESS_OUTPUT=$(assess_state)
@@ -2417,7 +2511,7 @@ except: print(0)
         daemon_log "DAEMON ACTION: processing pending merge (legacy/manual path)"
         python3 "$DAEMON_ACTIONS" merge "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log"
         if [ $? -eq 0 ]; then
-            notify "Brief merged to $GIT_MAIN_BRANCH"
+            notify ops "Brief merged to $GIT_MAIN_BRANCH"
         fi
         DID_WORK=true
         ASSESS_OUTPUT=$(assess_state)
@@ -2470,7 +2564,7 @@ except: print(0)
             # Same escalation gate as the serial path, evaluated once per tick.
             _ESC_BRIEF=$(printf '%s\n' "$WORKER_LINES" | head -1 | sed 's/^WORKER://' | cut -d',' -f1)
             daemon_log "WORKER: 3 consecutive failures — escalating to queen"
-            notify "3 worker failures on $_ESC_BRIEF — escalating"
+            notify brief_escalated "3 worker failures on $_ESC_BRIEF — escalating"
             write_heartbeat "phase3_queen_escalate:$_ESC_BRIEF"
             invoke_conductor "worker_failures_${_ESC_BRIEF}"
             CONDUCTOR_FIRED_THIS_TICK=$((CONDUCTOR_FIRED_THIS_TICK + 1))
@@ -2524,7 +2618,7 @@ except: print(0)
 
                 if [ "$CONSECUTIVE_WORKER_FAILURES" -ge 3 ]; then
                     daemon_log "WORKER: 3 consecutive failures — escalating to queen"
-                    notify "3 worker failures on $BRIEF_ID — escalating"
+                    notify brief_escalated "3 worker failures on $BRIEF_ID — escalating"
                     write_heartbeat "phase3_queen_escalate:$BRIEF_ID"
                     invoke_conductor "worker_failures_${BRIEF_ID}"
                     CONDUCTOR_FIRED_THIS_TICK=$((CONDUCTOR_FIRED_THIS_TICK + 1))
@@ -2547,7 +2641,7 @@ except: print(0)
     if [ -f "$SIGNALS_DIR/escalate.json" ]; then
         ESCALATE_MSG=$(python3 -c "import json; print(json.load(open('$SIGNALS_DIR/escalate.json')).get('reason','Review needed'))" 2>/dev/null || echo "Review needed")
         if [ ! -f "$SIGNALS_DIR/.escalate_notified" ]; then
-            notify "$ESCALATE_MSG"
+            notify brief_escalated "$ESCALATE_MSG"
             daemon_log "NOTIFY: escalation sent"
             touch "$SIGNALS_DIR/.escalate_notified"
         fi
@@ -2586,6 +2680,35 @@ try:
 except Exception as e:
     print(f'tick metric error: {e}', file=sys.stderr)
 " 2>/dev/null
+
+    # ┌─────────────────────────────────────┐
+    # │  Phase 4.7: queue_stuck alarm       │
+    # └─────────────────────────────────────┘
+    # Alive-but-stuck (Mattie's ruling 2026-07-12): a queued brief exists (the
+    # lane-aware enumerator the queen uses), nothing dispatched this tick, and
+    # nothing is active. After QUEUE_STUCK_TICKS consecutive such ticks fire ONE
+    # queue_stuck push naming the head queued brief + its loop-why first blocker,
+    # re-armed only on the next successful dispatch. (daemon-DEAD is a separate
+    # apiary sentinel — out of scope on this branch.)
+    _QS_HEAD=$(python3 "$DAEMON_LIB_DIR/queue.py" "$PROJECT_DIR" $_LANE_OPT 2>/dev/null \
+        | python3 -c "import json,sys;c=json.load(sys.stdin);print(c[0]['brief'] if c else '')" 2>/dev/null || echo "")
+    _QS_ACTIVE=$(python3 -c "import json;print(len(json.load(open('$RUNNING_FILE')).get('active',[])))" 2>/dev/null || echo 0)
+    _QS_STUCK=false
+    if [ -n "$_QS_HEAD" ] && [ "$_DISPATCHED_THIS_TICK" != "true" ] && [ "${_QS_ACTIVE:-0}" -eq 0 ]; then
+        _QS_STUCK=true
+    fi
+    if [ "$(_queue_stuck_tick "$_QS_STUCK")" = "notify" ]; then
+        _QS_BLOCKER=$(python3 -c "
+import sys
+sys.path.insert(0, '$DAEMON_LIB_DIR')
+from why import explain_dispatchability
+checks = explain_dispatchability('$PROJECT_DIR', '$_QS_HEAD', lane='$LOOP_LANE' or None)
+fail = [c for c in checks if not c.ok]
+print('%s: %s' % (fail[0].name, fail[0].receipt) if fail else 'all dispatch checks pass — no gate identified')
+" 2>/dev/null || echo "blocker unavailable")
+        daemon_log "QUEUE STUCK: $_QS_HEAD queued ${QUEUE_STUCK_TICKS}+ ticks with no dispatch — $_QS_BLOCKER"
+        notify queue_stuck "Queue stuck: $_QS_HEAD blocked ${QUEUE_STUCK_TICKS} ticks — $_QS_BLOCKER"
+    fi
 
     # ┌─────────────────────────────────────┐
     # │  Phase 5: Sleep (adaptive)          │
