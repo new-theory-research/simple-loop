@@ -277,6 +277,22 @@ _proc_starttime() {
     ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//'
 }
 
+# True (0) iff pid is STILL a live, non-zombie process whose start-time still
+# matches the identity token — i.e. a watchdog's TERM+KILL did NOT take. Used to
+# verify a fired kill actually landed (issue #89): a SIGKILLed target lingers as
+# a zombie (state Z, awaiting its parent's reap) and still reports an lstart, so
+# a bare `_proc_starttime` check would false-positive "survived". A zombie is
+# dead here; only a matching, non-zombie pid counts as survival.
+_target_survived() {
+    local pid="$1" token="$2" now st
+    now=$(_proc_starttime "$pid")
+    [ -z "$now" ] && return 1               # gone
+    [ "$now" != "$token" ] && return 1      # recycled pid — not our target
+    st=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$st" in Z*) return 1 ;; esac      # zombie — dead, awaiting reap
+    return 0
+}
+
 # Append a watchdog's pid + its own start-time to the registry. A pid line is
 # tiny, so the O_APPEND write is atomic even across concurrent worker subshells
 # — no lock needed. _reap_watchdogs identity-checks each entry before killing,
@@ -315,6 +331,16 @@ _reap_watchdogs() {
 #   4 pgid_kill   1 = signal the process group (-pid, fallback pid); 0 = pid only
 #   5 hard        1 = single SIGKILL, no grace (probe); 0 = SIGTERM, grace, SIGKILL
 #   6 label       human label for the stand-down log line
+#
+# Issue #89: the fire path is now FULLY OBSERVABLE. Previously the only trace of
+# a wall-time kill was the caller's flag→log line; a watchdog that stood down
+# because the target looked already-gone (a transient empty `ps` on a live pid)
+# left NO log at all, and a fired kill that DIDN'T take left no receipt either —
+# so a silent non-enforcement (1886s queen, no kill line, no stand-down line)
+# was indistinguishable from a healthy run. Every branch here now logs: the
+# already-exited stand-down, the fire itself (before signaling), and — loudest —
+# an ESCALATE when the target SURVIVES TERM+KILL. Silent non-enforcement is
+# worse than the bug (fix-77 reviewer), so a surviving target must page.
 spawn_watchdog() {
     local target_pid="$1" timeout="$2" flag="$3" pgid_kill="$4" hard="$5" label="$6"
     local target_start
@@ -322,30 +348,51 @@ spawn_watchdog() {
     (
         sleep "$timeout"
         now=$(_proc_starttime "$target_pid")
-        [ -z "$now" ] && exit 0                       # target already exited cleanly
+        if [ -z "$now" ]; then                        # target already exited cleanly
+            daemon_log "WATCHDOG: $label target pid $target_pid already exited before ${timeout}s cap — standing down"
+            exit 0
+        fi
         if [ "$now" != "$target_start" ]; then        # issue #77: recycled pid
             daemon_log "WATCHDOG: target pid $target_pid recycled — standing down ($label)"
             exit 0
         fi
         [ -n "$flag" ] && touch "$flag"
+        # The kill FIRES here — log it before signaling so a fire always leaves a
+        # receipt, independent of whether the flag/caller path is reached (#89).
+        daemon_log "WATCHDOG: $label exceeded ${timeout}s cap — killing pid $target_pid$([ "$pgid_kill" = "1" ] && printf ' (process group)')"
         if [ "$hard" = "1" ]; then
             if [ "$pgid_kill" = "1" ]; then
                 kill -KILL -"$target_pid" 2>/dev/null || kill -KILL "$target_pid" 2>/dev/null || true
             else
                 kill -KILL "$target_pid" 2>/dev/null || true
             fi
-            exit 0
-        fi
-        if [ "$pgid_kill" = "1" ]; then
-            kill -TERM -"$target_pid" 2>/dev/null || kill -TERM "$target_pid" 2>/dev/null
         else
-            kill -TERM "$target_pid" 2>/dev/null
+            if [ "$pgid_kill" = "1" ]; then
+                kill -TERM -"$target_pid" 2>/dev/null || kill -TERM "$target_pid" 2>/dev/null
+            else
+                kill -TERM "$target_pid" 2>/dev/null
+            fi
+            sleep "$WORKER_KILL_GRACE_SECS"
+            if [ "$pgid_kill" = "1" ]; then
+                kill -KILL -"$target_pid" 2>/dev/null || kill -KILL "$target_pid" 2>/dev/null || true
+            else
+                kill -KILL "$target_pid" 2>/dev/null || true
+            fi
         fi
-        sleep "$WORKER_KILL_GRACE_SECS"
-        if [ "$pgid_kill" = "1" ]; then
-            kill -KILL -"$target_pid" 2>/dev/null || kill -KILL "$target_pid" 2>/dev/null || true
+        # Verify the kill LANDED. Poll briefly (bounded — never hangs) to let the
+        # SIGKILL settle / the pid become a zombie, then confirm. A target still
+        # live and non-zombie after TERM+KILL escaped enforcement (uninterruptible
+        # sleep, re-parented work into a session leader, wrong process group):
+        # that is the #89 zombie we MUST surface loudly.
+        _wd_i=0
+        while [ "$_wd_i" -lt 20 ] && _target_survived "$target_pid" "$target_start"; do
+            sleep 0.1; _wd_i=$((_wd_i + 1))
+        done
+        if _target_survived "$target_pid" "$target_start"; then
+            daemon_log "WATCHDOG: ESCALATE — $label target pid $target_pid SURVIVED TERM+KILL; wall-time cap NOT enforced"
+            notify ops "WATCHDOG ESCALATE: $label survived TERM+KILL — wall-time cap not enforced (pid $target_pid)"
         else
-            kill -KILL "$target_pid" 2>/dev/null || true
+            daemon_log "WATCHDOG: $label target pid $target_pid killed at ${timeout}s cap"
         fi
     ) &
     WATCHDOG_SPAWNED_PID=$!

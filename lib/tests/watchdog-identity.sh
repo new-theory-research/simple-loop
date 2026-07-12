@@ -32,11 +32,12 @@ DAEMON_SH="$SCRIPT_DIR/../daemon.sh"
 
 # ── Extract helpers from lib/daemon.sh verbatim ──────────────────────────────
 FUNC_STARTTIME=$(sed -n '/^_proc_starttime() {/,/^}/p' "$DAEMON_SH")
+FUNC_SURVIVED=$(sed -n '/^_target_survived() {/,/^}/p' "$DAEMON_SH")
 FUNC_REGISTER=$(sed -n '/^_watchdog_register() {/,/^}/p' "$DAEMON_SH")
 FUNC_REAP=$(sed -n '/^_reap_watchdogs() {/,/^}/p' "$DAEMON_SH")
 FUNC_SPAWN=$(sed -n '/^spawn_watchdog() {/,/^}/p' "$DAEMON_SH")
 
-for fn in FUNC_STARTTIME FUNC_REGISTER FUNC_REAP FUNC_SPAWN; do
+for fn in FUNC_STARTTIME FUNC_SURVIVED FUNC_REGISTER FUNC_REAP FUNC_SPAWN; do
     if [ -z "${!fn}" ]; then
         fail "could not extract $fn from lib/daemon.sh"
         echo "FAILED: 1"
@@ -44,6 +45,7 @@ for fn in FUNC_STARTTIME FUNC_REGISTER FUNC_REAP FUNC_SPAWN; do
     fi
 done
 eval "$FUNC_STARTTIME"
+eval "$FUNC_SURVIVED"
 eval "$FUNC_REGISTER"
 eval "$FUNC_REAP"
 eval "$FUNC_SPAWN"
@@ -55,6 +57,9 @@ eval "$FUNC_SPAWN"
 DAEMON_LOG_FILE="$TMP/daemon.log"
 : > "$DAEMON_LOG_FILE"
 daemon_log() { echo "$1" >> "$DAEMON_LOG_FILE"; }
+# spawn_watchdog now pages ops when a fired target survives TERM+KILL (issue #89).
+# Capture the page to the same file so the ESCALATE test can assert it.
+notify() { echo "NOTIFY $*" >> "$DAEMON_LOG_FILE"; }
 WORKER_KILL_GRACE_SECS=1
 WATCHDOG_REGISTRY="$TMP/watchdog-pids"
 WATCHDOG_SPAWNED_PID=""
@@ -241,6 +246,188 @@ else
 fi
 
 # ╔══════════════════════════════════════════════════════════════════╗
+# ║  #89: the fire path is OBSERVABLE — every fire leaves a receipt  ║
+# ╚══════════════════════════════════════════════════════════════════╝
+# The #89 receipt: a queen ran 1886s past a 600s cap with NO 'wall-time cap
+# exceeded — killed' line AND NO 'standing down' line. The bash watchdog logic
+# enforces correctly for a well-behaved target (below), but the OLD fire path
+# was silent — the only trace of a kill was the caller's flag→log line, and a
+# stand-down on an already-gone target logged nothing at all. These assert that
+# a fire, a stand-down, and a surviving target now each leave a distinct log.
+echo ""
+echo "── #89: fire path leaves a receipt ──────────────────────────────"
+
+# FIRE: a real hang past the cap logs the kill FROM THE WATCHDOG (independent of
+# the caller/flag path) — the receipt #89 lacked.
+: > "$WATCHDOG_REGISTRY"; : > "$DAEMON_LOG_FILE"
+FLAGF="$TMP/flag_fire"; rm -f "$FLAGF"
+sleep 30 & HANG89=$!
+spawn_watchdog "$HANG89" 1 "$FLAGF" 0 0 "queen #408"
+wait_gone "$HANG89" || true
+sleep 2   # let the post-kill verify poll + log run
+if grep -q "queen #408 exceeded 1s cap — killing pid $HANG89" "$DAEMON_LOG_FILE"; then
+    pass "[#89-fire] watchdog logs the kill AS IT FIRES (receipt independent of caller)"
+else
+    fail "[#89-fire] fire left no 'exceeded cap — killing' receipt"
+fi
+if grep -q "queen #408 target pid $HANG89 killed at 1s cap" "$DAEMON_LOG_FILE"; then
+    pass "[#89-fire] watchdog confirms the kill LANDED"
+else
+    fail "[#89-fire] no post-kill 'killed at cap' confirmation"
+fi
+if ! grep -q "ESCALATE" "$DAEMON_LOG_FILE"; then
+    pass "[#89-fire] a target that DID die does NOT false-ESCALATE (zombie-aware)"
+else
+    fail "[#89-fire] false ESCALATE on a target that actually died"
+fi
+kill "$HANG89" 2>/dev/null; wait "$HANG89" 2>/dev/null || true
+
+# STAND-DOWN (already exited): the old code `[ -z "$now" ] && exit 0` was silent
+# — a transient empty `ps` on a live pid killed enforcement with no receipt.
+# Now it logs. Target exits well before the cap; the watchdog must SAY so.
+: > "$WATCHDOG_REGISTRY"; : > "$DAEMON_LOG_FILE"
+FLAGG="$TMP/flag_gone2"; rm -f "$FLAGG"
+sleep 1 & GONE89=$!
+spawn_watchdog "$GONE89" 3 "$FLAGG" 0 0 "queen #409"
+wait "$GONE89" 2>/dev/null || true   # exits ~1s, cap is 3s
+sleep 3
+if grep -q "queen #409 target pid $GONE89 already exited before 3s cap — standing down" "$DAEMON_LOG_FILE"; then
+    pass "[#89-standdown] already-exited target now logs a stand-down (was silent)"
+else
+    fail "[#89-standdown] already-exited stand-down still silent"
+fi
+if [ ! -f "$FLAGG" ]; then
+    pass "[#89-standdown] already-exited stand-down does not touch the flag"
+else
+    fail "[#89-standdown] stand-down spuriously touched the flag"
+fi
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  #89: _target_survived — zombie-aware kill verification          ║
+# ╚══════════════════════════════════════════════════════════════════╝
+echo ""
+echo "── #89: _target_survived liveness token ─────────────────────────"
+
+sleep 30 & ALIVE89=$!
+TOKA=$(_proc_starttime "$ALIVE89")
+if _target_survived "$ALIVE89" "$TOKA"; then
+    pass "[#89-survived] live matching pid reads as survived"
+else
+    fail "[#89-survived] live matching pid mis-read as dead"
+fi
+if ! _target_survived "$ALIVE89" "Mon Jan 1 00:00:00 2001"; then
+    pass "[#89-survived] mismatched token (recycled pid) reads as NOT survived"
+else
+    fail "[#89-survived] recycled pid mis-read as survived"
+fi
+# Zombie: SIGKILL it but do NOT reap — ps still reports an lstart, but state Z
+# means dead. A bare start-time check would false-positive "survived"; the
+# stat-guard must read it as dead.
+kill -KILL "$ALIVE89" 2>/dev/null
+zi=0
+while [ "$zi" -lt 40 ]; do
+    zst=$(ps -o stat= -p "$ALIVE89" 2>/dev/null | tr -d ' ')
+    case "$zst" in Z*) break ;; "") break ;; esac
+    sleep 0.1; zi=$((zi + 1))
+done
+if ! _target_survived "$ALIVE89" "$TOKA"; then
+    pass "[#89-survived] SIGKILLed zombie reads as dead (not a false survival)"
+else
+    fail "[#89-survived] zombie mis-read as survived — would false-ESCALATE every kill"
+fi
+wait "$ALIVE89" 2>/dev/null || true
+if ! _target_survived "$ALIVE89" "$TOKA"; then
+    pass "[#89-survived] reaped/gone pid reads as dead"
+else
+    fail "[#89-survived] gone pid mis-read as survived"
+fi
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  #89: a fired target that SURVIVES TERM+KILL pages ESCALATE      ║
+# ╚══════════════════════════════════════════════════════════════════╝
+# A real process cannot survive SIGKILL, so inject the condition the verify path
+# exists to catch: stub _target_survived to report survival. The brief: "a fired
+# watchdog whose target survives TERM+KILL must log ESCALATE-grade loudly."
+echo ""
+echo "── #89: surviving target escalates ──────────────────────────────"
+
+: > "$WATCHDOG_REGISTRY"; : > "$DAEMON_LOG_FILE"
+_target_survived() { return 0; }   # force the "survived" verdict
+sleep 10 & SURV89=$!
+FLAGS="$TMP/flag_surv"; rm -f "$FLAGS"
+spawn_watchdog "$SURV89" 1 "$FLAGS" 0 0 "queen #410"
+# Fire fires at cap(1) + grace(1); the verify poll then loops the full ~2s
+# because the stub always reports survival. Poll the log rather than race a
+# fixed sleep (bounded — never hangs the suite).
+ei=0
+while [ "$ei" -lt 80 ]; do
+    grep -q "ESCALATE — queen #410" "$DAEMON_LOG_FILE" && break
+    sleep 0.1; ei=$((ei + 1))
+done
+if grep -q "ESCALATE — queen #410 target pid $SURV89 SURVIVED TERM+KILL" "$DAEMON_LOG_FILE"; then
+    pass "[#89-escalate] surviving target logs ESCALATE-grade"
+else
+    fail "[#89-escalate] surviving target did NOT log ESCALATE"
+fi
+if grep -q "NOTIFY ops WATCHDOG ESCALATE" "$DAEMON_LOG_FILE"; then
+    pass "[#89-escalate] surviving target pages ops"
+else
+    fail "[#89-escalate] surviving target did NOT page ops"
+fi
+kill "$SURV89" 2>/dev/null; wait "$SURV89" 2>/dev/null || true
+eval "$FUNC_SURVIVED"   # restore the real helper
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  #89: END-TO-END — invoke_conductor's exact watchdog path        ║
+# ╚══════════════════════════════════════════════════════════════════╝
+# Drive the REAL spawn shape (setpgrp+execvp, own process group) exactly as
+# invoke_conductor does, with a long dummy standing in for the claude call, and
+# replicate the caller's wait → flag-check → kill-log tail. The #89 assertion:
+# the target is killed AT the cap, the flag is touched, and the caller logs.
+echo ""
+echo "── #89: end-to-end cap enforcement (invoke_conductor path) ──────"
+
+: > "$WATCHDOG_REGISTRY"; : > "$DAEMON_LOG_FILE"
+QUEEN_WALL_TIME_SECS=2
+E2E_FLAG="$TMP/e2e_flag"; rm -f "$E2E_FLAG"
+# EXACT invoke_conductor spawn: setpgrp + execvp, backgrounded, own group.
+python3 -c "import os,sys; os.setpgrp(); os.execvp(sys.argv[1],sys.argv[1:])" \
+    sleep 30 > /dev/null 2>&1 &
+E2E_QUEEN=$!
+spawn_watchdog "$E2E_QUEEN" "$QUEEN_WALL_TIME_SECS" "$E2E_FLAG" 1 0 "queen #411"
+E2E_WD=$WATCHDOG_SPAWNED_PID
+E2E_START=$(date +%s)
+wait "$E2E_QUEEN" 2>/dev/null
+E2E_RC=$?
+E2E_DUR=$(( $(date +%s) - E2E_START ))
+kill "$E2E_WD" 2>/dev/null; wait "$E2E_WD" 2>/dev/null || true
+# Caller tail (invoke_conductor lines 636-648): flag present ⇒ log the kill.
+if [ -f "$E2E_FLAG" ]; then
+    daemon_log "QUEEN #411: wall-time cap exceeded ${QUEEN_WALL_TIME_SECS}s — killed (${E2E_DUR}s)"
+fi
+if [ "$E2E_DUR" -lt 10 ]; then
+    pass "[#89-e2e] queen killed at the cap (${E2E_DUR}s ≪ 30s target)"
+else
+    fail "[#89-e2e] queen ran full 30s — cap NOT enforced (${E2E_DUR}s)"
+fi
+if [ -f "$E2E_FLAG" ]; then
+    pass "[#89-e2e] timeout flag touched — caller sees the kill"
+else
+    fail "[#89-e2e] flag not touched — caller would mis-record a clean exit"
+fi
+if grep -q "QUEEN #411: wall-time cap exceeded 2s — killed" "$DAEMON_LOG_FILE"; then
+    pass "[#89-e2e] caller logs 'wall-time cap exceeded — killed' (the #89 receipt)"
+else
+    fail "[#89-e2e] caller did NOT log the wall-time kill"
+fi
+if grep -q "queen #411 exceeded 2s cap — killing pid $E2E_QUEEN (process group)" "$DAEMON_LOG_FILE"; then
+    pass "[#89-e2e] watchdog logs the pgid fire independently of the caller"
+else
+    fail "[#89-e2e] watchdog fire left no independent receipt"
+fi
+rm -f "$E2E_FLAG"
+
+# ╔══════════════════════════════════════════════════════════════════╗
 # ║  Source guards: every watchdog site converted + trap wired       ║
 # ╚══════════════════════════════════════════════════════════════════╝
 echo ""
@@ -272,6 +459,17 @@ if grep -q 'recycled — standing down' "$DAEMON_SH"; then
     pass "[guard] identity-check stand-down present in source"
 else
     fail "[guard] identity-check stand-down missing from source"
+fi
+# #89 observability guards: the fire path must log, and a survivor must escalate.
+if grep -q 'exceeded ${timeout}s cap — killing pid' "$DAEMON_SH"; then
+    pass "[guard #89] watchdog logs the fire before signaling"
+else
+    fail "[guard #89] fire-log receipt missing from source"
+fi
+if grep -q 'SURVIVED TERM+KILL' "$DAEMON_SH" && grep -q '_target_survived' "$DAEMON_SH"; then
+    pass "[guard #89] surviving-target ESCALATE present in source"
+else
+    fail "[guard #89] surviving-target ESCALATE missing from source"
 fi
 
 # ╔══════════════════════════════════════════════════════════════════╗
