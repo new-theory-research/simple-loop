@@ -191,6 +191,35 @@ struct App {
     signals_show_runs: bool,
     /// Loaded run cards from wiki/runs/*/index.md + heartbeats.jsonl.
     run_cards: Vec<state::RunCard>,
+    /// Row-selection index in the Cells pane, over the selectable brief rows
+    /// (active/queued/backlog/parked/draft/anomalies — headers/blanks skipped).
+    /// Visible highlight only when Cells has focus; scroll follows it.
+    cells_cursor: usize,
+    /// True when the main pane shows the read-only Brief Detail view (opened
+    /// with Enter on the selected Cells row) instead of the dance floor.
+    show_brief_detail: bool,
+    /// Cached parsed detail for the selected brief. Rebuilt only when the
+    /// selection changes (keyed by brief id) — never per frame.
+    brief_detail: Option<BriefDetailView>,
+}
+
+/// Read-only detail assembled for one brief on Enter: the card-file fields
+/// (`state::CardDetail`) plus runtime facts reused from hive state.
+struct BriefDetailView {
+    card: state::CardDetail,
+    section: &'static str,
+    dispatched_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Worker worktree ("slot") path, when the brief is active.
+    worktree_path: Option<String>,
+    latest_validator_cycle: Option<usize>,
+}
+
+/// One selectable Cells row: its brief id, the render-order section it came
+/// from, and the line index of its primary row (used for scroll-follow).
+pub struct CellSelect {
+    pub brief: String,
+    pub section: &'static str,
+    pub line: usize,
 }
 
 const LEARNING_ROTATION_SECS: u64 = 60;
@@ -229,6 +258,9 @@ impl App {
                 std::path::Path::new("wiki/runs"),
                 std::path::Path::new(".loop/state/signals"),
             ),
+            cells_cursor: 0,
+            show_brief_detail: false,
+            brief_detail: None,
         }
     }
 
@@ -302,6 +334,30 @@ impl App {
     #[cfg(test)]
     fn selected_signal(&self) -> Option<&state::Signal> {
         self.signals.signals.get(self.signal_cursor)
+    }
+
+    /// Move the Cells row selection down one, clamped to the last selectable
+    /// row. `len` is the number of selectable rows this frame.
+    fn cells_cursor_down(&mut self, len: usize) {
+        self.cells_cursor = next_cursor(self.cells_cursor, len);
+    }
+
+    /// Move the Cells row selection up one, clamped at the top.
+    fn cells_cursor_up(&mut self) {
+        self.cells_cursor = prev_cursor(self.cells_cursor);
+    }
+
+    /// Open (or re-open) the Brief Detail view for the current selection. The
+    /// cache is filled lazily in the render loop, which knows the selected
+    /// brief id; here we only flip the flag.
+    fn open_brief_detail(&mut self) {
+        self.show_brief_detail = true;
+    }
+
+    /// Restore the dance floor.
+    fn close_brief_detail(&mut self) {
+        self.show_brief_detail = false;
+        self.brief_detail = None;
     }
 
     fn tick_spinner(&mut self) {
@@ -578,8 +634,34 @@ fn budget_color(current: usize, budget: usize) -> Color {
     }
 }
 
-fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Text<'a> {
+/// Render the Cells pane. `selected` is the ordinal of the highlighted
+/// selectable row (None when the pane isn't focused). Returns the text plus
+/// the ordered list of selectable rows (brief id + primary line index) so the
+/// caller can drive navigation and scroll-follow. Selectable sections, in
+/// render order: Active, Queued, Backlog, Parked, Draft, Anomalies — headers,
+/// blank lines, sub-rows, Pending, and Recent are not selectable.
+fn render_cells<'a>(
+    cells: &state::CellsState,
+    active_section_height: u16,
+    selected: Option<usize>,
+) -> (Text<'a>, Vec<CellSelect>) {
     let mut lines: Vec<Line<'a>> = Vec::new();
+    let mut selectable: Vec<CellSelect> = Vec::new();
+    // Record a selectable row and report whether it's the highlighted one.
+    // Called with the current `lines.len()` (the primary row's line index).
+    let record = |selectable: &mut Vec<CellSelect>, line: usize, brief: &str, section: &'static str| -> bool {
+        let is_sel = selected == Some(selectable.len());
+        selectable.push(CellSelect { brief: brief.to_string(), section, line });
+        is_sel
+    };
+    // Apply the selection highlight to a primary row when it's selected.
+    let highlight = |line: Line<'a>, is_sel: bool| -> Line<'a> {
+        if is_sel {
+            line.style(Style::default().add_modifier(Modifier::REVERSED))
+        } else {
+            line
+        }
+    };
     let section_header = |label: &'static str, color: Color| {
         Line::from(vec![
             Span::styled(
@@ -603,13 +685,14 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
         let total_active = cells.active.len();
         let show_active = total_active.min(active_section_height as usize);
         for brief in cells.active.iter().take(show_active) {
-            lines.push(Line::from(vec![
+            let sel = record(&mut selectable, lines.len(), &brief.brief, "Active");
+            lines.push(highlight(Line::from(vec![
                 Span::styled("  ⬢ ", Style::default().fg(AMBER)),
                 Span::styled(
                     brief.brief.clone(),
                     Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
                 ),
-            ]));
+            ]), sel));
             let age = brief
                 .dispatched_at
                 .map(state::relative_time)
@@ -718,18 +801,29 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
     }
     lines.push(Line::from(""));
 
+    // Runtime-unclassifiable pending briefs (PendingReason::Unknown) are pulled
+    // out of the Pending triage here and rendered later under Anomalies, so the
+    // Decide shelf stays "your judgment is requested" and Anomalies means "state
+    // is inconsistent". Collected during the Pending pass, rendered below.
+    let mut runtime_anomalies: Vec<&state::PendingBrief> = Vec::new();
+
     // ── Pending ───────────────────────────────────────────────────────────────
-    // Partitioned into "Decide" (needs Mattie) and "In flight" (daemon
-    // is working; zero action on her). Glance-level triage: if Decide is
-    // empty, she's not the bottleneck.
+    // Triaged into "Decide" (needs Mattie) and "In flight" (daemon is working;
+    // zero action on her); unclassifiable state routes to Anomalies. Glance-level
+    // triage: if Decide is empty, she's not the bottleneck.
     lines.push(section_header("Pending", CORAL));
     if cells.pending.is_empty() {
         lines.push(empty_row("— no briefs awaiting you"));
     } else {
-        let (decide, in_flight): (Vec<_>, Vec<_>) = cells
-            .pending
-            .iter()
-            .partition(|pb| pb.reason.needs_human());
+        let mut decide: Vec<&state::PendingBrief> = Vec::new();
+        let mut in_flight: Vec<&state::PendingBrief> = Vec::new();
+        for pb in cells.pending.iter() {
+            match pb.reason.shelf() {
+                state::PendingShelf::Decide => decide.push(pb),
+                state::PendingShelf::InFlight => in_flight.push(pb),
+                state::PendingShelf::Anomaly => runtime_anomalies.push(pb),
+            }
+        }
 
         let render_pending_row = |lines: &mut Vec<Line<'a>>, pb: &state::PendingBrief| {
             let (glyph, color) = match pb.reason {
@@ -845,6 +939,7 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
         // digits get "N." (2 chars); blank for unranked. If every brief is
         // unranked, skip the slot entirely — panel looks exactly as before.
         for (idx, qb) in cells.queued.iter().enumerate() {
+            let sel = record(&mut selectable, lines.len(), &qb.brief, "Queued");
             let mut spans: Vec<Span> = Vec::with_capacity(4);
             spans.push(Span::styled("  · ", Style::default().fg(MUTED)));
             let tag = format!("{:>2}. ", idx + 1);
@@ -883,7 +978,7 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
                     Style::default().fg(AMBER),
                 ));
             }
-            lines.push(Line::from(spans));
+            lines.push(highlight(Line::from(spans), sel));
         }
     }
 
@@ -905,37 +1000,66 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
         lines.push(Line::from(""));
         lines.push(section_header(title, MUTED));
         for db in items {
-            lines.push(Line::from(vec![
+            let sel = record(&mut selectable, lines.len(), &db.brief, title);
+            lines.push(highlight(Line::from(vec![
                 Span::styled("  ∘ ", Style::default().fg(MUTED)),
                 Span::styled(
                     db.brief.clone(),
                     Style::default().fg(MUTED).add_modifier(Modifier::DIM),
                 ),
-            ]));
+            ]), sel));
         }
     }
 
     // ── Anomalies ───────────────────────────────────────────────────────────────
-    // Genuinely broken cards only: no index.md, no Status field, or an
-    // unrecognized Status value. Labelled with the real reason and rendered in
-    // amber so they read as "look at this", not background.
+    // One shelf, two sources — per-row reasons distinguish them:
+    //   card-level   — broken cards (no index.md, no Status field, or an
+    //                  unrecognized Status value), from `discover_draft_briefs`.
+    //   runtime-level — pending briefs the runtime can't classify (Unknown),
+    //                  rerouted from the Pending triage above.
+    // Amber so they read as "look at this", not background. Show-don't-hide:
+    // nothing is dropped, only shelved honestly.
     let anomalies: Vec<&state::DraftBrief> = cells
         .drafts
         .iter()
         .filter(|d| d.bucket == state::DraftBucket::Anomaly)
         .collect();
-    if !anomalies.is_empty() {
+    if !anomalies.is_empty() || !runtime_anomalies.is_empty() {
         lines.push(Line::from(""));
         lines.push(section_header("Anomalies", AMBER));
         for db in anomalies {
-            lines.push(Line::from(vec![
+            let sel = record(&mut selectable, lines.len(), &db.brief, "Anomalies");
+            lines.push(highlight(Line::from(vec![
                 Span::styled("  ⚠ ", Style::default().fg(AMBER)),
                 Span::styled(db.brief.clone(), Style::default().fg(MUTED)),
                 Span::styled(
                     format!("  ·  {}", db.reason),
                     Style::default().fg(AMBER).add_modifier(Modifier::DIM),
                 ),
-            ]));
+            ]), sel));
+        }
+        for pb in &runtime_anomalies {
+            // Cycle tell is the orphaned-worker signature Scav decoded: a card
+            // present in no runtime bucket with N validator cycles. Include the
+            // count (and budget when cheaply known) as receipts.
+            let cycles = pb.latest_validator_cycle.unwrap_or(0);
+            let cycle_tell = match pb.cycle_budget {
+                Some(b) => format!("{}/{} cycles", cycles, b),
+                None => format!("{} validator cycles", cycles),
+            };
+            let reason = format!(
+                "in no known runtime bucket ({}) — possible orphaned worker (see #71)",
+                cycle_tell
+            );
+            let sel = record(&mut selectable, lines.len(), &pb.brief, "Anomalies");
+            lines.push(highlight(Line::from(vec![
+                Span::styled("  ⚠ ", Style::default().fg(AMBER)),
+                Span::styled(pb.brief.clone(), Style::default().fg(MUTED)),
+                Span::styled(
+                    format!("  ·  {}", reason),
+                    Style::default().fg(AMBER).add_modifier(Modifier::DIM),
+                ),
+            ]), sel));
         }
     }
 
@@ -978,7 +1102,240 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
         }
     }
 
+    (Text::from(lines), selectable)
+}
+
+/// Selection-index navigation: move down, clamped to the last row. Empty list
+/// keeps the cursor at 0.
+fn next_cursor(cursor: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        (cursor + 1).min(len - 1)
+    }
+}
+
+/// Selection-index navigation: move up, clamped at the top.
+fn prev_cursor(cursor: usize) -> usize {
+    cursor.saturating_sub(1)
+}
+
+/// Color for a card `Status:` value, drawn from the Cells section-header
+/// color vocabulary (queued=blue, active=amber, merged=green, drafts=muted,
+/// not-doing=dim, escalated=coral).
+fn status_color(status: Option<&str>) -> Color {
+    match status.map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("queued") => BLUE,
+        Some("active") | Some("in-progress") | Some("dispatched") => AMBER,
+        Some("merged") | Some("done") | Some("complete") | Some("approved") => STAMP_GREEN,
+        Some("backlog") | Some("parked") | Some("draft") => MUTED,
+        Some("not-doing") => DIM_BORDER,
+        Some("escalated") | Some("blocked") => CORAL,
+        _ => MUTED,
+    }
+}
+
+/// Assemble the read-only detail for a brief: parse its card file once and
+/// reuse runtime facts already in hive state (never recomputed here).
+fn build_brief_detail(
+    cells: &state::CellsState,
+    brief_id: &str,
+    section: &'static str,
+) -> BriefDetailView {
+    let card = state::parse_card_detail(brief_id, Path::new("wiki/briefs/cards"));
+    let active = cells.active.iter().find(|a| a.brief == brief_id);
+    BriefDetailView {
+        card,
+        section,
+        dispatched_at: active.and_then(|a| a.dispatched_at),
+        worktree_path: active.and_then(|a| a.worktree_path.clone()),
+        latest_validator_cycle: active.and_then(|a| a.latest_validator_cycle),
+    }
+}
+
+/// Render the Brief Detail view — a glanceable, read-only summary of one
+/// brief. No network, no git; all fields come from the cached
+/// `BriefDetailView` (card file + hive state), never recomputed per frame.
+fn render_brief_detail<'a>(view: &BriefDetailView) -> Text<'a> {
+    let card = &view.card;
+    let label = |s: &'static str| Span::styled(s, Style::default().fg(MUTED));
+    let val = |s: String| Span::styled(s, Style::default().fg(Color::White));
+    // "absent → false" honesty for boolean-ish fields that default false.
+    let bool_or_false = |v: &Option<String>| match v {
+        Some(s) => s.clone(),
+        None => "absent → false".to_string(),
+    };
+    let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "—".to_string());
+
+    let mut lines: Vec<Line<'a>> = Vec::new();
+
+    // Header: id + colored status.
+    let status_str = card.status.clone().unwrap_or_else(|| "unknown".to_string());
+    lines.push(Line::from(vec![
+        Span::styled(
+            card.brief_id.clone(),
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("   ", Style::default()),
+        label("status "),
+        Span::styled(
+            status_str.clone(),
+            Style::default()
+                .fg(status_color(Some(&status_str)))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("   [{}]", view.section),
+            Style::default().fg(MUTED),
+        ),
+    ]));
+    if !card.card_exists {
+        lines.push(Line::from(Span::styled(
+            "  (no index.md — card fields unavailable)",
+            Style::default().fg(AMBER),
+        )));
+    }
+
+    // Meta line: program/lane, model, human-gate, auto-merge, parallel-safe.
+    lines.push(Line::from(vec![
+        label("program "),
+        val(opt(&card.program)),
+        label("   model "),
+        val(opt(&card.model)),
+    ]));
+    lines.push(Line::from(vec![
+        label("human-gate "),
+        val(opt(&card.human_gate)),
+        label("   auto-merge "),
+        val(bool_or_false(&card.auto_merge)),
+        label("   parallel-safe "),
+        val(bool_or_false(&card.parallel_safe)),
+    ]));
+
+    // Intent centerpiece.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Intent",
+        Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+    )));
+    match &card.intent {
+        Some(text) => lines.push(Line::from(Span::styled(
+            text.clone(),
+            Style::default().fg(Color::White),
+        ))),
+        None => lines.push(Line::from(Span::styled(
+            "— no plain-language summary found in the card",
+            Style::default().fg(MUTED),
+        ))),
+    }
+
+    // Depends-on.
+    lines.push(Line::from(""));
+    if card.depends_on.is_empty() {
+        lines.push(Line::from(vec![label("depends-on "), val("— none".to_string())]));
+    } else {
+        lines.push(Line::from(vec![
+            label("depends-on "),
+            val(card.depends_on.join(", ")),
+        ]));
+    }
+
+    // Issues.
+    if !card.issues.is_empty() {
+        lines.push(Line::from(vec![
+            label("issues "),
+            val(card.issues.join(", ")),
+        ]));
+    }
+
+    // Runtime + locator facts.
+    lines.push(Line::from(""));
+    let branch = card
+        .branch
+        .clone()
+        .unwrap_or_else(|| card.brief_id.clone());
+    lines.push(Line::from(vec![label("branch "), val(branch)]));
+    let cycle_str = match view.latest_validator_cycle {
+        Some(n) => format!("cycle {}", n),
+        None => "—".to_string(),
+    };
+    lines.push(Line::from(vec![label("latest validator "), val(cycle_str)]));
+    if let Some(slot) = &view.worktree_path {
+        lines.push(Line::from(vec![label("worker slot "), val(slot.clone())]));
+    }
+    if let Some(ts) = view.dispatched_at {
+        lines.push(Line::from(vec![
+            label("dispatched "),
+            val(state::relative_time(ts)),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        label("card "),
+        Span::styled(card.card_dir.clone(), Style::default().fg(MUTED)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  (read-only · esc / enter to close)",
+        Style::default().fg(MUTED),
+    )));
+
     Text::from(lines)
+}
+
+/// Render the computed actor-presence strip shown above the dance-floor feed.
+/// Presence is a *fact* derived from state (running.json + full daemon.log
+/// scan), so a quiet class reads as "quiet Xm", never vanishing the way a
+/// windowed feed row can. Absence of signal ≠ signal of absence.
+fn render_presence_strip<'a>(p: &state::ActorPresence) -> Line<'a> {
+    let now = chrono::Utc::now();
+    const ACTIVE_WITHIN: i64 = 180; // seconds
+
+    // queen: recency-based (idle when not fresh).
+    let queen = match state::presence_status(p.queen.last_seen, now, ACTIVE_WITHIN) {
+        state::PresenceStatus::NoneYet => "queen — none yet".to_string(),
+        state::PresenceStatus::Active => "queen active".to_string(),
+        state::PresenceStatus::Quiet(age) => format!("queen idle {age}"),
+    };
+
+    // workers: live count from running.json active[] is the truth; fall back
+    // to log recency when nothing is dispatched.
+    let workers = if !p.active_workers.is_empty() {
+        let names = p
+            .active_workers
+            .iter()
+            .map(|b| truncate_chars(b, 20))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("workers {} active ({})", p.active_workers.len(), names)
+    } else {
+        match state::presence_status(p.workers.last_seen, now, ACTIVE_WITHIN) {
+            state::PresenceStatus::NoneYet => "workers — none yet".to_string(),
+            state::PresenceStatus::Active => "workers active".to_string(),
+            state::PresenceStatus::Quiet(age) => format!("workers quiet {age}"),
+        }
+    };
+
+    // validators: recency + last cycle context.
+    let validators = match state::presence_status(p.validators.last_seen, now, ACTIVE_WITHIN) {
+        state::PresenceStatus::NoneYet => "validators — none yet".to_string(),
+        state::PresenceStatus::Active => "validators active".to_string(),
+        state::PresenceStatus::Quiet(age) => {
+            let mut s = format!("validators quiet {age}");
+            if let Some(b) = &p.validators.last_brief {
+                let tail = match p.validators.last_cycle {
+                    Some(c) => format!(" (last: {} cycle {})", truncate_chars(b, 20), c),
+                    None => format!(" (last: {})", truncate_chars(b, 20)),
+                };
+                s.push_str(&tail);
+            }
+            s
+        }
+    };
+
+    Line::from(Span::styled(
+        format!("{queen}  ·  {workers}  ·  {validators}"),
+        Style::default().fg(MUTED),
+    ))
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -1821,9 +2178,9 @@ fn render_help_modal<'a>() -> Text<'a> {
         Line::from(vec![key("  q"), sep(), desc("quit")]),
         Line::from(vec![key("  ctrl-c"), sep(), desc("quit")]),
         Line::from(vec![key("  tab"), sep(), desc("cycle focus between panels")]),
-        Line::from(vec![key("  j / k"), sep(), desc("scroll panel, or move cursor in Signals")]),
-        Line::from(vec![key("  enter"), sep(), desc("open signal detail (when Signals focused)")]),
-        Line::from(vec![key("  esc"), sep(), desc("close modal")]),
+        Line::from(vec![key("  j / k"), sep(), desc("scroll panel, or move selection in Cells / Signals")]),
+        Line::from(vec![key("  enter"), sep(), desc("open detail — brief (Cells) or signal (Signals)")]),
+        Line::from(vec![key("  esc"), sep(), desc("close modal / brief detail")]),
         Line::from(vec![key("  r"), sep(), desc("toggle Run Cards view in Signals slot (auto-promotes when runs are active)")]),
         Line::from(vec![key("  ?"), sep(), desc("toggle this help modal")]),
         blank(),
@@ -1910,7 +2267,66 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
             .unwrap_or(10);
 
         let hive_text = render_hive(&app);
-        let cells_text = render_cells(&app.cells, app.config.layout.active_section_height);
+        // Cells row selection: highlight only when the pane has focus. The
+        // returned selectable list drives navigation, scroll-follow, and the
+        // Enter → Brief Detail lookup.
+        let cells_focused = app.focused == Panel::Cells;
+        let (cells_text, cells_selectable) = render_cells(
+            &app.cells,
+            app.config.layout.active_section_height,
+            if cells_focused { Some(app.cells_cursor) } else { None },
+        );
+        // Clamp the cursor to the current selectable rows (they come and go as
+        // briefs move between sections).
+        if cells_selectable.is_empty() {
+            app.cells_cursor = 0;
+        } else if app.cells_cursor >= cells_selectable.len() {
+            app.cells_cursor = cells_selectable.len() - 1;
+        }
+        // Scroll the Cells pane only when the selection moves past the viewport
+        // (ListState-style follow). Other panels' scroll is untouched.
+        if cells_focused && !cells_selectable.is_empty() {
+            let cells_vp = terminal
+                .size()
+                .map(|sz| (sz.height as i32 - 11).max(1) as u16)
+                .unwrap_or(20);
+            let line = cells_selectable[app.cells_cursor].line as u16;
+            let idx = Panel::Cells as usize;
+            let top = app.scroll[idx];
+            if line < top {
+                app.scroll[idx] = line;
+            } else if line >= top + cells_vp {
+                app.scroll[idx] = line - cells_vp + 1;
+            }
+        }
+        // Brief Detail cache: (re)build only when the selection changes. Parse
+        // happens here (once per selection), never inside the draw closure.
+        if app.show_brief_detail {
+            match cells_selectable.get(app.cells_cursor) {
+                Some(sel) => {
+                    let stale = app
+                        .brief_detail
+                        .as_ref()
+                        .map(|d| d.card.brief_id != sel.brief)
+                        .unwrap_or(true);
+                    if stale {
+                        app.brief_detail =
+                            Some(build_brief_detail(&app.cells, &sel.brief, sel.section));
+                    }
+                }
+                None => {
+                    // Selection vanished — restore the dance floor.
+                    app.show_brief_detail = false;
+                    app.brief_detail = None;
+                }
+            }
+        }
+        let brief_detail_text = if app.show_brief_detail {
+            app.brief_detail.as_ref().map(render_brief_detail)
+        } else {
+            None
+        };
+        let presence_strip = render_presence_strip(&app.dance_floor.presence);
         let (dance_floor_text, dance_floor_line_count) = render_dance_floor(&app.dance_floor);
         // Mode switch: Signals-slot priority (high→low):
         //   1. Alert signals (signals present) — overrides both buzz and learnings
@@ -1944,6 +2360,7 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
         let df_auto = app.dance_floor_auto_scroll;
         let df_manual_scroll = app.scroll[Panel::DanceFloor as usize];
         let show_buzz = app.focused == Panel::Buzz;
+        let show_brief_detail = app.show_brief_detail && brief_detail_text.is_some();
         let show_help = app.show_help;
         let show_signal_detail = app.show_signal_detail;
         let buzz_cursor_idx = app.buzz_cursor;
@@ -2054,8 +2471,24 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                 main_row[0],
             );
 
-            // Right main slot: Buzz when focused, otherwise Dance Floor
-            if show_buzz {
+            // Right main slot: Brief Detail (Enter on a Cells row) takes
+            // precedence, then Buzz when focused, otherwise the Dance Floor.
+            if let Some(detail_text) = brief_detail_text {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(GOLD))
+                    .title(Span::styled(
+                        " Brief Detail ",
+                        Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+                    ));
+                f.render_widget(
+                    Paragraph::new(detail_text)
+                        .wrap(ratatui::widgets::Wrap { trim: false })
+                        .block(block),
+                    main_row[1],
+                );
+            } else if show_buzz {
                 let buzz_block = app.panel_block(Panel::Buzz);
                 let inner = buzz_block.inner(main_row[1]);
                 f.render_widget(buzz_block, main_row[1]);
@@ -2085,41 +2518,64 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                     buzz_layout[2],
                 );
             } else {
+                // Dance floor: a computed presence strip pinned above the feed
+                // (never scrolls off), then the windowed feed below it. The
+                // strip is a fact from state, so a quiet class stays visible.
+                let df_block = app.panel_block(Panel::DanceFloor);
+                let inner = df_block.inner(main_row[1]);
+                f.render_widget(df_block, main_row[1]);
+                let parts = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(0)])
+                    .split(inner);
+                f.render_widget(Paragraph::new(presence_strip.clone()), parts[0]);
+
                 // Auto-scroll: pin dance floor to bottom unless user manually scrolled up
-                let df_inner_h = main_row[1].height.saturating_sub(2);
+                let df_inner_h = parts[1].height;
                 let df_scroll = if df_auto {
                     dance_floor_line_count.saturating_sub(df_inner_h)
                 } else {
                     df_manual_scroll
                 };
                 f.render_widget(
-                    Paragraph::new(dance_floor_text)
-                        .scroll((df_scroll, 0))
-                        .block(app.panel_block(Panel::DanceFloor)),
-                    main_row[1],
+                    Paragraph::new(dance_floor_text).scroll((df_scroll, 0)),
+                    parts[1],
                 );
             }
 
             // ── footer ────────────────────────────────────────────────────────
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("  q ", Style::default().fg(GOLD)),
-                    Span::styled("quit  ", Style::default().fg(MUTED)),
-                    Span::styled("·  j/k ", Style::default().fg(GOLD)),
-                    Span::styled("scroll  ", Style::default().fg(MUTED)),
-                    Span::styled("·  tab ", Style::default().fg(GOLD)),
-                    Span::styled("cycle  ", Style::default().fg(MUTED)),
-                    Span::styled("·  b ", Style::default().fg(GOLD)),
-                    Span::styled("buzz  ", Style::default().fg(MUTED)),
-                    Span::styled("·  r ", Style::default().fg(GOLD)),
-                    Span::styled("runs toggle  ", Style::default().fg(MUTED)),
-                    Span::styled("·  c ", Style::default().fg(GOLD)),
-                    Span::styled("cells  ", Style::default().fg(MUTED)),
-                    Span::styled("·  ? ", Style::default().fg(GOLD)),
-                    Span::styled("help", Style::default().fg(MUTED)),
-                ])),
-                outer[3],
-            );
+            // Context-aware hint line: Brief Detail shows the back key; Cells
+            // focus swaps the scroll hint for select + enter-detail.
+            let key = |k: &'static str| Span::styled(k, Style::default().fg(GOLD));
+            let dsc = |d: &'static str| Span::styled(d, Style::default().fg(MUTED));
+            let mut footer: Vec<Span> = vec![key("  q "), dsc("quit  ")];
+            if show_brief_detail {
+                footer.push(key("·  esc "));
+                footer.push(dsc("back  "));
+                footer.push(key("·  j/k "));
+                footer.push(dsc("change brief  "));
+            } else if cells_focused {
+                footer.push(key("·  j/k "));
+                footer.push(dsc("select  "));
+                footer.push(key("·  enter "));
+                footer.push(dsc("detail  "));
+            } else {
+                footer.push(key("·  j/k "));
+                footer.push(dsc("scroll  "));
+            }
+            footer.extend([
+                key("·  tab "),
+                dsc("cycle  "),
+                key("·  b "),
+                dsc("buzz  "),
+                key("·  r "),
+                dsc("runs toggle  "),
+                key("·  c "),
+                dsc("cells  "),
+                key("·  ? "),
+                dsc("help"),
+            ]);
+            f.render_widget(Paragraph::new(Line::from(footer)), outer[3]);
 
             // ── help modal overlay ────────────────────────────────────────────
             if show_help {
@@ -2244,8 +2700,18 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                                 }
                             }
                             KeyCode::Char('c') => app.focused = Panel::Cells,
+                            // Brief Detail back behavior — esc or a second enter
+                            // restores the dance floor (mirrors the signal modal).
+                            KeyCode::Esc if app.show_brief_detail => app.close_brief_detail(),
+                            KeyCode::Enter if app.show_brief_detail => app.close_brief_detail(),
                             KeyCode::Enter if app.focused == Panel::Signals => {
                                 app.open_signal_detail();
+                            }
+                            // Enter on a selected Cells row → open Brief Detail.
+                            KeyCode::Enter
+                                if app.focused == Panel::Cells && !cells_selectable.is_empty() =>
+                            {
+                                app.open_brief_detail();
                             }
                             KeyCode::Char('j') => {
                                 if app.focused == Panel::Signals
@@ -2253,6 +2719,8 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                                     && !app.signals_show_runs
                                 {
                                     app.signal_cursor_down();
+                                } else if app.focused == Panel::Cells {
+                                    app.cells_cursor_down(cells_selectable.len());
                                 } else {
                                     app.scroll_down();
                                 }
@@ -2263,6 +2731,8 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                                     && !app.signals_show_runs
                                 {
                                     app.signal_cursor_up();
+                                } else if app.focused == Panel::Cells {
+                                    app.cells_cursor_up();
                                 } else {
                                     if app.focused == Panel::DanceFloor {
                                         app.dance_floor_auto_scroll = false;
@@ -2355,6 +2825,92 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Cells row-selection navigation ─────────────────────────────────────
+
+    #[test]
+    fn next_cursor_clamps_at_last_row() {
+        assert_eq!(next_cursor(0, 3), 1);
+        assert_eq!(next_cursor(1, 3), 2);
+        assert_eq!(next_cursor(2, 3), 2); // clamped at end
+    }
+
+    #[test]
+    fn prev_cursor_clamps_at_top() {
+        assert_eq!(prev_cursor(2), 1);
+        assert_eq!(prev_cursor(0), 0); // clamped at top
+    }
+
+    #[test]
+    fn next_cursor_empty_list_stays_zero() {
+        assert_eq!(next_cursor(0, 0), 0);
+    }
+
+    fn empty_cells() -> state::CellsState {
+        state::CellsState {
+            active: vec![],
+            pending: vec![],
+            queued: vec![],
+            drafts: vec![],
+            recently_finished: vec![],
+            not_doing: vec![],
+            scouts: vec![],
+        }
+    }
+
+    #[test]
+    fn render_cells_selectable_skips_headers_and_covers_all_sections() {
+        let mut cells = empty_cells();
+        cells.active.push(state::ActiveBrief {
+            brief: "brief-1-active".to_string(),
+            branch: "brief-1-active".to_string(),
+            dispatched_at: None,
+            brief_progress: None,
+            latest_validator_cycle: None,
+            cycle_budget: None,
+            worktree_path: None,
+        });
+        cells.queued.push(state::QueuedBrief {
+            brief: "brief-2-queued".to_string(),
+            priority_rank: None,
+            depends_on_secrets: vec![],
+            readiness: state::QueuedReadiness::Ready,
+        });
+        cells.drafts.push(state::DraftBrief {
+            brief: "brief-3-backlog".to_string(),
+            bucket: state::DraftBucket::Backlog,
+            reason: String::new(),
+        });
+        cells.drafts.push(state::DraftBrief {
+            brief: "brief-4-anomaly".to_string(),
+            bucket: state::DraftBucket::Anomaly,
+            reason: "no index.md".to_string(),
+        });
+
+        let (_text, selectable) = render_cells(&cells, 8, None);
+        let ids: Vec<&str> = selectable.iter().map(|s| s.brief.as_str()).collect();
+        // Render order: active, queued, backlog, anomalies — headers/blanks
+        // are not selectable rows.
+        assert_eq!(
+            ids,
+            vec![
+                "brief-1-active",
+                "brief-2-queued",
+                "brief-3-backlog",
+                "brief-4-anomaly"
+            ]
+        );
+        // Line indices strictly increase (each primary row is a distinct line).
+        for pair in selectable.windows(2) {
+            assert!(pair[1].line > pair[0].line);
+        }
+    }
+
+    #[test]
+    fn render_cells_empty_has_no_selectable_rows() {
+        let (_text, selectable) = render_cells(&empty_cells(), 8, None);
+        assert!(selectable.is_empty());
+    }
 
     #[test]
     fn detect_loop_root_in_tmpdir_no_panic() {
