@@ -59,3 +59,25 @@ card status. The five issues are facets of the same missing state machine.
 - `closeout.md` — the lifecycle design and per-issue confirmation. Close #15 #27
   #39 #58 #59 with the merge SHA.
 - `review.md` — gate runbook.
+
+## Design centerpiece (2026-07-12, from the night's claim tally — Mattie flagged the pattern)
+
+**The claims-lifecycle invariant:** a claim ref exists ⟺ its brief is active on
+the claiming box. Tonight's leak tally, every one a queue misbehavior: rq-001's
+June claim blocked its own re-run; three merged briefs never released; the
+starved-window wedge (claim pushed before dispatch's init-commit — reviewer-64,
+recovery impossible without manual ref surgery); serve-009 leaked via sweep
+auto-route (queen saw "already claimed", silently skipped down the list).
+Mechanism: claims are created at one site but released only on the happy path —
+every abnormal exit (park, sweep route, crash, failed dispatch) leaks.
+
+Build shape: (1) every transition that removes a brief from active[] releases
+or transfers its claim in the SAME operation (park, auto-route, over-budget,
+manual-recovery — grep every move-to-* site); (2) dispatch claims LAST, after
+the init-commit lands (kills the starved-window wedge class); (3) startup
+repair + the sweep verify the invariant and release loudly, using apiary
+heartbeats for box-aware liveness once multi-box (a remote box's active claim
+is NOT stale — never reap on local ignorance); (4) loop why's claim_ref check
+already reports these — its receipts are the acceptance test. Retires: Scav's
+doctor patch for claim variants (compensating watcher, noted for the
+watcher-retirement list).
