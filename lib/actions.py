@@ -1877,7 +1877,10 @@ def dispatch(paths):
 # any that end up tracked at HEAD — in a single follow-up commit — so main's tip
 # tree stays clean and old branches can never re-track them (the resurrection
 # class, #83). The physical files stay on disk (gitignored, daemon-local);
-# runtime-events now travels via the hum sidecar (brief-165), not git main.
+# runtime-events SHOULD leave git main entirely (hum sidecar, brief-165) but
+# dispatch still plumbing-commits it (bypasses gitignore, see #88) — until that
+# path closes, main tracks it transiently between dispatch and the next
+# merge-strip. This strip is the janitor, not an invariant.
 STRIP_ON_MAIN = [
     os.path.join(".loop", "state", "progress.json"),
     os.path.join(".loop", "state", "runtime-events.jsonl"),
