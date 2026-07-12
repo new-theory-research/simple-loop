@@ -108,6 +108,10 @@ QUEEN_FAIL_THRESHOLD="${QUEEN_FAIL_THRESHOLD:-3}"
 # Health-probe timeout for auto-resume (lightweight ping, not a full queen).
 # Short enough to not block the tick; long enough to survive a slow connect.
 QUEEN_PROBE_TIMEOUT_SECS="${QUEEN_PROBE_TIMEOUT_SECS:-30}"
+# Issue #15: consecutive identical failures at a repeat-failure site (delivered
+# gate, dispatch, sync) before the site stops silently retrying and raises the
+# EXISTING escalate.json with the receipt (default 3). Config-overridable.
+ESCALATE_AFTER_FAILURES="${ESCALATE_AFTER_FAILURES:-3}"
 # TTL for conductor dedup cache entries. After this many seconds a cached
 # trigger is treated as fresh, allowing re-evaluation of persistent conditions
 # (e.g. stale_brief after a stuck worker exit). 30 min keeps dedup spam-free
@@ -572,6 +576,53 @@ _cb_record_queen_result() {
         notify "Circuit breaker tripped: $CONSECUTIVE_QUEEN_FAILURES consecutive queen failures"
         _cb_write_pause
     fi
+}
+
+# ── Repeat-failure escalation (issue #15) ─────────────────────────────────────
+# Design rule (Mattie): the STATE CHANGE is the fix; notify() is one line at the
+# end. Tonight's receipt — a delivered-gate REFUSED that re-idled identically 13×
+# over 2h15m, silent, no cap — is the failure class. When a gate/dispatch/sync
+# failure repeats IDENTICALLY N times with no human watching, stop silently
+# retrying: raise the EXISTING escalate.json with the receipt, park the brief so
+# it stops being retried each tick, and mark the run degraded (the raised
+# escalation is what turns loop status / hive red). notify() is a latency reducer
+# for the human decision only — never the detection mechanism.
+#
+# The detection state change (fingerprint counter + escalate.json + runtime
+# event + the once-per-fingerprint dedup) lives in lib/failure_tracker.py. This
+# wrapper owns the two bash-side pieces the tracker can't: notify() and the
+# site-specific brief-park, both gated on the tracker's exit code:
+#   10 → escalation raised THIS call (park + notify)
+#   11 → already escalated for this fingerprint → suppress silently (no re-raise)
+#    0 → below threshold → keep going
+# Callers park brief-scoped sites themselves on rc==10 (the park style differs:
+# auto-merge-gate → move-to-awaiting-review; dispatch → drop pending-dispatch).
+record_failure_and_maybe_escalate() {
+    # $1 site, $2 brief (or "-" when repo-level/not brief-scoped), $3 reason line.
+    local site="$1" brief="$2" reason="$3"
+    local rc
+    ESCALATE_AFTER_FAILURES="$ESCALATE_AFTER_FAILURES" \
+        python3 "$DAEMON_LIB_DIR/failure_tracker.py" record "$STATE_DIR" "$site" "$brief" "$reason" \
+        >/dev/null 2>&1
+    rc=$?
+    case "$rc" in
+        10)
+            daemon_log "REPEAT-FAILURE: $site failed ${ESCALATE_AFTER_FAILURES}x identically on ${brief} — stopped retrying, escalate.json raised (receipt: $reason)"
+            notify "Repeat failure: $site ${ESCALATE_AFTER_FAILURES}x on ${brief} — escalated (parked)"
+            ;;
+        11)
+            # Already escalated for this fingerprint — the desk already has the
+            # receipt. Stay silent until a human resolves escalate.json.
+            :
+            ;;
+    esac
+    return "$rc"
+}
+
+# Reset a site's fingerprint counter on success (progress clears the streak).
+clear_failure_fingerprint() {
+    # $1 site, $2 brief (or "-").
+    python3 "$DAEMON_LIB_DIR/failure_tracker.py" clear "$STATE_DIR" "$1" "$2" >/dev/null 2>&1 || true
 }
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -1764,7 +1815,12 @@ sync_project_checkout() {
 
     SYNC_FAIL_COUNT=$((SYNC_FAIL_COUNT + 1))
     daemon_log "SYNC FAILED: diverged ($ahead ahead / $behind behind) — daemon checkout is stale (consecutive: $SYNC_FAIL_COUNT)"
-    if [ "$SYNC_FAIL_COUNT" -ge 3 ] && [ ! -f "$SIGNALS_DIR/escalate.json" ]; then
+    # Issue #15: sync is the repo-level sibling of the delivered-gate loop. It is
+    # NOT parkable (the daemon must keep trying to reconcile its checkout), so the
+    # "stop silently retrying" state change here is: raise escalate.json ONCE
+    # (guarded so it doesn't re-raise every tick), plus notify() + a runtime event
+    # so the degraded state is unmissable instead of a silent per-tick log line.
+    if [ "$SYNC_FAIL_COUNT" -ge "${ESCALATE_AFTER_FAILURES:-3}" ] && [ ! -f "$SIGNALS_DIR/escalate.json" ]; then
         mkdir -p "$SIGNALS_DIR"
         printf '%s\n' \
             '{' \
@@ -1778,6 +1834,9 @@ sync_project_checkout() {
             "  \"consecutive_failures\": $SYNC_FAIL_COUNT" \
             '}' > "$SIGNALS_DIR/escalate.json"
         daemon_log "GIT SYNC: escalate.json written after $SYNC_FAIL_COUNT consecutive failed syncs"
+        notify "GIT SYNC: $SYNC_FAIL_COUNT consecutive failed syncs ($ahead ahead / $behind behind) — escalated"
+        python3 "$DAEMON_LIB_DIR/state.py" append-event "$PROJECT_DIR" repeat_failure_escalated "-" \
+            site=sync consecutive_failures="$SYNC_FAIL_COUNT" ahead="$ahead" behind="$behind" 2>/dev/null || true
     fi
     return 1
 }
@@ -2120,8 +2179,33 @@ print('')
             if [ "$STALENESS_GATED" = "false" ]; then
                 if [ "$AM_FLAG" = "true" ]; then
                     daemon_log "DAEMON ACTION: move-to-pending-merges $active_entry (auto-merge)"
-                    python3 "$DAEMON_ACTIONS" move-to-pending-merges "$active_entry" "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log" && DID_WORK=true
-                    notify "$active_entry complete → queued for auto-merge"
+                    # Issue #15: the delivered-gate REFUSED loop. On refusal this
+                    # exits non-zero and (without intervention) re-idles identically
+                    # every tick. Capture stderr for the receipt, still tee it to
+                    # the log, and count the fingerprint. On the Nth identical
+                    # refusal: escalate + park to awaiting_review so the brief stops
+                    # being re-assessed for auto-merge each tick. Parking uses a
+                    # non-'complete' kind so it bypasses the delivered gate that is
+                    # itself refusing — the park lands instead of re-refusing.
+                    _AM_ERR=$(python3 "$DAEMON_ACTIONS" move-to-pending-merges "$active_entry" "$PROJECT_DIR" 2>&1 1>/dev/null)
+                    _AM_RC=$?
+                    [ -n "$_AM_ERR" ] && printf '%s\n' "$_AM_ERR" >> "$LOG_DIR/daemon.log"
+                    if [ "$_AM_RC" -eq 0 ]; then
+                        DID_WORK=true
+                        clear_failure_fingerprint "auto-merge-gate" "$active_entry"
+                        notify "$active_entry complete → queued for auto-merge"
+                    else
+                        _AM_REASON=$(printf '%s\n' "$_AM_ERR" | grep -E 'REFUSED|gate:' | head -1)
+                        [ -z "$_AM_REASON" ] && _AM_REASON="move-to-pending-merges failed (rc=$_AM_RC)"
+                        record_failure_and_maybe_escalate "auto-merge-gate" "$active_entry" "$_AM_REASON"
+                        if [ $? -eq 10 ]; then
+                            python3 "$DAEMON_ACTIONS" move-to-awaiting-review "$active_entry" "$PROJECT_DIR" \
+                                manual-recovery "repeat-failure escalation (issue #15): auto-merge delivered-gate refused ${ESCALATE_AFTER_FAILURES}x identically — $_AM_REASON" \
+                                2>>"$LOG_DIR/daemon.log" \
+                                && { DID_WORK=true; daemon_log "REPEAT-FAILURE: parked $active_entry to awaiting_review — stops the per-tick auto-merge retry"; } \
+                                || daemon_log "REPEAT-FAILURE: could not park $active_entry (already moved?)"
+                        fi
+                    fi
                 else
                     daemon_log "DAEMON ACTION: move-to-awaiting-review $active_entry (human approval required)"
                     python3 "$DAEMON_ACTIONS" move-to-awaiting-review "$active_entry" "$PROJECT_DIR" \
@@ -2154,11 +2238,35 @@ print('')
             rm -f "$STATE_DIR/pending-dispatch.json"
         else
             daemon_log "DAEMON ACTION: processing pending dispatch"
-            if ! python3 "$DAEMON_ACTIONS" dispatch "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log"; then
+            # Issue #15: the "dispatch failed, retrying once" loop. A dispatch that
+            # fails identically leaves pending-dispatch.json in place and re-tries
+            # every tick, silent. Capture the brief + stderr for the fingerprint,
+            # tee stderr to the log, and count. On the Nth identical failure:
+            # escalate + drop pending-dispatch.json (the existing dep-blocked stop
+            # mechanism) so it stops silently retrying — the receipt on the desk
+            # carries the re-dispatch request.
+            _DISPATCH_BRIEF=$(python3 -c "import json; print(json.load(open('$STATE_DIR/pending-dispatch.json')).get('brief',''))" 2>/dev/null || echo "")
+            [ -z "$_DISPATCH_BRIEF" ] && _DISPATCH_BRIEF="-"
+            if python3 "$DAEMON_ACTIONS" dispatch "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log"; then
+                clear_failure_fingerprint "dispatch" "$_DISPATCH_BRIEF"
+            else
                 daemon_log "DAEMON ACTION: dispatch failed, retrying once"
                 sleep 5
-                python3 "$DAEMON_ACTIONS" dispatch "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log" || \
+                _D_ERR=$(python3 "$DAEMON_ACTIONS" dispatch "$PROJECT_DIR" 2>&1 1>/dev/null)
+                _D_RC=$?
+                [ -n "$_D_ERR" ] && printf '%s\n' "$_D_ERR" >> "$LOG_DIR/daemon.log"
+                if [ "$_D_RC" -eq 0 ]; then
+                    clear_failure_fingerprint "dispatch" "$_DISPATCH_BRIEF"
+                else
                     daemon_log "DAEMON ACTION: dispatch retry failed"
+                    _D_REASON=$(printf '%s\n' "$_D_ERR" | grep -iE 'error|fail|refus|conflict' | head -1)
+                    [ -z "$_D_REASON" ] && _D_REASON="dispatch failed (rc=$_D_RC)"
+                    record_failure_and_maybe_escalate "dispatch" "$_DISPATCH_BRIEF" "$_D_REASON"
+                    if [ $? -eq 10 ]; then
+                        rm -f "$STATE_DIR/pending-dispatch.json"
+                        daemon_log "REPEAT-FAILURE: dropped pending-dispatch.json for $_DISPATCH_BRIEF — stops the per-tick dispatch retry (re-dispatch from the escalation receipt)"
+                    fi
+                fi
             fi
             DID_WORK=true
             ASSESS_OUTPUT=$(assess_state)

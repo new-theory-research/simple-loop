@@ -38,6 +38,13 @@ GIT_REMOTE="origin"
 GIT_MAIN_BRANCH="main"
 LOG_LINES=""
 daemon_log() { LOG_LINES="${LOG_LINES}${1}"$'\n'; }
+# Issue #15: the escalation branch now also calls notify() + appends a runtime
+# event. Stub notify and point DAEMON_LIB_DIR/PROJECT_DIR at throwaway paths so
+# the extracted function runs clean (the append-event call is best-effort, guarded
+# by `|| true` in the daemon). None of these affect the escalate.json assertions.
+notify() { :; }
+DAEMON_LIB_DIR="$TMP/nonexistent-lib"
+PROJECT_DIR="$TMP/nonexistent-project"
 
 # Build an "origin + daemon checkout + other actor" fixture.
 #   $1 = fixture root. Sets: ORIGIN, DAEMON (daemon's project dir), OTHER.

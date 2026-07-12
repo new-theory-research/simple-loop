@@ -21,6 +21,8 @@ site/
 .site/
 .loop/state/last-queen-error.json
 .loop/state/last-queen-success.json
+# issue #15: repeat-failure fingerprint counter — daemon-local volatile state.
+.loop/state/failure-fingerprints.json
 __pycache__/
 .loop/state/progress.json
 .loop/state/runtime-events.jsonl
