@@ -2635,6 +2635,54 @@ def parse_worker_model(brief_file_path):
     return True
 
 
+def parse_budget(brief_file_path):
+    """Read the per-brief iteration budget from a card's `## Budget` section.
+
+    Issue #44: the card's declared budget was decorative — the daemon's
+    max-iterations cap ignored it. This is the read side of the wiring.
+
+    Semantics mirror hive's `parse_cycle_budget` (crates/hive/src/state.rs)
+    exactly: scan the `## Budget` section, return the MAX integer found,
+    bounded by the next `## ` header. This is the same number hive renders as
+    `cycle X/Y`, so the daemon's runaway cap and the operator's on-screen
+    budget agree on one source of truth.
+
+    Prints the integer if a budget is declared; prints NOTHING otherwise so the
+    daemon keeps its global MAX_ITERATIONS default (byte-identical to pre-#44).
+
+    Called by daemon.sh as:
+        python3 actions.py parse-budget <absolute_brief_path>
+    """
+    if not brief_file_path or not os.path.exists(brief_file_path):
+        return True
+    try:
+        with open(brief_file_path) as f:
+            content = f.read()
+    except (IOError, OSError) as e:
+        print(f"parse-budget error: {e}", file=sys.stderr)
+        return True
+
+    in_section = False
+    max_seen = None
+    for line in content.splitlines():
+        if not in_section:
+            # Enter the Budget section when we hit its header (not absorbed).
+            if line.lstrip().startswith("## Budget"):
+                in_section = True
+            continue
+        # Stop at the next section header so integers from adjacent sections
+        # (Anti-patterns, Artifact) can't leak into the running max.
+        if line.lstrip().startswith("## "):
+            break
+        for tok in re.findall(r"\d+", line):
+            n = int(tok)
+            max_seen = n if max_seen is None else max(max_seen, n)
+
+    if max_seen is not None:
+        print(max_seen)
+    return True
+
+
 def parse_cycle_wall_time_secs(paths):
     """Read Cycle-wall-time-secs frontmatter from pending-dispatch brief.
 
@@ -2715,6 +2763,13 @@ def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "parse-worker-model":
         brief_path = sys.argv[2] if len(sys.argv) >= 3 else ""
         parse_worker_model(brief_path)
+        sys.exit(0)
+
+    # parse-budget also takes a single brief file path (issue #44). Same shape
+    # as parse-worker-model: handle before the generic argc guard.
+    if len(sys.argv) >= 2 and sys.argv[1] == "parse-budget":
+        brief_path = sys.argv[2] if len(sys.argv) >= 3 else ""
+        parse_budget(brief_path)
         sys.exit(0)
 
     BRIEF_ACTIONS = ("move-to-eval", "move-to-pending-merges", "move-to-awaiting-review",

@@ -625,6 +625,80 @@ clear_failure_fingerprint() {
     python3 "$DAEMON_LIB_DIR/failure_tracker.py" clear "$STATE_DIR" "$1" "$2" >/dev/null 2>&1 || true
 }
 
+# ── Over-budget park + escalate (issue #44) ──────────────────────────────────
+# A brief that reaches its card's declared `## Budget` cycle count is the
+# unattended-spend ceiling firing. Design rule (Mattie): the STATE CHANGE is the
+# fix — park the brief loudly, then surface the crossing so the director can
+# re-scope / bump tier / stop; notify() is the last line, never the detection.
+# Four steps, in order:
+#   1) STATE CHANGE — park via the shared move-to-awaiting-review manual-recovery
+#      path (reuse of fix-15's delivered-gate park site; do not invent). This
+#      removes the brief from active[], so the budget gate cannot re-fire next
+#      tick for the same brief — exactly one park+escalation.
+#   2) Raise the EXISTING escalate.json signal with the receipt (guarded so it
+#      never clobbers a pre-existing escalation; the park already dedups here).
+#   3) Append an over_budget runtime event (append-event takes any type; the
+#      state.py event schema is untouched — the projector ignores unknown types).
+#   4) notify() last.
+over_budget_park() {
+    local brief_id="$1" iterations_used="$2" budget="$3"
+    local now first_ts
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # First iteration ts = the brief's earliest runtime event (its dispatch);
+    # falls back to now if the events log is unavailable.
+    first_ts=$(python3 -c "
+import json
+brief='$brief_id'; path='$STATE_DIR/runtime-events.jsonl'; first=None
+try:
+    with open(path) as f:
+        for line in f:
+            line=line.strip()
+            if not line:
+                continue
+            try:
+                e=json.loads(line)
+            except Exception:
+                continue
+            if e.get('brief')==brief and e.get('ts'):
+                first=e['ts']; break
+except Exception:
+    pass
+print(first or '$now')
+" 2>/dev/null || echo "$now")
+
+    # 1) STATE CHANGE: park via the shared manual-recovery path.
+    python3 "$DAEMON_LIB_DIR/actions.py" move-to-awaiting-review "$brief_id" "$PROJECT_DIR" \
+        over-budget "reached declared budget ($iterations_used/$budget cycles) — director re-assessment required" \
+        2>>"$LOG_DIR/daemon.log" || true
+
+    # 2) Raise escalate.json (guarded: don't clobber an existing escalation).
+    if [ ! -f "$SIGNALS_DIR/escalate.json" ]; then
+        mkdir -p "$SIGNALS_DIR"
+        printf '%s\n' \
+            '{' \
+            '  "type": "over_budget",' \
+            '  "reason": "brief_reached_declared_budget",' \
+            "  \"timestamp\": \"$now\"," \
+            "  \"brief\": \"$brief_id\"," \
+            "  \"iterations_used\": $iterations_used," \
+            "  \"budget\": $budget," \
+            "  \"first_iteration_ts\": \"$first_ts\"," \
+            "  \"last_iteration_ts\": \"$now\"" \
+            '}' > "$SIGNALS_DIR/escalate.json"
+        daemon_log "OVER-BUDGET: escalate.json written for $brief_id ($iterations_used/$budget cycles)"
+    else
+        daemon_log "OVER-BUDGET: $brief_id reached budget ($iterations_used/$budget) but escalate.json already present — parked without clobbering existing escalation"
+    fi
+
+    # 3) Runtime event (informational; unknown type → ignored by the projector).
+    python3 "$DAEMON_LIB_DIR/state.py" append-event "$PROJECT_DIR" over_budget "$brief_id" \
+        iterations_used="$iterations_used" budget="$budget" \
+        first_iteration_ts="$first_ts" last_iteration_ts="$now" 2>/dev/null || true
+
+    # 4) notify() last.
+    notify "$brief_id: over budget ($iterations_used/$budget cycles) — parked to awaiting_review + escalated"
+}
+
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Worker Iteration                                               ║
 # ╚══════════════════════════════════════════════════════════════════╝
@@ -815,10 +889,47 @@ for b in rc.get('active', []):
         git -C "$WORKTREE_DIR" commit -m "loop: reset progress.json for $brief_id (was: ${existing_brief:-missing})" -q 2>/dev/null
     fi
 
-    # Safety: check iteration count
+    # ── Budget gate (issue #44) ──────────────────────────────────────────────
+    # The card's `## Budget` cycle count is the per-brief runaway ceiling — the
+    # unattended-spend brake for remote queens. Effective budget = the card's
+    # declared cycles when present (parse-budget mirrors hive's `cycle X/Y`
+    # integer), else the global MAX_ITERATIONS default. Absent budget → the
+    # global-default path below is byte-identical to pre-#44 behavior.
     local iteration
     iteration=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('iteration', 0))" 2>/dev/null || echo "0")
-    if [ "$iteration" -ge "$MAX_ITERATIONS" ]; then
+
+    local EFFECTIVE_BUDGET="$MAX_ITERATIONS"
+    local BUDGET_SOURCE="global"
+    local _budget_brief_file
+    _budget_brief_file=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('brief_file', ''))" 2>/dev/null)
+    if [ -n "$_budget_brief_file" ] && [ -f "$WORKTREE_DIR/$_budget_brief_file" ]; then
+        local _card_budget
+        _card_budget=$(python3 "$DAEMON_LIB_DIR/actions.py" parse-budget "$WORKTREE_DIR/$_budget_brief_file" 2>/dev/null)
+        if [ -n "$_card_budget" ]; then
+            EFFECTIVE_BUDGET="$_card_budget"
+            BUDGET_SOURCE="card"
+        fi
+    fi
+
+    # Cheap honesty (issue #44 task 3): log the burn rate every cycle so hive
+    # and the logs show it as it goes — (iter N/BUDGET).
+    wlog "WORKER: iter $((iteration + 1))/$EFFECTIVE_BUDGET for $brief_id (budget: $BUDGET_SOURCE)"
+
+    if [ "$iteration" -ge "$EFFECTIVE_BUDGET" ]; then
+        if [ "$BUDGET_SOURCE" = "card" ]; then
+            # Over the card's declared budget. Design rule (Mattie): the STATE
+            # CHANGE is the fix — park the brief loudly via the same
+            # move-to-awaiting-review manual-recovery path fix-15's delivered
+            # gate uses, raise the EXISTING escalate.json with a receipt, append
+            # an over_budget runtime event, notify() last. The park removes the
+            # brief from active[], so this fires exactly once — no re-fire next
+            # tick.
+            wlog "WORKER: budget reached ($iteration/$EFFECTIVE_BUDGET, source=card) for $brief_id — parking over-budget"
+            over_budget_park "$brief_id" "$iteration" "$EFFECTIVE_BUDGET"
+            return 0
+        fi
+        # Global-default path — byte-identical to pre-#44 behavior (mark
+        # blocked, commit, push). Only reached when the card declares no budget.
         wlog "WORKER: max iterations ($MAX_ITERATIONS) reached — marking blocked"
         python3 -c "
 import json
@@ -835,6 +946,7 @@ with open('$PROGRESS_FILE', 'w') as f:
         git -C "$WORKTREE_DIR" push -u --force-with-lease "$GIT_REMOTE" "$branch" 2>&1 || true
         return 0
     fi
+    # ─────────────────────────────────────────────────────────────────────────
 
     # Tier: worker = per-brief (see top-of-file model tier policy).
     # Default sonnet; override from brief frontmatter Model: line (YAML) or
