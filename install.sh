@@ -88,19 +88,16 @@ python3 "$SCRIPT_DIR/lib/write_provenance.py" "$SCRIPT_DIR" "$INSTALL_DIR" || ec
 
 # Copy lib (daemon runtime)
 cp "$SCRIPT_DIR/lib/daemon.sh" "$INSTALL_DIR/lib/"
-cp "$SCRIPT_DIR/lib/actions.py" "$INSTALL_DIR/lib/"
-cp "$SCRIPT_DIR/lib/assess.py" "$INSTALL_DIR/lib/"
-cp "$SCRIPT_DIR/lib/sweep.py" "$INSTALL_DIR/lib/"
-cp "$SCRIPT_DIR/lib/scouts.py" "$INSTALL_DIR/lib/"
-cp "$SCRIPT_DIR/lib/auto_merge.py" "$INSTALL_DIR/lib/"
-cp "$SCRIPT_DIR/lib/startup_repair.py" "$INSTALL_DIR/lib/"
-cp "$SCRIPT_DIR/lib/_set_card_status.py" "$INSTALL_DIR/lib/"
-cp "$SCRIPT_DIR/lib/queue.py" "$INSTALL_DIR/lib/"
-cp "$SCRIPT_DIR/lib/claim.py" "$INSTALL_DIR/lib/"
-cp "$SCRIPT_DIR/lib/state.py" "$INSTALL_DIR/lib/"
-cp "$SCRIPT_DIR/lib/git_plumbing.py" "$INSTALL_DIR/lib/"
-cp "$SCRIPT_DIR/lib/migrate_runtime_events.py" "$INSTALL_DIR/lib/"
-cp "$SCRIPT_DIR/lib/metrics-report.py" "$INSTALL_DIR/lib/" 2>/dev/null || true
+# All top-level lib modules ship — glob, not a hand-list (a new module missing
+# the bundle cost us loop-why + failure_tracker on 2026-07-12; the list is the
+# ghost-file bug's inverse). Test files stay source-only; lib/scouts/ subdir
+# stays source-only (training watcher, not runtime).
+for _libf in "$SCRIPT_DIR"/lib/*.py; do
+    case "$(basename "$_libf")" in
+        *_test.py|*-test.py|test_*.py) continue ;;
+    esac
+    cp "$_libf" "$INSTALL_DIR/lib/"
+done
 cp "$SCRIPT_DIR/lib/lint.py" "$INSTALL_DIR/lib/" 2>/dev/null || true
 chmod +x "$INSTALL_DIR/lib/daemon.sh"
 
