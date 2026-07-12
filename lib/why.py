@@ -316,6 +316,40 @@ def explain_dispatchability(project_dir, brief_id, running=None, lane=None):
     return checks
 
 
+def slots_available_candidate(project_dir, running=None, lane=None, cap=3):
+    """Pure wake-check for the daemon's slots_available trigger (issue #51).
+
+    Return the brief_id of the first cross-lane dispatchable candidate, or ""
+    if none. The daemon only WAKES the queen on a non-empty return; the queen's
+    assess remains the decider (Mattie's doctrine: the wake check is pure
+    functions the repo already ships, not inference).
+
+    Everything the trigger needs is already a deterministic gate:
+      - "board has capacity" (active < THROTTLE) is the `throttle` check;
+      - "cross-lane work exists" falls out of `lane_mutex` — a queued brief
+        whose Program: is held by an active brief FAILS lane_mutex, so a
+        same-lane candidate can never satisfy `all(ok)`;
+      - "a draining solo head suppresses slot-filling" is the `solo_drain`
+        check (and parallel_safe for the solo head itself).
+    A brief counts only when EVERY explain_dispatchability check passes, so all
+    of these hold by construction — no separate re-derivation.
+
+    Cost is bounded: enumerate is lane-scoped and cheap, and at most `cap`
+    queue-head candidates are evaluated (short-circuits on the first green).
+    """
+    running = _load_running(project_dir, running)
+    lane_spec = _resolve_lane(project_dir, lane)
+    candidates = _queue.enumerate_dispatchable(
+        project_dir, running=running, lane=lane_spec)
+    for cand in candidates[:cap]:
+        brief_id = cand["brief"]
+        checks = explain_dispatchability(
+            project_dir, brief_id, running=running, lane=lane_spec)
+        if all(c.ok for c in checks):
+            return brief_id
+    return ""
+
+
 # ─── Papercuts ledger (Scav, 2026-07-11) ─────────────────────────────
 
 _PAPERCUT_NOTE_SHOWN = [False]
@@ -398,10 +432,44 @@ def _queued_card_ids(project_dir):
     return out
 
 
+def _lane_from_argv(argv):
+    lane = None
+    for i, a in enumerate(argv):
+        if a == "--lane" and i + 1 < len(argv):
+            lane = argv[i + 1]
+        elif a.startswith("--lane="):
+            lane = a[len("--lane="):]
+    return lane
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     project_dir = os.getcwd()
     brief_id = None
+
+    # --slots-available: pure wake-check for the daemon's slots_available
+    # trigger (issue #51). Distinct code path — NO papercut side-effect, NO
+    # checklist print: it runs per daemon tick and must stay cheap and quiet.
+    # Emits three lines when a cross-lane dispatchable candidate exists (exit 0):
+    #   <candidate brief id>
+    #   <queue fingerprint>   (dedup key part 1 — queue changed → re-fire)
+    #   <active-set fingerprint>  (dedup key part 2 — board changed → re-fire)
+    # and prints nothing / exits 1 when there is no candidate. Failure-safe by
+    # the daemon's `|| echo`/`2>/dev/null` wrappers.
+    if "--slots-available" in argv:
+        positional = [a for a in argv if not a.startswith("-")]
+        pdir = positional[0] if positional and os.path.isdir(positional[0]) else project_dir
+        lane = _lane_from_argv(argv)
+        running = _load_running(pdir, None)
+        bid = slots_available_candidate(pdir, running=running, lane=lane)
+        if not bid:
+            return 1
+        qfp = _queue.queue_fingerprint(pdir, lane=_resolve_lane(pdir, lane))
+        afp = ",".join(sorted(e.get("brief", "") for e in running.get("active", [])))
+        print(bid)
+        print(qfp)
+        print(afp)
+        return 0
     # Positional args: [project_dir?] [brief_id?]. `loop why` wraps this passing
     # PROJECT_DIR first, then the optional brief id.
     positional = [a for a in argv if not a.startswith("-")]
