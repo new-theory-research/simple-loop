@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  hum — per-box presence shipper (brief-165). One per box: brings the box's own
+  shipper up on boot. A sidecar by design — the daemon does not know it exists.
+  Placeholders ({{...}}) are filled by `loop init`/install the same way as the
+  daemon plist template (templates/com.scaviefae.simpleloop.plist).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.scaviefae.hum.{{PROJECT_NAME}}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>{{HUM_DIR}}/hum.py</string>
+        <string>--box</string>
+        <string>{{BOX}}</string>
+        <string>--project-dir</string>
+        <string>{{PROJECT_DIR}}</string>
+        <string>--apiary-url</string>
+        <string>{{APIARY_URL}}</string>
+        <string>--token</string>
+        <string>{{APIARY_TOKEN}}</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{{PROJECT_DIR}}</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>{{LOG_FILE}}</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{LOG_FILE}}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+    </dict>
+</dict>
+</plist>
