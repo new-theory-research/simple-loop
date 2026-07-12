@@ -45,8 +45,14 @@ fields, note:
   The dispatcher enforces this as a first-class gate (`lane_mutex_hold`, evaluated
   before the `THROTTLE` and edit-surface gates); `loop why` reports it as the
   `lane_mutex` check. Scoping w.r.t. issue #51 (fill unused `THROTTLE` slots): the
-  extra slots the slot-filler wants are **cross-program** slots only — the mutex and
-  the slot-filler are complementary, never a second thread in the same lane.
+  extra slots the slot-filler fills are **cross-program** slots only — the mutex and
+  the slot-filler are complementary, never a second thread in the same lane. The
+  slot-filler ships as the daemon's `slots_available` wake (issue #51, Phase 1.5 in
+  `lib/daemon.sh`): when a brief is active but a `THROTTLE` slot is open, the daemon
+  runs the pure `why.py --slots-available` check and, if a cross-lane brief is
+  DISPATCHABLE, wakes the queen — which is exactly a same-lane candidate failing the
+  `lane_mutex` check, so the wake is cross-program by construction. The daemon only
+  wakes; the queen still decides whether to dispatch.
 
   *Retired interim encoding:* before the first-class mutex (issue #74), the lane was
   serialized by a shared fiction — every serving card declared `wiki/programs/serving/`

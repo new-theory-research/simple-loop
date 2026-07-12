@@ -11,6 +11,7 @@ so the claim-ref (git ls-remote) predicate exercises real remote state.
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -443,6 +444,154 @@ class WhyTests(unittest.TestCase):
         added = _read(path)[len(before):]
         self.assertIn("serve-003 (preflight)", added)
         self.assertNotIn("serve-010", added)
+
+
+class SlotsAvailableTests(unittest.TestCase):
+    """why.slots_available_candidate — the pure wake-check behind the daemon's
+    slots_available trigger (issue #51). A candidate is returned ONLY when a
+    cross-lane queued brief passes every dispatch gate with an open slot."""
+
+    def setUp(self):
+        self.tmp, self.project = _make_project()
+        self._saved_lane = os.environ.pop("LOOP_LANE", None)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        if self._saved_lane is not None:
+            os.environ["LOOP_LANE"] = self._saved_lane
+
+    def _active(self, brief, edit_surface):
+        return {"brief": brief, "branch": brief,
+                "parallel_safe": True, "edit_surface": edit_surface}
+
+    # serve active (serving lane) + capture dispatchable (capture lane) + a free
+    # THROTTLE slot → capture is the wake candidate. The receipt scenario.
+    def test_cross_lane_dispatchable_wakes(self):
+        _append_config(self.project, "THROTTLE=3")
+        _write_card(self.project, "serve-009", status="active",
+                    program="serving", parallel_safe="true", edit_surface="serving/")
+        _write_card(self.project, "capture-005", status="queued",
+                    program="capture", parallel_safe="true", edit_surface="capture/")
+        running = {"active": [self._active("serve-009", ["serving/"])]}
+        self.assertEqual(
+            why.slots_available_candidate(self.project, running=running, lane=""),
+            "capture-005")
+
+    # A same-lane queued brief while its lane is held by an active brief must NOT
+    # wake — lane_mutex filters it (cross-lane is the whole point).
+    def test_same_lane_only_no_wake(self):
+        _append_config(self.project, "THROTTLE=3")
+        _write_card(self.project, "serve-009", status="active",
+                    program="serving", parallel_safe="true", edit_surface="serving/a")
+        _write_card(self.project, "serve-010", status="queued",
+                    program="serving", parallel_safe="true", edit_surface="serving/b")
+        running = {"active": [self._active("serve-009", ["serving/a"])]}
+        self.assertEqual(
+            why.slots_available_candidate(self.project, running=running, lane=""),
+            "")
+
+    # THROTTLE full (default 1, one active) → no slot → no wake.
+    def test_throttle_full_no_wake(self):
+        _write_card(self.project, "serve-009", status="active",
+                    program="serving", parallel_safe="true", edit_surface="serving/")
+        _write_card(self.project, "capture-005", status="queued",
+                    program="capture", parallel_safe="true", edit_surface="capture/")
+        running = {"active": [self._active("serve-009", ["serving/"])]}
+        # default THROTTLE=1 → board 1/1 → throttle gate closed
+        self.assertEqual(
+            why.slots_available_candidate(self.project, running=running, lane=""),
+            "")
+
+    # A draining solo head suppresses slot-filling wakes (solo_drain gate).
+    def test_solo_drain_suppresses_wake(self):
+        _append_config(self.project, "THROTTLE=3", "SOLO_DRAIN_AFTER_SECS=1")
+        # Solo (parallel-safe:false) brief at the queue head, committed long ago
+        # so it reads as past the drain threshold.
+        _write_card(self.project, "capture-001", status="queued",
+                    program="capture", parallel_safe="false", edit_surface="capture/x")
+        _write_card(self.project, "fleets-002", status="queued",
+                    program="fleets", parallel_safe="true", edit_surface="fleets/y")
+        _write_goals(self.project, ["capture-001", "fleets-002"])
+        _commit_all_backdated(self.project)
+        running = {"active": [self._active("serve-009", ["serving/z"])]}
+        self.assertEqual(
+            why.slots_available_candidate(self.project, running=running, lane=""),
+            "")
+
+    # No queued work → no wake.
+    def test_empty_queue_no_wake(self):
+        _append_config(self.project, "THROTTLE=3")
+        _write_card(self.project, "serve-009", status="active",
+                    program="serving", parallel_safe="true", edit_surface="serving/")
+        running = {"active": [self._active("serve-009", ["serving/"])]}
+        self.assertEqual(
+            why.slots_available_candidate(self.project, running=running, lane=""),
+            "")
+
+    # Cost bound: only the first `cap` queue-head candidates are evaluated. Three
+    # blocked (edit-surface-overlapping) heads ahead of a green brief → with
+    # cap=3 the green one is never reached, so no wake.
+    def test_cap_bounds_evaluation(self):
+        _append_config(self.project, "THROTTLE=3")
+        # Three heads that overlap the active brief's surface (blocked), then a
+        # disjoint one. Goals order fixes the queue head order.
+        for i in range(3):
+            _write_card(self.project, f"blk-00{i}", status="queued",
+                        program="capture", parallel_safe="true", edit_surface="shared/")
+        _write_card(self.project, "green-009", status="queued",
+                    program="fleets", parallel_safe="true", edit_surface="green/")
+        _write_goals(self.project, ["blk-000", "blk-001", "blk-002", "green-009"])
+        running = {"active": [self._active("serve-009", ["shared/"])]}
+        self.assertEqual(
+            why.slots_available_candidate(self.project, running=running, lane="", cap=3),
+            "")
+        # With a larger cap it IS reached.
+        self.assertEqual(
+            why.slots_available_candidate(self.project, running=running, lane="", cap=4),
+            "green-009")
+
+    # The --slots-available CLI emits candidate + queue-fp + active-fp (exit 0),
+    # or nothing (exit 1). These three lines are the daemon's dedup key.
+    def test_cli_emits_dedup_key(self):
+        _append_config(self.project, "THROTTLE=3")
+        _write_card(self.project, "serve-009", status="active",
+                    program="serving", parallel_safe="true", edit_surface="serving/")
+        _write_card(self.project, "capture-005", status="queued",
+                    program="capture", parallel_safe="true", edit_surface="capture/")
+        running = {"active": [self._active("serve-009", ["serving/"])],
+                   "awaiting_review": [], "pending_merges": [],
+                   "completed_pending_eval": [], "history": []}
+        with open(os.path.join(self.project, ".loop", "state", "running.json"), "w") as f:
+            json.dump(running, f)
+        env = dict(os.environ, LOOP_LANE="")
+        r = subprocess.run(
+            [sys.executable, os.path.join(_LIB_DIR, "why.py"),
+             self.project, "--slots-available"],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0)
+        lines = r.stdout.splitlines()
+        self.assertEqual(lines[0], "capture-005")
+        self.assertEqual(lines[2], "serve-009")  # active-set fingerprint
+        self.assertEqual(len(lines), 3)
+
+    def test_cli_no_candidate_exit1(self):
+        # default THROTTLE=1 with one active → no slot → exit 1, no output
+        _write_card(self.project, "serve-009", status="active",
+                    program="serving", parallel_safe="true", edit_surface="serving/")
+        _write_card(self.project, "capture-005", status="queued",
+                    program="capture", parallel_safe="true", edit_surface="capture/")
+        running = {"active": [self._active("serve-009", ["serving/"])],
+                   "awaiting_review": [], "pending_merges": [],
+                   "completed_pending_eval": [], "history": []}
+        with open(os.path.join(self.project, ".loop", "state", "running.json"), "w") as f:
+            json.dump(running, f)
+        env = dict(os.environ, LOOP_LANE="")
+        r = subprocess.run(
+            [sys.executable, os.path.join(_LIB_DIR, "why.py"),
+             self.project, "--slots-available"],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout.strip(), "")
 
 
 if __name__ == "__main__":
