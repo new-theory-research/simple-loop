@@ -32,7 +32,7 @@ fields, note:
 
   > "programs are single-threaded, and we can have a max # of threads going at a
   > time. ft has one going at any time, serve has one going at any time, and if
-  > both are active, they can happen at once." — Mattie, 2026-07-11 (issue #74)
+  > both are active, they can happen at once." — Mattie, 2026-07-11, harness-director session ruling; #74 carries the companion formulation 'two programs can parallelize a single thread'
 
   Two same-lane briefs are sequenced by `goals.md` order and `Depends-on:`, never
   co-dispatched — **even when both are `Parallel-safe:` and their edit surfaces are

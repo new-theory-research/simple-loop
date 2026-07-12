@@ -28,3 +28,4 @@ __pycache__/
 .loop/state/runtime-events.jsonl
 .claude/
 .loop/state/hive.stderr.log
+.loop/state/lane-mutex-dedup.json

@@ -1385,7 +1385,9 @@ def config_int(config, key, default):
 
 
 # ─── Lane mutex (issue #74 — Program: is the unit of parallelism) ─────
-# Mattie's ruling, 2026-07-11 (verbatim): "programs are single-threaded, and we
+# Mattie's ruling, 2026-07-11, harness-director session (verbatim; #74 carries
+# the companion formulation "two programs can parallelize a single thread"):
+# "programs are single-threaded, and we
 # can have a max # of threads going at a time. ft has one going at any time,
 # serve has one going at any time, and if both are active, they can happen at
 # once." A lane is a single thread: at most one active brief per Program: value,
