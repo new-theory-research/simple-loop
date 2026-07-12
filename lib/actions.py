@@ -69,7 +69,18 @@ def read_config(loop_dir):
         "GIT_REMOTE": "origin",
         "GIT_MAIN_BRANCH": "main",
     }
-    config_file = os.path.join(loop_dir, "config.sh")
+    # Mirror daemon.sh source order: config.sh, then config.local.sh overlays
+    # (per-machine, gitignored — LOOP_LANE lives there; standalone consumers
+    # like `loop why` must see the same roster the daemon sees).
+    for _cfg_name in ("config.sh", "config.local.sh"):
+        _cfg_path = os.path.join(loop_dir, _cfg_name)
+        if not os.path.exists(_cfg_path):
+            continue
+        _parse_config_file(_cfg_path, config)
+    return config
+
+
+def _parse_config_file(config_file, config):
     if os.path.exists(config_file):
         with open(config_file) as f:
             for line in f:

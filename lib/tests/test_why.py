@@ -379,3 +379,20 @@ class WhyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestConfigLocalOverlay:
+    def test_lane_read_from_config_local(self, tmp_path):
+        """read_config must overlay config.local.sh (daemon source order) —
+        loop why's first production run reported 'no lane filter' on a laned
+        daemon because the roster lives in the gitignored local overlay."""
+        loop_dir = tmp_path / ".loop"
+        loop_dir.mkdir()
+        (loop_dir / "config.sh").write_text('GIT_MAIN_BRANCH="main"\nLOOP_LANE=""\n')
+        (loop_dir / "config.local.sh").write_text('LOOP_LANE="finetune,capture"\n')
+        import importlib, sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from why import _actions
+        cfg = _actions.read_config(str(loop_dir))
+        assert cfg["LOOP_LANE"] == "finetune,capture"
+        assert cfg["GIT_MAIN_BRANCH"] == "main"
