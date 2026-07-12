@@ -2410,6 +2410,73 @@ def validator_presence_check(brief_file_path, worktree_dir):
     return missing
 
 
+def scan_merged_card_ids(project_dir):
+    """Card ids with Status: merged — the ONLY dependency-satisfaction signal the
+    dispatch enforcer recognizes (card-is-truth, brief-108).
+
+    A dependency that finished via a director arc carries card Status: complete
+    (or awaiting_review), NOT merged, so it reads as UNMET here. That is a
+    documented gap queued for design review — reported, not fixed. Factored out
+    of check_depends_on so lib/why.py can call the SAME scan and report what the
+    daemon WILL do (if the enforcer is wrong, the explainer is wrong the same way).
+    """
+    cards_dir = os.path.join(project_dir, "wiki", "briefs", "cards")
+    merged_ids = []
+    if os.path.isdir(cards_dir):
+        for card_id in os.listdir(cards_dir):
+            card_file = os.path.join(cards_dir, card_id, "index.md")
+            if not os.path.isfile(card_file):
+                continue
+            try:
+                in_fm = False
+                with open(card_file) as cf:
+                    for line in cf:
+                        stripped = line.strip()
+                        if stripped == "---":
+                            if not in_fm:
+                                in_fm = True
+                            else:
+                                break
+                        elif in_fm and stripped.lower().startswith("status:"):
+                            if stripped.split(":", 1)[1].strip().lower() == "merged":
+                                merged_ids.append(card_id)
+                            break
+            except Exception:
+                pass
+    return merged_ids
+
+
+def depends_on_verdict(project_dir, brief_file_rel):
+    """The enforcer's exact Depends-on verdict for a brief file on disk.
+
+    Returns (depends_on, merged_ids, unmet):
+      depends_on — parsed dep ids from the brief's **Depends-on:** line
+      merged_ids — card ids with Status: merged (scan_merged_card_ids)
+      unmet      — deps not matched by any merged id (via _brief_id_matches)
+
+    This IS the dispatch dependency gate, factored out of check_depends_on so
+    both the daemon (the gate) and lib/why.py (the explainer) agree byte-for-byte
+    on what "satisfied" means.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from assess import DEPENDS_ON_LINE_RE, parse_depends_on_value
+
+    depends_on = []
+    bf_path = (brief_file_rel if os.path.isabs(brief_file_rel)
+               else os.path.join(project_dir, brief_file_rel)) if brief_file_rel else ""
+    if bf_path and os.path.exists(bf_path):
+        with open(bf_path) as f:
+            for line in f:
+                m = DEPENDS_ON_LINE_RE.match(line)
+                if m:
+                    depends_on = parse_depends_on_value(m.group(1))
+                    break
+
+    merged_ids = scan_merged_card_ids(project_dir)
+    unmet = [d for d in depends_on if not any(_brief_id_matches(d, m) for m in merged_ids)]
+    return depends_on, merged_ids, unmet
+
+
 # ─── Action: check-depends-on ────────────────────────────────────────
 #
 # Brief-014 fix 1 + 2: parse **Depends-on:** from pending-dispatch brief,
@@ -2420,61 +2487,25 @@ def validator_presence_check(brief_file_path, worktree_dir):
 
 def check_depends_on(paths):
     """Verify pending-dispatch brief's Depends-on against card Status==merged."""
-    # Inline import avoids circular dep at module load (assess.py imports from
-    # the same tree but isn't a package sibling).
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from assess import DEPENDS_ON_LINE_RE, parse_depends_on_value
-
     brief_id = ""
     depends_on = []
-    history_ids = []
 
     try:
         with open(paths["pending_dispatch"]) as f:
             spec = json.load(f)
         brief_id = spec.get("brief", "")
         brief_file = spec.get("brief_file", "")
-        bf_path = os.path.join(paths["project_dir"], brief_file) if brief_file else ""
 
-        if bf_path and os.path.exists(bf_path):
-            with open(bf_path) as f:
-                for line in f:
-                    m = DEPENDS_ON_LINE_RE.match(line)
-                    if m:
-                        depends_on = parse_depends_on_value(m.group(1))
-                        break
+        # depends_on_verdict IS the dependency gate (shared with lib/why.py):
+        # parse the brief's Depends-on, scan cards for Status==merged, diff.
+        depends_on, merged_ids, unmet = depends_on_verdict(
+            paths["project_dir"], brief_file)
 
         if not depends_on:
             print("allowed")
             print(f"brief={brief_id} depends_on=[] merged_ids=<skipped> match=allowed")
             return True
 
-        # Scan cards for merged status (card-is-truth: no history[] needed)
-        cards_dir = os.path.join(paths["project_dir"], "wiki", "briefs", "cards")
-        merged_ids = []
-        if os.path.isdir(cards_dir):
-            for card_id in os.listdir(cards_dir):
-                card_file = os.path.join(cards_dir, card_id, "index.md")
-                if not os.path.isfile(card_file):
-                    continue
-                try:
-                    in_fm = False
-                    with open(card_file) as cf:
-                        for line in cf:
-                            stripped = line.strip()
-                            if stripped == "---":
-                                if not in_fm:
-                                    in_fm = True
-                                else:
-                                    break
-                            elif in_fm and stripped.lower().startswith("status:"):
-                                if stripped.split(":", 1)[1].strip().lower() == "merged":
-                                    merged_ids.append(card_id)
-                                break
-                except Exception:
-                    pass
-
-        unmet = [d for d in depends_on if not any(_brief_id_matches(d, m) for m in merged_ids)]
         if unmet:
             verdict = f"blocked:{unmet[0]}"
             print(verdict)
