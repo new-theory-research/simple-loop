@@ -41,3 +41,4 @@ __pycache__/
 apiary.db
 apiary.db-wal
 apiary.db-shm
+.loop/state/lane-mutex-dedup.json

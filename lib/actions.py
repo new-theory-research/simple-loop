@@ -1384,6 +1384,88 @@ def config_int(config, key, default):
         return default
 
 
+# ─── Lane mutex (issue #74 — Program: is the unit of parallelism) ─────
+# Mattie's ruling, 2026-07-11, harness-director session (verbatim; #74 carries
+# the companion formulation "two programs can parallelize a single thread"):
+# "programs are single-threaded, and we
+# can have a max # of threads going at a time. ft has one going at any time,
+# serve has one going at any time, and if both are active, they can happen at
+# once." A lane is a single thread: at most one active brief per Program: value,
+# independent of Parallel-safe/edit-surface (a lane is single-threaded even for
+# parallel-safe cards with disjoint surfaces — that IS the point). Cross-program
+# co-running and THROTTLE are unchanged; #51's cross-program slot-filler is
+# complementary. Unlabeled briefs (no Program:) keep the existing surface-based
+# behavior — the ruling governs programs.
+
+def _entry_program(project_dir, entry):
+    """Normalized Program: lane for an active[] entry (card-is-truth).
+
+    Prefers the `program` field the projector records on the entry; falls back
+    to reading the brief's card for a running.json written before that field
+    existed. Normalization matches queue._lane_set members (strip + lower).
+    """
+    prog = entry.get("program")
+    if prog is None:
+        bid = entry.get("brief", "")
+        if bid:
+            card_path = os.path.join(
+                project_dir, "wiki", "briefs", "cards", bid, "index.md")
+            prog = _load_queue_module()._parse_card_program(card_path)
+    return (prog or "").strip().lower()
+
+
+def lane_mutex_blocker(project_dir, program, active):
+    """Return the active[] entry holding lane `program`, or None if free.
+
+    `program` is the candidate brief's normalized Program: value. Unlabeled
+    candidate ('') → None (no mutex; existing surface-based behavior governs).
+    A lane is a single thread: the FIRST active brief with a matching program
+    holds the mutex; every later same-lane brief is refused until it clears.
+    Comparison uses the same normalization as queue._lane_set members.
+
+    Shared by dispatch()'s gate and lib/why.py's lane_mutex check so the
+    explainer's green matches the daemon's dispatch-green.
+    """
+    program = (program or "").strip().lower()
+    if not program:
+        return None
+    for entry in active:
+        if _entry_program(project_dir, entry) == program:
+            return entry
+    return None
+
+
+def _lane_mutex_report_once(paths, brief, held_by):
+    """First-hold-per-(brief, held_by) dedup for the lane-mutex receipt.
+
+    Cross-tick: the daemon re-execs actions.py each tick, so a process-scoped
+    set (assess.py's issue-#50 pattern) would re-fire the log + runtime event
+    every tick. Persist the last-reported blocker per brief in a small state
+    file; return True only when this (brief, held_by) pair hasn't been reported
+    yet. When the blocker changes or the hold clears, the next distinct pair
+    fires — the refusal itself is unconditional; only the noisy log/event is
+    deduped.
+    """
+    path = os.path.join(paths["state_dir"], "lane-mutex-dedup.json")
+    try:
+        with open(path) as f:
+            seen = json.load(f)
+    except (IOError, OSError, ValueError):
+        seen = {}
+    if not isinstance(seen, dict):
+        seen = {}
+    if seen.get(brief) == held_by:
+        return False
+    seen[brief] = held_by
+    try:
+        with open(path, "w") as f:
+            json.dump(seen, f)
+            f.write("\n")
+    except OSError:
+        pass
+    return True
+
+
 def dispatch(paths):
     """Process pending-dispatch.json: concurrency gate + worktree + progress init.
 
@@ -1449,6 +1531,42 @@ def dispatch(paths):
             os.remove(paths["pending_dispatch"])
             return False
 
+    brief_file_abs = (brief_file if os.path.isabs(brief_file)
+                      else os.path.join(project_dir, brief_file))
+
+    # ── Lane mutex gate (issue #74 — Mattie's ruling 2026-07-11) ──────
+    # A program is a single thread: at most one active brief per Program:
+    # value, independent of THROTTLE and Parallel-safe/edit-surface. Placed
+    # BEFORE throttle (a global capacity cap) and the concurrency/surface gate
+    # for two reasons: (1) it is the most specific hold reason — "this lane is
+    # busy" — the first-class predicate #67 asks for, distinct from the generic
+    # throttle_reached / concurrency_skip; (2) it is a hard lane invariant that
+    # must NOT depend on the THROTTLE value — #51's slot-filler raises THROTTLE
+    # to fill CROSS-program slots, and the mutex must still hold same-lane
+    # briefs regardless. The concurrency gate below would wrongly co-dispatch
+    # two same-lane parallel-safe briefs with disjoint surfaces — the exact
+    # case the ruling forbids (tonight's serve-005/006/009 receipt).
+    candidate_program = _load_queue_module()._parse_card_program(brief_file_abs)
+    if active and candidate_program:
+        holder = lane_mutex_blocker(project_dir, candidate_program, active)
+        if holder is not None:
+            held_by = holder.get("brief", "?")
+            if _lane_mutex_report_once(paths, brief, held_by):
+                log_action(paths, "lane_mutex_hold", {
+                    "brief": brief,
+                    "program": candidate_program,
+                    "held_by": held_by,
+                })
+                runtime_event(paths, "lane_mutex_hold", brief,
+                              program=candidate_program, held_by=held_by)
+            print(
+                f"lane_mutex_hold: lane {candidate_program!r} is single-threaded "
+                f"— {held_by} active — {brief} deferred",
+                file=sys.stderr,
+            )
+            os.remove(paths["pending_dispatch"])
+            return False
+
     if in_flight >= throttle:
         log_action(paths, "throttle_reached", {
             "brief": brief,
@@ -1460,8 +1578,6 @@ def dispatch(paths):
         os.remove(paths["pending_dispatch"])
         return False
 
-    brief_file_abs = (brief_file if os.path.isabs(brief_file)
-                      else os.path.join(project_dir, brief_file))
     parallel_safe, edit_surface = parse_concurrency_frontmatter(brief_file_abs)
 
     if active:
