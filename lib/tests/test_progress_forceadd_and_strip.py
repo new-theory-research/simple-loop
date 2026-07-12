@@ -184,13 +184,16 @@ class TestMergeStripsProgressFromMain(unittest.TestCase):
 
         state = project / ".loop" / "state"
         state.mkdir(parents=True)
-        # Wave-1b gitignore on main + tracked runtime-events (dispatch plumbing).
-        (project / ".gitignore").write_text(PROGRESS_REL + "\n")
+        # Wave-1b gitignore on main for BOTH files; runtime-events force-added
+        # to model a repo whose main still carries a stale tracked copy from
+        # before the untracking commit (#83) — the merge-strip must remove it.
+        (project / ".gitignore").write_text(PROGRESS_REL + "\n" + ".loop/state/runtime-events.jsonl\n")
         (state / "runtime-events.jsonl").write_text(
             '{"event":"dispatched","brief":"' + brief + '"}\n'
         )
         (project / "README").write_text("seed\n")
-        _git(project, "add", "README", ".gitignore", ".loop/state/runtime-events.jsonl")
+        _git(project, "add", "README", ".gitignore")
+        _git(project, "add", "-f", ".loop/state/runtime-events.jsonl")
         _git(project, "commit", "-q", "-m", "seed")
         _git(project, "push", "-u", "origin", "main", "-q")
 
@@ -263,11 +266,12 @@ class TestMergeStripsProgressFromMain(unittest.TestCase):
                 "git show main:progress.json must fail — main's tree carries no "
                 "progress.json",
             )
-            # runtime-events.jsonl is intentionally NOT stripped — it has no
-            # branch read path and is legitimately committed to main.
-            self.assertIn(
+            # #83: runtime-events.jsonl is ALSO stripped off main now — it must
+            # never re-track (wave-1b: it travels via the hum sidecar, not main).
+            self.assertNotIn(
                 ".loop/state/runtime-events.jsonl", _git(project, "ls-files").stdout,
-                "runtime-events.jsonl must remain tracked on main (not stripped)",
+                "runtime-events.jsonl must NOT be tracked on main after merge "
+                "(#83 strip): the resurrection class depends on it never re-tracking",
             )
         finally:
             shutil.rmtree(str(tmp), ignore_errors=True)
@@ -332,6 +336,238 @@ class TestRebaseInvariantNoConflict(unittest.TestCase):
                              "branch's committed progress.json must survive rebase")
             self.assertEqual(json.loads(shown.stdout)["iteration"], 3,
                              "branch's progress.json content must be preserved")
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+
+EVENTS_REL = ".loop/state/runtime-events.jsonl"
+
+
+class TestMergeStripsBothFilesOneCommit(unittest.TestCase):
+    """#83: a branch carrying BOTH progress.json and a (pre-untracking) stale
+    runtime-events.jsonl → after merge, main tracks NEITHER, and the strip
+    happens in a SINGLE follow-up commit. Drives the real actions.merge()."""
+
+    BRIEF = "brief-83-both"
+
+    def _setup(self, tmp: Path):
+        brief = self.BRIEF
+        origin = tmp / "origin.git"
+        origin.mkdir()
+        _git(origin, "init", "--bare", "-q", "-b", "main")
+
+        project = tmp / "project"
+        project.mkdir()
+        _git(project, "init", "-q", "-b", "main")
+        _git(project, "config", "user.email", "t@t")
+        _git(project, "config", "user.name", "t")
+        _git(project, "remote", "add", "origin", str(origin))
+
+        state = project / ".loop" / "state"
+        state.mkdir(parents=True)
+        # Wave-1b steady state: BOTH files gitignored; main tracks NEITHER.
+        (project / ".gitignore").write_text(PROGRESS_REL + "\n" + EVENTS_REL + "\n")
+        (project / "README").write_text("seed\n")
+        _git(project, "add", "README", ".gitignore")
+        _git(project, "commit", "-q", "-m", "seed")
+        _git(project, "push", "-u", "origin", "main", "-q")
+
+        # Brief branch: real work + force-added progress.json AND
+        # runtime-events.jsonl (models a branch cut before the untracking commit).
+        _git(project, "checkout", "-q", "-b", brief)
+        (project / "work.txt").write_text("work output\n")
+        _write_progress(project, brief, 2, status="complete")
+        (state / "runtime-events.jsonl").write_text(
+            '{"event":"dispatched","brief":"' + brief + '","branch":"' + brief + '"}\n'
+        )
+        _git(project, "add", "work.txt")
+        _git(project, "add", "-f", PROGRESS_REL, EVENTS_REL)
+        _git(project, "commit", "-q", "-m", f"[worker] {brief} done")
+        _git(project, "push", "-u", "origin", brief, "-q")
+        _git(project, "checkout", "-q", "main")
+
+        card = project / "wiki" / "briefs" / "cards" / brief
+        card.mkdir(parents=True)
+        (card / "index.md").write_text(
+            f"---\nID: {brief}\nStatus: active\nAuto-merge: true\n---\n\n# {brief}\n"
+        )
+        _git(project, "add", f"wiki/briefs/cards/{brief}/index.md")
+        _git(project, "commit", "-q", "-m", f"loop: card active for {brief}")
+        _git(project, "push", "origin", "main", "-q")
+
+        # `git checkout main` pruned the (now branch-only) gitignored files and
+        # their empty parent dirs — recreate the state dir before writing.
+        state.mkdir(parents=True, exist_ok=True)
+        (project / ".loop" / "config.sh").write_text(
+            "GIT_REMOTE=origin\nGIT_MAIN_BRANCH=main\n"
+        )
+        (state / "log.jsonl").write_text("")
+        # Working-tree events for the pending_merges projection (untracked on main).
+        with open(state / "runtime-events.jsonl", "w") as f:
+            for e in (
+                {"event": "dispatched", "brief": brief, "branch": brief},
+                {"event": "completed", "brief": brief, "kind": "complete",
+                 "auto_merge": True},
+                {"event": "approved", "brief": brief},
+            ):
+                f.write(json.dumps(e) + "\n")
+        write_running_json(str(project))
+        with open(state / "pending-merge.json", "w") as f:
+            json.dump({"brief": brief, "branch": brief, "title": brief}, f)
+        return project
+
+    def test_both_files_stripped_in_single_commit(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            project = self._setup(tmp)
+
+            # Pre-condition: the BRANCH carries BOTH files committed.
+            for rel in (PROGRESS_REL, EVENTS_REL):
+                self.assertEqual(
+                    _git(project, "show", f"{self.BRIEF}:{rel}", check=False).returncode, 0,
+                    f"pre-condition: brief branch must carry committed {rel}",
+                )
+
+            paths = init_paths(str(project))
+            self.assertTrue(merge(paths), "merge() must succeed")
+
+            tracked = _git(project, "ls-files").stdout
+            self.assertIn("work.txt", tracked, "worker's real content must land on main")
+            # Neither bookkeeping file may be tracked on main after merge.
+            self.assertNotIn(PROGRESS_REL, tracked,
+                             "progress.json must NOT be tracked on main after merge")
+            self.assertNotIn(EVENTS_REL, tracked,
+                             "runtime-events.jsonl must NOT be tracked on main after merge")
+
+            # The strip must be a SINGLE follow-up commit covering both paths.
+            strip_log = _git(
+                project, "log", "--format=%H",
+                "--grep=strip daemon-volatile bookkeeping",
+            ).stdout.split()
+            self.assertEqual(
+                len(strip_log), 1,
+                f"expected exactly ONE strip commit, got {len(strip_log)}",
+            )
+            removed = _git(
+                project, "show", "--name-only", "--diff-filter=D",
+                "--format=", strip_log[0],
+            ).stdout
+            self.assertIn(PROGRESS_REL, removed,
+                          "the single strip commit must remove progress.json")
+            self.assertIn(EVENTS_REL, removed,
+                          "the single strip commit must remove runtime-events.jsonl")
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+
+class TestDispatchNeverReusesStaleBranchRef(unittest.TestCase):
+    """#83/#84: dispatch must not resurrect a branch deleted on origin off a
+    stale local remote-tracking ref. Exercises the real branch_reusable_on_origin
+    gate + ensure_worktree reuse decision with real git."""
+
+    def _seed_project(self, tmp: Path):
+        origin = tmp / "origin.git"
+        origin.mkdir()
+        _git(origin, "init", "--bare", "-q", "-b", "main")
+        project = tmp / "project"
+        project.mkdir()
+        _git(project, "init", "-q", "-b", "main")
+        _git(project, "config", "user.email", "t@t")
+        _git(project, "config", "user.name", "t")
+        _git(project, "remote", "add", "origin", str(origin))
+        (project / "clean.txt").write_text("clean main content\n")
+        _git(project, "add", "clean.txt")
+        _git(project, "commit", "-q", "-m", "seed main")
+        _git(project, "push", "-u", "origin", "main", "-q")
+        (project / ".loop").mkdir(parents=True, exist_ok=True)
+        (project / ".loop" / "config.sh").write_text(
+            "GIT_REMOTE=origin\nGIT_MAIN_BRANCH=main\n"
+        )
+        return origin, project
+
+    def test_deleted_on_origin_stale_ref_cuts_fresh_from_main(self):
+        from actions import branch_reusable_on_origin, ensure_worktree
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            origin, project = self._seed_project(tmp)
+            branch = "brief-z"
+
+            # Build a CONTAMINATED commit off main and plant it as a stale local
+            # remote-tracking ref — origin never advertises this branch.
+            _git(project, "checkout", "-q", "-b", branch)
+            (project / "CONTAMINATED").write_text("resurrected garbage\n")
+            _git(project, "add", "CONTAMINATED")
+            _git(project, "commit", "-q", "-m", "contaminated content")
+            contaminated_sha = _git(project, "rev-parse", "HEAD").stdout.strip()
+            _git(project, "checkout", "-q", "main")
+            _git(project, "branch", "-D", branch)  # drop local branch; keep only the stale ref
+            _git(project, "update-ref", f"refs/remotes/origin/{branch}", contaminated_sha)
+
+            # Pre-condition: stale remote-tracking ref present, origin has no brief-z.
+            self.assertEqual(
+                _git(project, "show-ref", "--verify",
+                     f"refs/remotes/origin/{branch}", check=False).returncode, 0,
+                "pre-condition: stale remote-tracking ref must exist",
+            )
+            self.assertEqual(
+                _git(project, "ls-remote", "--heads", "origin", branch).stdout.strip(), "",
+                "pre-condition: origin must NOT advertise the branch",
+            )
+
+            reusable, note = branch_reusable_on_origin(str(project), "origin", branch)
+            self.assertFalse(reusable, "deleted-on-origin branch must be non-reusable")
+            self.assertIsNone(note, "a cleanly-absent branch is not an offline failure")
+            self.assertNotEqual(
+                _git(project, "show-ref", "--verify",
+                     f"refs/remotes/origin/{branch}", check=False).returncode, 0,
+                "the stale remote-tracking ref must be dropped",
+            )
+
+            # ensure_worktree now cuts FRESH from main — not the contaminated ref.
+            paths = init_paths(str(project))
+            config = {"GIT_REMOTE": "origin", "GIT_MAIN_BRANCH": "main"}
+            wt = ensure_worktree(paths, branch, branch, config)
+            self.assertFalse(
+                (Path(wt) / "CONTAMINATED").exists(),
+                "worktree must be fresh from main — the contaminated content must "
+                "NOT be resurrected",
+            )
+            self.assertTrue((Path(wt) / "clean.txt").exists(),
+                            "worktree must carry main's clean content")
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+    def test_branch_genuinely_on_origin_is_reused(self):
+        from actions import branch_reusable_on_origin, ensure_worktree
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            origin, project = self._seed_project(tmp)
+            branch = "brief-live"
+
+            # A real branch that genuinely exists on origin.
+            _git(project, "checkout", "-q", "-b", branch)
+            (project / "MARKER").write_text("live branch content\n")
+            _git(project, "add", "MARKER")
+            _git(project, "commit", "-q", "-m", "live branch work")
+            _git(project, "push", "-u", "origin", branch, "-q")
+            _git(project, "checkout", "-q", "main")
+            _git(project, "branch", "-D", branch)  # only the remote-tracking ref remains
+
+            reusable, note = branch_reusable_on_origin(str(project), "origin", branch)
+            self.assertTrue(reusable, "a branch present on origin must be reusable")
+            self.assertIsNone(note)
+            self.assertEqual(
+                _git(project, "show-ref", "--verify",
+                     f"refs/remotes/origin/{branch}", check=False).returncode, 0,
+                "the (valid) remote-tracking ref must be preserved",
+            )
+
+            # ensure_worktree reuses the branch — its content is present.
+            paths = init_paths(str(project))
+            config = {"GIT_REMOTE": "origin", "GIT_MAIN_BRANCH": "main"}
+            wt = ensure_worktree(paths, branch, branch, config)
+            self.assertTrue((Path(wt) / "MARKER").exists(),
+                            "reused worktree must carry the origin branch's content")
         finally:
             shutil.rmtree(str(tmp), ignore_errors=True)
 
