@@ -11,7 +11,7 @@ The May hackathon-hardening queue (briefs 142–151) is **complete**: all merged
 
 ## Queued next
 
-_Empty — the next queue is the Draft section below, pending Mattie's review-and-flip._
+1. **brief-160 (brief-state lifecycle — the claims invariant)** — #27 #39 #58 #59 #62 #71; claim exists ⟺ brief active on claiming box; first-class parked; startup board reconciliation. Flipped by Mattie 2026-07-12. Worked via director-iterator (daemon self-dev remains off). Canonical at `wiki/briefs/cards/brief-160-blocked-brief-lifecycle/index.md`.
 
 ## Draft — awaiting human review
 
@@ -27,7 +27,6 @@ one card (proof in `brief-154-issue-intake-triage/closeout.md`).
 3. **brief-157 (unbounded LLM subprocesses — budget/backoff/fill controller)** — #44 #47 #49 #51; generalizes the 2026-07-11 queen circuit breaker to worker/validator/budget. `wiki/briefs/cards/brief-157-unbounded-llm-subprocesses/index.md`.
 4. **brief-158 (lane IDs — unlaned dispatch + brief-NNN-only regex)** — #30 #50; reconcile the lane/ID model. `wiki/briefs/cards/brief-158-lane-id-parsing/index.md`.
 5. **brief-159 (runtime observability — status/sweep signals that cry wolf)** — #31 #38 #53; anchor observables to the running daemon, not local-clone/argv/dispatch-age proxies. `wiki/briefs/cards/brief-159-runtime-observability/index.md`.
-6. **brief-160 (the blocked/parked brief lifecycle)** — #15 #27 #39 #58 #59; give "parked" a first-class state, surface, and unblock path. `wiki/briefs/cards/brief-160-blocked-brief-lifecycle/index.md`.
 7. **brief-161 (cross-repo delivery — target-repo briefs strand their deliverable)** — #35 #36; build artifact resolution + PR hop for target-repo briefs. `wiki/briefs/cards/brief-161-cross-repo-delivery/index.md`.
 8. **brief-163 (input parsing/validation robustness)** — #21 #23; validate-at-parse on LLM/free-form field boundaries. `wiki/briefs/cards/brief-163-input-validation-robustness/index.md`.
 9. **brief-164 (roadmap/misc — field report + capability stubs)** — #1 #3 #4; holding pen with no shared bug mechanism, recommend fan-out at review. `wiki/briefs/cards/brief-164-roadmap-misc/index.md`.
