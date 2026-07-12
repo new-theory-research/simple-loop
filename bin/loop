@@ -120,6 +120,58 @@ with open(config_file, 'w') as f:
 PYEOF
 }
 
+# Commit harness-propagation bookkeeping (baseline re-seed + refreshed prompts)
+# that landed in TRACKED project files. Without this, every `loop update` leaves
+# the project clone dirty (simple_loop.commit rewritten into .loop/config.json,
+# prompts refreshed under .loop/prompts/) and feeds the stranded-commit /
+# state-push churn (issue #78).
+#
+# Scope is surgical: only the specific propagation paths are committed — never
+# the operator's own uncommitted work — via a pathspec commit. No push: the
+# daemon's own sync pushes bookkeeping, and a human-run update in a director
+# clone leaves the commit for their next push. Untracked/unchanged paths are
+# left alone. A failed commit (mid-merge, detached HEAD, …) warns loudly and
+# returns — bookkeeping never aborts the update.
+_commit_propagation_bookkeeping() {
+    # Not a git repo? The re-seed just sits in the working tree; nothing to do.
+    git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+
+    # Candidate propagation paths, project-root-relative. Each is included only
+    # if it is git-TRACKED and currently differs from HEAD.
+    local candidates=(".loop/config.json" ".loop/prompts")
+    local to_stage=() p
+    for p in "${candidates[@]}"; do
+        git -C "$PROJECT_DIR" ls-files --error-unmatch -- "$p" >/dev/null 2>&1 || continue
+        git -C "$PROJECT_DIR" diff --quiet HEAD -- "$p" 2>/dev/null && continue
+        to_stage+=("$p")
+    done
+    [ ${#to_stage[@]} -eq 0 ] && return 0  # nothing tracked+modified => nothing to commit
+
+    # One commit per update; the message names what actually propagated.
+    local has_config=false has_prompts=false s msg sha
+    for s in "${to_stage[@]}"; do
+        [ "$s" = ".loop/config.json" ] && has_config=true
+        [ "$s" = ".loop/prompts" ] && has_prompts=true
+    done
+    if [ "$has_config" = true ] && [ "$has_prompts" = true ]; then
+        msg="loop: update propagation (baseline + prompts)"
+    elif [ "$has_prompts" = true ]; then
+        msg="loop: update propagation (prompts)"
+    else
+        sha=$(python3 -c "import json;print(json.load(open('$LOOP_DIR/config.json')).get('simple_loop',{}).get('commit','unknown'))" 2>/dev/null)
+        msg="loop: update baseline re-seed (simple_loop.commit -> ${sha:-unknown})"
+    fi
+
+    # Pathspec commit: records the working-tree content of exactly these tracked
+    # paths, ignoring the rest of the index (untracked files under a directory
+    # pathspec are NOT swept in).
+    if git -C "$PROJECT_DIR" commit -q -m "$msg" -- "${to_stage[@]}" >/dev/null 2>&1; then
+        echo "  Committed propagation bookkeeping: ${to_stage[*]}"
+    else
+        echo "  ⚠  Could not commit propagation bookkeeping (${to_stage[*]}) — left dirty; commit or discard manually."
+    fi
+}
+
 # ── init ─────────────────────────────────────────────────────
 
 cmd_init() {
@@ -1727,6 +1779,13 @@ cmd_update() {
         --prompts-dir "$LOOP_DIR/prompts" \
         --source-repo "$source_repo" \
         --base-sha "${project_base_sha:-}"
+
+    # ── 6b. Commit propagation bookkeeping (baseline + prompts) in place ──
+    # The re-seed (step 4) and prompt refresh (step 6) rewrite TRACKED project
+    # files. Fold both into a single commit so `loop update` doesn't leave the
+    # clone dirty and feed stranded-commit push churn (issue #78). No push.
+    echo ""
+    _commit_propagation_bookkeeping
 
     # ── 7. Re-sync installed skills + modules (existing behaviors, unchanged) ──
     echo ""
