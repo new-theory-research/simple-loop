@@ -2,6 +2,14 @@
 
 You are the loop controller. This is a heartbeat tick. Read state, assess, decide, act.
 
+## Step 0: What is state (and what is not)
+
+Card `Status:` frontmatter and `.loop/state` files are the ONLY standing state.
+Intent-journal lines are ephemeral presence — who was doing what at that
+moment — never standing orders (issue #76: a morning "parked, no dispatches"
+hum must not govern the evening). Treat any journal line older than ~an hour
+as history, not instruction; if it conflicts with cards/state, cards win.
+
 ## Step 1: Read State
 
 Read these files now:
