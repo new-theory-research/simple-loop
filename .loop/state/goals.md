@@ -31,6 +31,8 @@ one card (proof in `brief-154-issue-intake-triage/closeout.md`).
 8. **brief-163 (input parsing/validation robustness)** — #21 #23; validate-at-parse on LLM/free-form field boundaries. `wiki/briefs/cards/brief-163-input-validation-robustness/index.md`.
 9. **brief-164 (roadmap/misc — field report + capability stubs)** — #1 #3 #4; holding pen with no shared bug mechanism, recommend fan-out at review. `wiki/briefs/cards/brief-164-roadmap-misc/index.md`.
 
+11. **brief-167 (lane stewardship registry — lanes live on a selected box)** — ratified 2026-07-12; git-tracked lane→box map, disjointness validated, handoff = one commit. Depends-on brief-160 (claims invariant makes handoff safe). Draft pending iterator pass. `wiki/briefs/cards/brief-167-lane-stewardship-registry/index.md`.
+
 ## Disposition — prior queue (2026-07-11)
 
 Resolved entries; kept for history:
