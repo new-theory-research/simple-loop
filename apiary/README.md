@@ -36,3 +36,11 @@ journals.
 
 **Do not deploy without Mattie's explicit on-card approval** (infra spend +
 always-on service = always-Mattie). Everything above is verified locally.
+
+### Infrastructure-isolation clause (hard requirement, verbatim)
+
+When the apiary eventually deploys, it gets its OWN Railway project and OWN
+storage, nothing shared with NT product infrastructure, no product env
+vars/tokens. The SQLite-inside-the-service design already satisfies this by
+construction — storage stays in-service, with no external database references
+anywhere.
