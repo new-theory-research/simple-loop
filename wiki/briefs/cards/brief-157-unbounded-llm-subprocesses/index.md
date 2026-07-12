@@ -9,7 +9,7 @@ Human-gate: review
 Target repo: ScavieFae/simple-loop master
 Parallel-safe: false
 Program: harness-improvements
-Issues: ["#44", "#47", "#49", "#51"]
+Issues: ["#44", "#47", "#49", "#51", "#77"]
 Depends-on: none
 Tags: [harness, llm, subprocess, budget, circuit-breaker, throttle]
 ---
