@@ -201,6 +201,16 @@ struct App {
     /// Cached parsed detail for the selected brief. Rebuilt only when the
     /// selection changes (keyed by brief id) — never per frame.
     brief_detail: Option<BriefDetailView>,
+    /// Runtime apiary toggle (`a`). ON = merged all-boxes view; OFF = local-only
+    /// fallback. Default ON; when no apiary is configured the key is a no-op and
+    /// this flag has no effect (the fetch is skipped regardless).
+    apiary_enabled: bool,
+    /// Monotonic timestamp of the last successful apiary fetch, so the strip can
+    /// show "unreachable (last ok 3m)" honestly when a fetch fails.
+    apiary_last_ok: Option<Instant>,
+    /// Transient status hint (message + when set), shown briefly in the footer.
+    /// Used for the "no apiary configured" no-op feedback on `a`.
+    status_hint: Option<(String, Instant)>,
 }
 
 /// Read-only detail assembled for one brief on Enter: the card-file fields
@@ -226,13 +236,22 @@ const LEARNING_ROTATION_SECS: u64 = 60;
 
 impl App {
     fn new() -> Self {
+        // Apiary defaults ON: whenever it's configured, the merged all-boxes view
+        // is the expected posture; local-only is a fallback you drop into.
+        let apiary_enabled = true;
+        let dance_floor = state::DanceFloorState::load(apiary_enabled);
+        let apiary_last_ok = if dance_floor.apiary_status == state::ApiaryStatus::Live {
+            Some(Instant::now())
+        } else {
+            None
+        };
         App {
             focused: Panel::DanceFloor,
             scroll: [0; 5],
             spinner_frame: 0,
             hive: state::HiveState::load(),
             cells: state::CellsState::load(),
-            dance_floor: state::DanceFloorState::load(),
+            dance_floor,
             buzz: buzz::load_buzz_state(std::time::Duration::from_secs(3 * 3600), 0),
             signals: state::SignalsState::load(),
             learnings: state::LearningsState::load(),
@@ -261,6 +280,9 @@ impl App {
             cells_cursor: 0,
             show_brief_detail: false,
             brief_detail: None,
+            apiary_enabled,
+            apiary_last_ok,
+            status_hint: None,
         }
     }
 
@@ -271,7 +293,7 @@ impl App {
     fn refresh_state(&mut self) {
         self.hive = state::HiveState::load();
         self.cells = state::CellsState::load();
-        self.dance_floor = state::DanceFloorState::load();
+        self.reload_dance_floor();
         self.reload_buzz();
         self.signals = state::SignalsState::load();
         self.learnings = state::LearningsState::load();
@@ -285,6 +307,32 @@ impl App {
             std::path::Path::new("wiki/runs"),
             std::path::Path::new(".loop/state/signals"),
         );
+    }
+
+    /// (Re)load the dance floor with the current apiary toggle. Refreshes the
+    /// "last ok" clock whenever the fetch succeeds, so the unreachable-age label
+    /// counts from the last good pull (eyes-don't-lie).
+    fn reload_dance_floor(&mut self) {
+        self.dance_floor = state::DanceFloorState::load(self.apiary_enabled);
+        if self.dance_floor.apiary_status == state::ApiaryStatus::Live {
+            self.apiary_last_ok = Some(Instant::now());
+        }
+    }
+
+    /// `a` — flip the apiary feed on/off. When no apiary is configured the key is
+    /// a no-op that leaves a brief status hint (nothing to toggle). Otherwise it
+    /// flips the toggle and reloads the floor immediately so the strip + feed
+    /// reflect the new view without waiting for the next refresh tick.
+    fn toggle_apiary(&mut self) {
+        if self.dance_floor.apiary_status == state::ApiaryStatus::Unconfigured {
+            self.status_hint = Some((
+                "no apiary configured — .loop/config.local.sh APIARY_URL".to_string(),
+                Instant::now(),
+            ));
+            return;
+        }
+        self.apiary_enabled = !self.apiary_enabled;
+        self.reload_dance_floor();
     }
 
     /// Advance the learning quote if it's been long enough since the last
@@ -1286,7 +1334,10 @@ fn render_brief_detail<'a>(view: &BriefDetailView) -> Text<'a> {
 /// Presence is a *fact* derived from state (running.json + full daemon.log
 /// scan), so a quiet class reads as "quiet Xm", never vanishing the way a
 /// windowed feed row can. Absence of signal ≠ signal of absence.
-fn render_presence_strip<'a>(p: &state::ActorPresence) -> Line<'a> {
+fn render_presence_strip<'a>(
+    p: &state::ActorPresence,
+    apiary: Option<(String, Color)>,
+) -> Line<'a> {
     let now = chrono::Utc::now();
     const ACTIVE_WITHIN: i64 = 180; // seconds
 
@@ -1332,10 +1383,18 @@ fn render_presence_strip<'a>(p: &state::ActorPresence) -> Line<'a> {
         }
     };
 
-    Line::from(Span::styled(
+    let mut spans = vec![Span::styled(
         format!("{queen}  ·  {workers}  ·  {validators}"),
         Style::default().fg(MUTED),
-    ))
+    )];
+    // Apiary view label, when there's something to show (configured). The color
+    // carries the posture: Live reads present; fallback/unreachable read warmer
+    // so the eye registers a reduced view.
+    if let Some((label, color)) = apiary {
+        spans.push(Span::styled("  ·  ", Style::default().fg(MUTED)));
+        spans.push(Span::styled(label, Style::default().fg(color)));
+    }
+    Line::from(spans)
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -2198,6 +2257,7 @@ fn render_help_modal<'a>() -> Text<'a> {
         Line::from(vec![key("  enter"), sep(), desc("open detail — brief (Cells) or signal (Signals)")]),
         Line::from(vec![key("  esc"), sep(), desc("close modal / brief detail")]),
         Line::from(vec![key("  r"), sep(), desc("toggle Run Cards view in Signals slot (auto-promotes when runs are active)")]),
+        Line::from(vec![key("  a"), sep(), desc("fall back to local-only view / return to apiary view")]),
         Line::from(vec![key("  ?"), sep(), desc("toggle this help modal")]),
         blank(),
         section("  Color Legend"),
@@ -2342,7 +2402,21 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
         } else {
             None
         };
-        let presence_strip = render_presence_strip(&app.dance_floor.presence);
+        // Apiary view label for the strip: Live reads present (teal); the
+        // deliberate local-only fallback reads warm/muted (amber); a configured
+        // fetch that failed reads as an honest degraded warning (orange), never
+        // silently as "off". Unconfigured shows nothing.
+        let apiary_last_ok_age = app.apiary_last_ok.map(|t| t.elapsed().as_secs() as i64);
+        let apiary_color = match app.dance_floor.apiary_status {
+            state::ApiaryStatus::Live => TEAL,
+            state::ApiaryStatus::Disabled => AMBER,
+            state::ApiaryStatus::Unreachable => ORANGE,
+            state::ApiaryStatus::Unconfigured => MUTED,
+        };
+        let apiary_seg =
+            state::apiary_view_label(&app.dance_floor.apiary_status, apiary_last_ok_age)
+                .map(|label| (label, apiary_color));
+        let presence_strip = render_presence_strip(&app.dance_floor.presence, apiary_seg);
         let (dance_floor_text, dance_floor_line_count) = render_dance_floor(&app.dance_floor);
         // Mode switch: Signals-slot priority (high→low):
         //   1. Alert signals (signals present) — overrides both buzz and learnings
@@ -2378,6 +2452,11 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
         let show_buzz = app.focused == Panel::Buzz;
         let show_brief_detail = app.show_brief_detail && brief_detail_text.is_some();
         let show_help = app.show_help;
+        // Transient footer hint (e.g. the `a` no-op when no apiary configured),
+        // shown for a few seconds after it's set, then it self-clears.
+        let status_hint = app.status_hint.as_ref().and_then(|(msg, at)| {
+            (at.elapsed() < Duration::from_secs(4)).then(|| msg.clone())
+        });
         let show_signal_detail = app.show_signal_detail;
         let buzz_cursor_idx = app.buzz_cursor;
         let signal_modal_scroll = app.signal_modal_scroll;
@@ -2586,12 +2665,26 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                 dsc("buzz  "),
                 key("·  r "),
                 dsc("runs toggle  "),
+                key("·  a "),
+                dsc("apiary view  "),
                 key("·  c "),
                 dsc("cells  "),
                 key("·  ? "),
                 dsc("help"),
             ]);
-            f.render_widget(Paragraph::new(Line::from(footer)), outer[3]);
+            // Transient status hint (amber) takes over the footer when fresh —
+            // e.g. the `a` no-op message when no apiary is configured.
+            if let Some(hint) = &status_hint {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!("  {}", hint),
+                        Style::default().fg(AMBER),
+                    ))),
+                    outer[3],
+                );
+            } else {
+                f.render_widget(Paragraph::new(Line::from(footer)), outer[3]);
+            }
 
             // ── help modal overlay ────────────────────────────────────────────
             if show_help {
@@ -2716,6 +2809,8 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                                 }
                             }
                             KeyCode::Char('c') => app.focused = Panel::Cells,
+                            // a → fall back to local-only view / return to apiary view
+                            KeyCode::Char('a') => app.toggle_apiary(),
                             // Brief Detail back behavior — esc or a second enter
                             // restores the dance floor (mirrors the signal modal).
                             KeyCode::Esc if app.show_brief_detail => app.close_brief_detail(),
@@ -3031,6 +3126,39 @@ mod tests {
         }
         // Back to frame 0 after full cycle
         assert_eq!(app.spinner_frame, 0);
+    }
+
+    #[test]
+    fn apiary_toggle_defaults_on() {
+        // Default posture is the merged apiary view whenever configured.
+        let app = App::new();
+        assert!(app.apiary_enabled);
+    }
+
+    #[test]
+    fn apiary_toggle_noop_when_unconfigured() {
+        // Run from the crate dir → no .loop config → Unconfigured. `a` is a no-op
+        // that leaves the toggle untouched and posts a status hint.
+        let mut app = App::new();
+        assert_eq!(app.dance_floor.apiary_status, state::ApiaryStatus::Unconfigured);
+        let before = app.apiary_enabled;
+        app.toggle_apiary();
+        assert_eq!(app.apiary_enabled, before, "unconfigured toggle is a no-op");
+        assert!(app.status_hint.is_some(), "unconfigured toggle leaves a hint");
+    }
+
+    #[test]
+    fn apiary_toggle_flips_when_configured() {
+        // Simulate a configured floor so the guard is bypassed and the toggle
+        // flips. reload_dance_floor re-reads disk (Unconfigured here), but the
+        // flip itself must have happened and no hint posted.
+        let mut app = App::new();
+        app.dance_floor.apiary_status = state::ApiaryStatus::Live;
+        app.apiary_enabled = true;
+        app.status_hint = None;
+        app.toggle_apiary();
+        assert!(!app.apiary_enabled, "configured toggle flips ON→OFF");
+        assert!(app.status_hint.is_none(), "configured toggle posts no hint");
     }
 
     fn app_with_buzz_events(n: usize) -> App {

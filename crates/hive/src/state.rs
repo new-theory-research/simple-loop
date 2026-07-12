@@ -2249,6 +2249,10 @@ pub struct DanceFloorState {
     /// differently from signal of absence (the windowed feed simply dropped
     /// the rows) — presence is a computed fact, not a windowed row.
     pub presence: ActorPresence,
+    /// Status of the remote apiary source after this load: unconfigured, off
+    /// (toggle), live, or unreachable. Drives the presence-strip view label so a
+    /// failed fetch reads differently from a deliberate local-only fallback.
+    pub apiary_status: ApiaryStatus,
 }
 
 /// Last-activity fact for one actor class, from an unwindowed daemon.log scan.
@@ -2736,29 +2740,174 @@ pub fn parse_apiary_events(body: &str) -> Vec<LogEvent> {
     out
 }
 
-/// Fetch presence events from the apiary if `HIVE_APIARY_URL` is set. Best-effort
-/// over `curl` (hive already shells out to git/kill; zero new crate deps). Any
-/// failure — unset env, unreachable service, non-JSON — yields zero events and
-/// no error: the apiary path degrades to invisible, never to broken.
-pub fn load_apiary_events() -> Vec<LogEvent> {
-    let Ok(base) = std::env::var(APIARY_URL_ENV) else {
-        return vec![]; // feature off
-    };
-    if base.trim().is_empty() {
-        return vec![];
+/// Config-file keys (no `HIVE_` prefix) read from `.loop/config.{local.,}sh`
+/// when the env is unset. Same names the portal-daemon writes.
+const APIARY_URL_KEY: &str = "APIARY_URL";
+const APIARY_TOKEN_KEY: &str = "APIARY_TOKEN";
+/// Shared dev token when neither env nor config names one — a local two-box run
+/// works out of the box; production sets it explicitly.
+const APIARY_TOKEN_DEFAULT: &str = "dev-token";
+const LOOP_CONFIG_DIR: &str = ".loop";
+
+/// Parse a `config.sh`-style file body into key→value pairs. Mirrors
+/// lib/actions.py `_parse_config_file`: trim each line, skip comment lines and
+/// lines without `=`, split on the first `=`, then strip surrounding matched
+/// quotes off the value. Pure — the same body always yields the same map.
+pub fn parse_config_sh(body: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || !line.contains('=') {
+            continue;
+        }
+        let (key, val) = line.split_once('=').unwrap();
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        // Python's `.strip('"').strip("'")`: peel any surrounding quotes.
+        let val = val.trim().trim_matches('"').trim_matches('\'');
+        out.insert(key.to_string(), val.to_string());
     }
-    let token = std::env::var(APIARY_TOKEN_ENV).unwrap_or_else(|_| "dev-token".to_string());
+    out
+}
+
+/// Read `.loop/config.sh` then `.loop/config.local.sh`, the local file
+/// overlaying the base (per-machine wins) — the same source order the daemon
+/// and `loop why` use. Missing files contribute nothing.
+fn read_loop_config(loop_dir: &Path) -> std::collections::HashMap<String, String> {
+    let mut config = std::collections::HashMap::new();
+    for name in ["config.sh", "config.local.sh"] {
+        if let Ok(body) = fs::read_to_string(loop_dir.join(name)) {
+            for (k, v) in parse_config_sh(&body) {
+                config.insert(k, v);
+            }
+        }
+    }
+    config
+}
+
+/// A resolved apiary endpoint.
+pub struct ApiaryConfig {
+    pub base: String,
+    pub token: String,
+}
+
+/// Resolve the apiary endpoint from env (which wins) then the `.loop` config
+/// map. `None` = unconfigured (no URL anywhere) → the feed stays local-only.
+/// Pure over its inputs so the precedence ladder is unit-testable without
+/// touching process env or disk.
+fn resolve_apiary(
+    env_url: Option<&str>,
+    env_token: Option<&str>,
+    config: &std::collections::HashMap<String, String>,
+) -> Option<ApiaryConfig> {
+    // Env value if non-empty, else the config value if non-empty, else None.
+    let pick = |env: Option<&str>, key: &str| -> Option<String> {
+        if let Some(v) = env {
+            if !v.trim().is_empty() {
+                return Some(v.trim().to_string());
+            }
+        }
+        config
+            .get(key)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let base = pick(env_url, APIARY_URL_KEY)?;
+    let token = pick(env_token, APIARY_TOKEN_KEY)
+        .unwrap_or_else(|| APIARY_TOKEN_DEFAULT.to_string());
+    Some(ApiaryConfig { base, token })
+}
+
+/// Resolve the apiary config from the live process env + `.loop` files.
+fn apiary_config() -> Option<ApiaryConfig> {
+    let env_url = std::env::var(APIARY_URL_ENV).ok();
+    let env_token = std::env::var(APIARY_TOKEN_ENV).ok();
+    let config = read_loop_config(Path::new(LOOP_CONFIG_DIR));
+    resolve_apiary(env_url.as_deref(), env_token.as_deref(), &config)
+}
+
+/// Outcome of one apiary fetch attempt. Distinguishes the four postures the
+/// presence strip must render honestly: no config, toggle off, a good fetch,
+/// and a configured-but-failed fetch (which must never masquerade as off).
+pub enum ApiaryFetch {
+    /// No apiary configured (env or config) — nothing to fetch.
+    Unconfigured,
+    /// Configured but the runtime toggle is off — fetch skipped entirely.
+    Disabled,
+    /// Fetch succeeded (the event list may legitimately be empty).
+    Ok(Vec<LogEvent>),
+    /// Configured, toggle on, but the fetch failed (unreachable / non-JSON).
+    Failed,
+}
+
+/// Fetch apiary presence events, honoring the runtime `enabled` toggle. When
+/// disabled we skip the network entirely (not fetch-and-hide). Config comes from
+/// env (`HIVE_APIARY_URL`/`HIVE_APIARY_TOKEN`) or, absent env, the `.loop`
+/// config files. Best-effort over `curl` (hive already shells out to git/kill;
+/// zero new crate deps); a configured fetch that fails returns `Failed` so the
+/// caller can surface an honest "unreachable" state instead of silent local-only.
+pub fn fetch_apiary_events(enabled: bool) -> ApiaryFetch {
+    let Some(cfg) = apiary_config() else {
+        return ApiaryFetch::Unconfigured; // feature off — no URL anywhere
+    };
+    if !enabled {
+        return ApiaryFetch::Disabled; // toggle off — no per-frame network I/O
+    }
     // since=0: pull the ring and let hive dedup on id + window to 500. v0 keeps
     // hive stateless; the bounded buffer keeps the payload sane.
-    let url = format!("{}/v1/events?since=0", base.trim_end_matches('/'));
+    let url = format!("{}/v1/events?since=0", cfg.base.trim_end_matches('/'));
     let output = std::process::Command::new("curl")
-        .args(["-s", "--max-time", "3", "-H", &format!("X-Apiary-Token: {}", token), &url])
+        .args([
+            "-s",
+            "--max-time",
+            "3",
+            "-H",
+            &format!("X-Apiary-Token: {}", cfg.token),
+            &url,
+        ])
         .output();
     match output {
         Ok(o) if o.status.success() => {
-            parse_apiary_events(&String::from_utf8_lossy(&o.stdout))
+            ApiaryFetch::Ok(parse_apiary_events(&String::from_utf8_lossy(&o.stdout)))
         }
-        _ => vec![],
+        _ => ApiaryFetch::Failed,
+    }
+}
+
+/// The apiary source's status after a load, stored on `DanceFloorState` so the
+/// presence strip can render one of the visible views honestly. A configured
+/// fetch that failed is `Unreachable`, deliberately distinct from `Disabled`
+/// (toggle off): the eyes must never read a fetch failure as "off".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ApiaryStatus {
+    /// No apiary configured — the `a` toggle is a no-op.
+    #[default]
+    Unconfigured,
+    /// Configured, toggle off — local-only fallback view.
+    Disabled,
+    /// Configured, toggle on, last fetch OK — merged all-boxes view.
+    Live,
+    /// Configured, toggle on, last fetch failed — showing local, apiary stale.
+    Unreachable,
+}
+
+/// Render the apiary view label for the presence strip from the load status and
+/// the age (secs) since the last successful fetch. `None` = nothing to show
+/// (unconfigured). Pure so the three visible states are unit-testable.
+pub fn apiary_view_label(status: &ApiaryStatus, last_ok_age_secs: Option<i64>) -> Option<String> {
+    match status {
+        ApiaryStatus::Unconfigured => None,
+        ApiaryStatus::Disabled => Some("view: local only (fallback)".to_string()),
+        ApiaryStatus::Live => Some("view: apiary (all boxes)".to_string()),
+        ApiaryStatus::Unreachable => {
+            let age = match last_ok_age_secs {
+                Some(secs) => format!("last ok {}", fmt_short_age(secs)),
+                None => "never ok".to_string(),
+            };
+            Some(format!("view: apiary — unreachable ({}), showing local", age))
+        }
     }
 }
 
@@ -2791,7 +2940,11 @@ impl LogEvent {
 }
 
 impl DanceFloorState {
-    pub fn load() -> Self {
+    /// Load the floor. `apiary_enabled` is the runtime toggle: when false the
+    /// remote fetch is skipped entirely (no network I/O), local sources still
+    /// render. The returned `apiary_status` records what happened so the caller
+    /// can show an honest view label.
+    pub fn load(apiary_enabled: bool) -> Self {
         let log_path = Path::new(".loop/state/log.jsonl");
         let daemon_log_path = Path::new(".loop/logs/daemon.log");
 
@@ -2854,10 +3007,20 @@ impl DanceFloorState {
             events.extend(load_intent_journal_events(&path));
         }
 
-        // brief-165: remote presence via the apiary. Absent HIVE_APIARY_URL =
-        // feature off (zero events). Remote rows carry a box tag + server stamp
-        // and land in the SAME merge — no new render path.
-        events.extend(load_apiary_events());
+        // brief-165: remote presence via the apiary. Gated by the runtime `a`
+        // toggle: OFF skips the fetch entirely (local-only fallback). Remote rows
+        // carry a box tag + server stamp and land in the SAME merge — no new
+        // render path. The status distinguishes off / live / unreachable so the
+        // strip never renders a failed fetch as a deliberate local-only view.
+        let apiary_status = match fetch_apiary_events(apiary_enabled) {
+            ApiaryFetch::Ok(remote) => {
+                events.extend(remote);
+                ApiaryStatus::Live
+            }
+            ApiaryFetch::Disabled => ApiaryStatus::Disabled,
+            ApiaryFetch::Unconfigured => ApiaryStatus::Unconfigured,
+            ApiaryFetch::Failed => ApiaryStatus::Unreachable,
+        };
 
         // Collapse at-least-once redeliveries on `id` before sorting/capping, so
         // a replayed batch renders exactly once (braces to the apiary's belt).
@@ -2885,7 +3048,7 @@ impl DanceFloorState {
             Path::new(".loop/state/running.json"),
         );
 
-        DanceFloorState { events, presence }
+        DanceFloorState { events, presence, apiary_status }
     }
 }
 
@@ -4455,9 +4618,130 @@ mod tests {
 
     #[test]
     fn apiary_source_off_when_env_unset() {
-        // Feature off: no HIVE_APIARY_URL → zero events, zero errors.
+        // Feature off: no HIVE_APIARY_URL and no .loop config under the crate
+        // dir → Unconfigured, zero events, zero errors.
         std::env::remove_var("HIVE_APIARY_URL");
-        assert_eq!(load_apiary_events().len(), 0);
+        assert!(matches!(
+            fetch_apiary_events(true),
+            ApiaryFetch::Unconfigured
+        ));
+    }
+
+
+    // ── config-file parse (piece 1) ───────────────────────────────────────────
+
+    #[test]
+    fn parse_config_sh_present_absent_quoted_commented() {
+        let body = "\
+# a comment line — skipped
+GIT_REMOTE=origin
+APIARY_URL=\"http://127.0.0.1:8787\"
+APIARY_TOKEN='shh-secret'
+  THROTTLE = 1
+# APIARY_URL=commented-out-should-not-win
+BARE
+";
+        let cfg = parse_config_sh(body);
+        // present, unquoted
+        assert_eq!(cfg.get("GIT_REMOTE").map(String::as_str), Some("origin"));
+        // present, double-quoted → quotes stripped
+        assert_eq!(cfg.get("APIARY_URL").map(String::as_str), Some("http://127.0.0.1:8787"));
+        // present, single-quoted → quotes stripped
+        assert_eq!(cfg.get("APIARY_TOKEN").map(String::as_str), Some("shh-secret"));
+        // whitespace around key and value is trimmed
+        assert_eq!(cfg.get("THROTTLE").map(String::as_str), Some("1"));
+        // absent key
+        assert_eq!(cfg.get("NOT_THERE"), None);
+        // a bare line with no `=` contributes nothing
+        assert_eq!(cfg.get("BARE"), None);
+        // the commented duplicate never overrides the real value
+        assert_eq!(cfg.len(), 4);
+    }
+
+    // ── apiary precedence (piece 1): env wins; local overlays base ─────────────
+
+    #[test]
+    fn resolve_apiary_env_wins_over_config() {
+        let mut config = std::collections::HashMap::new();
+        config.insert("APIARY_URL".to_string(), "http://from-config".to_string());
+        config.insert("APIARY_TOKEN".to_string(), "config-token".to_string());
+        let got = resolve_apiary(Some("http://from-env"), Some("env-token"), &config).unwrap();
+        assert_eq!(got.base, "http://from-env");
+        assert_eq!(got.token, "env-token");
+    }
+
+    #[test]
+    fn resolve_apiary_falls_back_to_config_when_env_unset() {
+        let mut config = std::collections::HashMap::new();
+        config.insert("APIARY_URL".to_string(), "http://from-config".to_string());
+        // token absent everywhere → dev-token default.
+        let got = resolve_apiary(None, None, &config).unwrap();
+        assert_eq!(got.base, "http://from-config");
+        assert_eq!(got.token, "dev-token");
+    }
+
+    #[test]
+    fn resolve_apiary_empty_env_does_not_shadow_config() {
+        // An exported-but-empty env var must not defeat the config fallback.
+        let mut config = std::collections::HashMap::new();
+        config.insert("APIARY_URL".to_string(), "http://from-config".to_string());
+        let got = resolve_apiary(Some("   "), None, &config).unwrap();
+        assert_eq!(got.base, "http://from-config");
+    }
+
+    #[test]
+    fn resolve_apiary_unconfigured_when_no_url_anywhere() {
+        let config = std::collections::HashMap::new();
+        assert!(resolve_apiary(None, None, &config).is_none());
+    }
+
+    #[test]
+    fn read_loop_config_local_overlays_base() {
+        // config.sh sets a base value; config.local.sh overrides it (per-machine
+        // wins) and adds a second key — the same precedence the daemon uses.
+        let dir = std::env::temp_dir().join(format!(
+            "hive-cfg-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.sh"), "APIARY_URL=http://base\nGIT_REMOTE=origin\n").unwrap();
+        std::fs::write(dir.join("config.local.sh"), "APIARY_URL=http://local\nAPIARY_TOKEN=local-token\n").unwrap();
+        let cfg = read_loop_config(&dir);
+        assert_eq!(cfg.get("APIARY_URL").map(String::as_str), Some("http://local"));
+        assert_eq!(cfg.get("APIARY_TOKEN").map(String::as_str), Some("local-token"));
+        assert_eq!(cfg.get("GIT_REMOTE").map(String::as_str), Some("origin"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── view-label states (piece 2): the three visible states + unreachable age ─
+
+    #[test]
+    fn apiary_view_label_three_states() {
+        // Unconfigured: nothing on the strip (the `a` key is a no-op).
+        assert_eq!(apiary_view_label(&ApiaryStatus::Unconfigured, None), None);
+        // Disabled: deliberate local-only fallback.
+        assert_eq!(
+            apiary_view_label(&ApiaryStatus::Disabled, None).as_deref(),
+            Some("view: local only (fallback)")
+        );
+        // Live: the default merged all-boxes view.
+        assert_eq!(
+            apiary_view_label(&ApiaryStatus::Live, Some(0)).as_deref(),
+            Some("view: apiary (all boxes)")
+        );
+        // Unreachable: honest, carries the age since the last good fetch.
+        assert_eq!(
+            apiary_view_label(&ApiaryStatus::Unreachable, Some(180)).as_deref(),
+            Some("view: apiary — unreachable (last ok 3m), showing local")
+        );
+        // Unreachable with no prior success reads "never ok", never "off".
+        assert_eq!(
+            apiary_view_label(&ApiaryStatus::Unreachable, None).as_deref(),
+            Some("view: apiary — unreachable (never ok), showing local")
+        );
     }
 
     #[test]
@@ -4537,7 +4821,7 @@ mod tests {
     fn load_dance_floor_from_path(path: &std::path::Path) -> DanceFloorState {
         let file = match std::fs::File::open(path) {
             Ok(f) => f,
-            Err(_) => return DanceFloorState { events: vec![], presence: Default::default() },
+            Err(_) => return DanceFloorState { events: vec![], presence: Default::default(), apiary_status: ApiaryStatus::Unconfigured },
         };
         let reader = std::io::BufReader::new(file);
         let mut events: Vec<LogEvent> = Vec::new();
@@ -4565,7 +4849,7 @@ mod tests {
         if events.len() > 500 {
             events.drain(..events.len() - 500);
         }
-        DanceFloorState { events, presence: Default::default() }
+        DanceFloorState { events, presence: Default::default(), apiary_status: ApiaryStatus::Unconfigured }
     }
 
     // ── interval_mode tests ───────────────────────────────────────────────────
