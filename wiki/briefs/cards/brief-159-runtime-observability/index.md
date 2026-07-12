@@ -77,3 +77,9 @@ issues: #65 (wall-clock ticks — in flight), #66 (wire notify), and Scav's
 retry→escalation filing (identical failure N times must raise escalate.json,
 not log-and-idle — receipt: delivered-gate refused the same SHA every 15 min
 for an hour, silently).
+
+## Delivered early, slice 2 (2026-07-12): hive selector + presence strip + shelf split
+Merged via director-iteration (see merge for detail). Residuals for this card:
+cells cursor is positional (identity race bounded to one refresh — key by brief
+id if it ever bites); presence scan reads full daemon.log per state-load (add a
+windowed tail when the log grows past ~100k lines).
