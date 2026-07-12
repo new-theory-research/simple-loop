@@ -2035,6 +2035,20 @@ cmd_lint() {
     python3 "$lint_script" "$@"
 }
 
+# ── why (dispatchability explainer) ──────────────────────────
+cmd_why() {
+    require_loop_dir
+    local why_script="$LIB_DIR/why.py"
+    if [ ! -f "$why_script" ]; then
+        why_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/why.py"
+    fi
+    [ -f "$why_script" ] || die "why.py not found. Is Simple Loop installed?"
+
+    # Pass PROJECT_DIR first; an optional <brief-id> follows. No arg = sweep
+    # every Status: queued card.
+    python3 "$why_script" "$PROJECT_DIR" "$@"
+}
+
 # ── sweep ────────────────────────────────────────────────────
 
 cmd_sweep() {
@@ -2398,6 +2412,8 @@ Signals:
 Quality:
   lint <path>              Lint a brief file or directory for format drift
                            <path> = single file or wiki/briefs/cards/ dir
+  why [<brief-id>]         Explain why a queued brief will/won't dispatch
+                           no arg = preflight sweep over every queued card
   sweep [--quick]          Deterministic state validator — 4 structural predicates
   sweep [--auto-route]     Also move orphaned active[] entries to awaiting_review
 
@@ -2436,6 +2452,7 @@ case "${1:-help}" in
     close)   shift; cmd_close "$@" ;;
     metrics) shift; cmd_metrics "$@" ;;
     lint)    shift; cmd_lint "$@" ;;
+    why)     shift; cmd_why "$@" ;;
     sweep)   shift; cmd_sweep "$@" ;;
     install-service)   shift; cmd_install_service "$@" ;;
     uninstall-service) cmd_uninstall_service ;;
