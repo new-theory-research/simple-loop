@@ -283,3 +283,9 @@ Named here so they're tracked, **not** scoped into BRICK 1:
 - `review.md` — gate runbook (Human-gate: review): the coordination-guard proof,
   the additive-off proofs (`HIVE_APIARY_URL` unset, new fields absent), and the
   portal#51 mechanism-supersession note held for the issue comment.
+
+## Follow-up (2026-07-12, from the rq-001 smoke): #85
+hum cannot ship overwrite-style files — heartbeat.json never flows, so a live
+remote box reads dead between events (presence contract violated at its most
+basic). Also first-run cursors must init at EOF (backlog flood). Both surfaced
+during Titania's spin-up; carried here as the brick-2 head items.
