@@ -9,7 +9,7 @@ Human-gate: review
 Target repo: ScavieFae/simple-loop master
 Parallel-safe: false
 Program: harness-improvements
-Issues: ["#21", "#23"]
+Issues: ["#21", "#23", "#68"]
 Depends-on: none
 Tags: [harness, validation, assess, presence-check, robustness]
 ---

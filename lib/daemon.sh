@@ -5,6 +5,8 @@
 #
 # Architecture:
 #   Each tick: assess state → run queen or worker → push → sleep.
+#   Scheduling naps use wall_sleep() (issue #65): short wall-clock slices, not
+#   one process-clock `sleep N`, so machine sleep can't silently freeze a tick.
 #   Queen: reads state, decides what to do (evaluate, dispatch, idle).
 #   Worker: does ONE task from the active brief, commits, exits.
 #   Both run as fresh Claude Code sessions. No long-lived processes.
@@ -74,6 +76,11 @@ VALIDATOR_AGENT_DEFAULT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/core/a
 
 HEARTBEAT_INTERVAL="${_HEARTBEAT_ARG:-${HEARTBEAT_INTERVAL:-300}}"
 WORKER_COOLDOWN="${WORKER_COOLDOWN:-30}"
+# Wall-clock tick slices (issue #65). Long scheduling naps sleep in slices of
+# this many seconds against a wall-clock target instead of one process-clock
+# `sleep N`, so machine sleep (lid close, pmset, VM pause) can't silently steal
+# the nap. See wall_sleep().
+WALL_SLICE_SECS="${WALL_SLICE_SECS:-60}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-20}"
 NTFY_TOPIC="${SIMPLE_LOOP_NTFY_TOPIC:-${NTFY_TOPIC:-}}"
 GIT_REMOTE="${GIT_REMOTE:-origin}"
@@ -225,6 +232,41 @@ notify() {
         "https://ntfy.sh/$NTFY_TOPIC" >/dev/null 2>&1
 }
 
+# Sleep <seconds> against a WALL-CLOCK target, in slices of WALL_SLICE_SECS,
+# instead of one process-clock `sleep N`. Issue #65: a plain long `sleep`
+# suspends with the process, so when the machine sleeps mid-nap (lid close,
+# pmset, VM pause) bash resumes counting the remaining seconds on wake — the
+# daemon then freezes for the whole nap with no tick, no sync, no dispatch, and
+# no log line to distinguish "frozen" from "quietly idle". Here each slice is
+# <= WALL_SLICE_SECS; after a suspend the first slice returns, `now` has already
+# jumped past `target`, and the nap ends immediately. When total elapsed wall
+# time runs past ~2x the intended nap (the machine slept), it's logged loudly
+# and appended to runtime-events.jsonl so the wake is visible history, not
+# silence.
+wall_sleep() {
+    local secs="$1"
+    local start now target rem slice
+    start=$(date +%s)
+    target=$(( start + secs ))
+    while true; do
+        now=$(date +%s)
+        [ "$now" -ge "$target" ] && break
+        rem=$(( target - now ))
+        slice=$(( rem < WALL_SLICE_SECS ? rem : WALL_SLICE_SECS ))
+        sleep "$slice"
+    done
+    now=$(date +%s)
+    local elapsed=$(( now - start ))
+    # Jump detection: total elapsed >= 2x the intended nap means we lost at least
+    # a full nap's worth of wall time we didn't sleep for — the machine slept.
+    if [ "$secs" -gt 0 ] && [ "$elapsed" -ge $(( secs * 2 )) ]; then
+        local past=$(( now - target ))
+        daemon_log "WAKE: wall clock jumped ${past}s past tick target — machine slept; ticking now"
+        python3 "$DAEMON_LIB_DIR/state.py" append-event "$PROJECT_DIR" wake "-" \
+            seconds_past_target="$past" intended_nap_s="$secs" elapsed_s="$elapsed" 2>/dev/null || true
+    fi
+}
+
 # Parse metrics from Claude JSON output.
 # Args: $1=json_file, $2=log_file, $3=source, $4=extra_fields (python dict literal)
 parse_metrics() {
@@ -294,12 +336,12 @@ handle_rate_limit() {
             SLEEP_SECS=$(( RESET_TODAY - NOW_EPOCH + 300 ))
             daemon_log "RATE LIMITED: sleeping $((SLEEP_SECS / 3600))h $(((SLEEP_SECS % 3600) / 60))m until ${RESET_HOUR}:00"
             notify "Rate limited — sleeping until ${RESET_HOUR}:00"
-            sleep "$SLEEP_SECS"
+            wall_sleep "$SLEEP_SECS"
             return
         fi
     fi
     daemon_log "RATE LIMITED: couldn't parse reset time. Sleeping 1h."
-    sleep 3600
+    wall_sleep 3600
 }
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -2332,7 +2374,7 @@ except Exception as e:
         CONSECUTIVE_SKIPS=0
         daemon_log "Sleeping ${WORKER_COOLDOWN}s before next tick"
         write_heartbeat "phase5_sleep_worked"
-        sleep "$WORKER_COOLDOWN"
+        wall_sleep "$WORKER_COOLDOWN"
     else
         CONSECUTIVE_SKIPS=$((CONSECUTIVE_SKIPS + 1))
         write_heartbeat "phase5_sleep_idle"
@@ -2360,6 +2402,6 @@ with open('$METRICS_FILE', 'a') as f:
     f.write(json.dumps(entry) + '\n')
 " 2>/dev/null
 
-        sleep "$SKIP_SLEEP"
+        wall_sleep "$SKIP_SLEEP"
     fi
 done
