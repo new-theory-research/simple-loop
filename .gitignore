@@ -27,3 +27,4 @@ __pycache__/
 .loop/state/progress.json
 .loop/state/runtime-events.jsonl
 .claude/
+.loop/state/hive.stderr.log
