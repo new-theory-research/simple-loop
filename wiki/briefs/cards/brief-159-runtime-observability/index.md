@@ -63,3 +63,17 @@ cards, and renders an honest Anomalies section). Remaining scope (#31 #38 #53:
 status reads the running daemon, sweep predicates, PID substring matching)
 unchanged. Also add when working this card: startup banner should print the
 active lane set (noted at lane activation).
+
+## Scope addition (2026-07-11 night, from the queue-stall postmortem)
+
+**The work-liveness instrument.** Every existing surface (log tail, heartbeat,
+loop status) reports process-liveness, so a wedged-but-alive daemon reads
+healthy on all of them — the director "papering over" was instruments lying,
+not judgment failing. Add the one metric that can't lie: **queued > 0 (or
+active briefs ready to advance) AND no state-advancing event for N minutes →
+RED**, surfaced in `loop status`, the hive floor, and (once #66 lands) a push.
+Time-since-last-advance vs queue depth is the whole signal. Related new
+issues: #65 (wall-clock ticks — in flight), #66 (wire notify), and Scav's
+retry→escalation filing (identical failure N times must raise escalate.json,
+not log-and-idle — receipt: delivered-gate refused the same SHA every 15 min
+for an hour, silently).
