@@ -31,7 +31,19 @@ Predicates, in the operator's order:
   5. claim_ref   — no stale refs/claims/<brief> claim ref on the remote.
   6. not_running — not already in running.json active/awaiting/pending/history.
 
-Predicate 7 from the operator's list — "daemon awake" — is not a property of
+Plus two gates dispatch() applies that the operator's folk list missed (the
+folk list said seven; the code says ten — recorded as brief-166 activation
+design-review evidence; the third missed gate, edit-surface overlap, is folded
+into parallel_safe, which reuses the real concurrency gate):
+  7. throttle    — in_flight (len active) vs THROTTLE, resolved via the same
+                   config parse dispatch() uses (actions.config_int).
+  8. solo_drain  — the drain-for-solo hold (SOLO_DRAIN_AFTER_SECS): when a
+                   Parallel-safe:false brief sits at the queue head past the
+                   threshold, ALL other dispatch is held until the board
+                   empties. Reuses queue.head_solo_drain — dispatch()'s own
+                   decision function.
+
+The operator's predicate 7 — "daemon awake" — is not a property of
 the brief and can't be answered by a pure function, so it is omitted here. A
 true queue also needs a live daemon; the CLI footer points at `loop status`.
 
@@ -231,6 +243,47 @@ def explain_dispatchability(project_dir, brief_id, running=None, lane=None):
     else:
         checks.append(Check("not_running", True,
                             "not in running.json active/awaiting/pending/history"))
+
+    # ── 7. throttle (dispatch()'s own THROTTLE resolution) ───────────
+    throttle = _actions.config_int(config, "THROTTLE", 1)
+    if throttle < 1:
+        throttle = 1
+    in_flight = len(active)
+    if in_flight >= throttle:
+        names = ", ".join(e.get("brief", "?") for e in active)
+        checks.append(Check("throttle", False,
+                            f"board at THROTTLE cap {in_flight}/{throttle} — blocked until a slot frees (active: {names})"))
+    else:
+        checks.append(Check("throttle", True,
+                            f"board {in_flight}/{throttle} — capacity for this brief"))
+
+    # ── 8. solo_drain (dispatch()'s drain-for-solo hold) ─────────────
+    # Reuses queue.head_solo_drain — the exact decision function dispatch()
+    # calls. Gate semantics mirrored: consulted only when the feature is on
+    # (SOLO_DRAIN_AFTER_SECS > 0) AND the board is non-empty; the draining
+    # head itself is allowed through.
+    drain_secs = _actions.config_int(config, "SOLO_DRAIN_AFTER_SECS", 0)
+    if drain_secs <= 0:
+        checks.append(Check("solo_drain", True,
+                            "SOLO_DRAIN_AFTER_SECS off — no drain gate"))
+    elif not active:
+        checks.append(Check("solo_drain", True,
+                            "board empty — no solo brief draining the board"))
+    else:
+        decision = _queue.head_solo_drain(
+            project_dir, drain_secs, running=running, lane=lane_spec)
+        if decision["drain"] and decision["brief"] != brief_id:
+            checks.append(Check("solo_drain", False,
+                                f"held: Parallel-safe:false brief {decision['brief']} at queue head "
+                                f"past SOLO_DRAIN_AFTER_SECS (draining {int(decision['waited'])}s) — "
+                                f"all other dispatch held until board empties"))
+        elif decision["drain"]:
+            checks.append(Check("solo_drain", True,
+                                f"this brief IS the draining solo head (waited {int(decision['waited'])}s) — "
+                                f"allowed through once the board empties"))
+        else:
+            checks.append(Check("solo_drain", True,
+                                "no solo brief draining the board"))
 
     return checks
 

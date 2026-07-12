@@ -35,13 +35,18 @@ why = _load("loop_why", "why.py")
 claim = _load("loop_claim", "claim.py")
 
 
-def _git(repo, *args, check=True):
+def _git(repo, *args, check=True, env=None):
+    run_env = None
+    if env:
+        run_env = dict(os.environ)
+        run_env.update(env)
     return subprocess.run(["git", "-C", repo, *args],
-                          check=check, capture_output=True, text=True)
+                          check=check, capture_output=True, text=True,
+                          env=run_env)
 
 
 def _write_card(project, brief_id, status="queued", program=None,
-                parallel_safe=None, depends_on=None):
+                parallel_safe=None, depends_on=None, edit_surface=None):
     card_dir = os.path.join(project, "wiki", "briefs", "cards", brief_id)
     os.makedirs(card_dir, exist_ok=True)
     body = ["---", f"ID: {brief_id}", f"Status: {status}"]
@@ -51,9 +56,30 @@ def _write_card(project, brief_id, status="queued", program=None,
         body.append(f"Parallel-safe: {parallel_safe}")
     if depends_on is not None:
         body.append(f"Depends-on: {depends_on}")
+    if edit_surface is not None:
+        body.append(f"Edit-surface: {edit_surface}")
     body += ["---", "", f"# {brief_id}", ""]
     with open(os.path.join(card_dir, "index.md"), "w") as f:
         f.write("\n".join(body))
+
+
+def _append_config(project, *lines):
+    with open(os.path.join(project, ".loop", "config.sh"), "a") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _commit_all_backdated(project, when="2020-01-01T00:00:00"):
+    """Commit the tree with an old committer date, so queue.py's queued-age
+    proxy (last commit time of the card file) reads as 'waited a long time'."""
+    _git(project, "add", "-A")
+    _git(project, "commit", "-qm", "cards",
+         env={"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when})
+
+
+def _write_goals(project, order):
+    with open(os.path.join(project, ".loop", "state", "goals.md"), "w") as f:
+        for i, bid in enumerate(order, 1):
+            f.write(f"{i}. {bid}\n")
 
 
 def _make_project():
@@ -220,7 +246,87 @@ class WhyTests(unittest.TestCase):
         self.assertEqual(
             set(c),
             {"queued", "lane", "parallel_safe", "depends_on",
-             "claim_ref", "not_running"})
+             "claim_ref", "not_running", "throttle", "solo_drain"})
+
+    # ── 7. throttle ──────────────────────────────────────────────────
+    def test_throttle_at_cap(self):
+        _append_config(self.project, "THROTTLE=2")
+        _write_card(self.project, "serve-010", status="queued",
+                    parallel_safe="true", edit_surface="lib/")
+        running = {"active": [
+            {"brief": "other-001", "branch": "other-001",
+             "parallel_safe": True, "edit_surface": ["docs/"]},
+            {"brief": "other-002", "branch": "other-002",
+             "parallel_safe": True, "edit_surface": ["scripts/"]},
+        ]}
+        c = _checks(self.project, "serve-010", running=running)
+        self.assertFalse(c["throttle"].ok)
+        self.assertIn("board at THROTTLE cap 2/2", c["throttle"].receipt)
+        self.assertIn("other-001, other-002", c["throttle"].receipt)
+        self.assertFalse(self._dispatchable(c))
+
+    def test_throttle_capacity(self):
+        _append_config(self.project, "THROTTLE=3")
+        _write_card(self.project, "serve-010", status="queued",
+                    parallel_safe="true", edit_surface="lib/")
+        running = {"active": [
+            {"brief": "other-001", "branch": "other-001",
+             "parallel_safe": True, "edit_surface": ["docs/"]},
+        ]}
+        c = _checks(self.project, "serve-010", running=running)
+        self.assertTrue(c["throttle"].ok)
+        self.assertIn("board 1/3", c["throttle"].receipt)
+
+    # ── 8. solo_drain ────────────────────────────────────────────────
+    def _drain_board(self):
+        """Tonight's-missing-hour fixture: a Parallel-safe:false brief at the
+        queue head past the drain threshold, a parallel-safe brief behind it,
+        and a non-overlapping parallel-safe brief active on the board."""
+        _append_config(self.project, "THROTTLE=3", "SOLO_DRAIN_AFTER_SECS=60")
+        _write_card(self.project, "aaa-001", status="queued")  # solo head
+        _write_card(self.project, "serve-010", status="queued",
+                    parallel_safe="true", edit_surface="lib/")
+        _write_goals(self.project, ["aaa-001", "serve-010"])
+        _commit_all_backdated(self.project)  # head has "waited" years > 60s
+        return {"active": [
+            {"brief": "other-001", "branch": "other-001",
+             "parallel_safe": True, "edit_surface": ["docs/"]},
+        ]}
+
+    def test_solo_drain_hold(self):
+        running = self._drain_board()
+        c = _checks(self.project, "serve-010", running=running)
+        self.assertFalse(c["solo_drain"].ok)
+        self.assertIn("held: Parallel-safe:false brief aaa-001 at queue head",
+                      c["solo_drain"].receipt)
+        self.assertIn("all other dispatch held until board empties",
+                      c["solo_drain"].receipt)
+        # Everything else about serve-010 is green — this is exactly the
+        # false-green loop why would have shown without the drain check.
+        self.assertTrue(c["parallel_safe"].ok)
+        self.assertTrue(c["throttle"].ok)
+        self.assertFalse(self._dispatchable(c))
+
+    def test_solo_drain_head_itself_allowed(self):
+        running = self._drain_board()
+        c = _checks(self.project, "aaa-001", running=running)
+        self.assertTrue(c["solo_drain"].ok)
+        self.assertIn("IS the draining solo head", c["solo_drain"].receipt)
+
+    def test_throttle_and_solo_drain_both_green(self):
+        _append_config(self.project, "THROTTLE=3", "SOLO_DRAIN_AFTER_SECS=60")
+        _write_card(self.project, "serve-010", status="queued",
+                    parallel_safe="true", edit_surface="lib/")
+        _commit_all_backdated(self.project)
+        running = {"active": [
+            {"brief": "other-001", "branch": "other-001",
+             "parallel_safe": True, "edit_surface": ["docs/"]},
+        ]}
+        c = _checks(self.project, "serve-010", running=running)
+        self.assertTrue(c["throttle"].ok)
+        self.assertTrue(c["solo_drain"].ok)
+        self.assertIn("no solo brief draining", c["solo_drain"].receipt)
+        self.assertTrue(self._dispatchable(c))
 
     # ── papercuts ledger ─────────────────────────────────────────────
     def test_papercut_appended_when_blocked(self):

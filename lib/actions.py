@@ -1357,6 +1357,22 @@ def _release_claim_quiet(paths, brief_id):
         print(f"release_claim: {brief_id} non-fatal failure: {e}", file=sys.stderr)
 
 
+def config_int(config, key, default):
+    """Parse an int config value exactly the way dispatch() does: strip an
+    inline `# comment`, empty → default, unparseable → default.
+
+    Factored out of dispatch() so lib/why.py's throttle / solo-drain checks use
+    the SAME threshold resolution as the gate they explain (import, don't
+    reimplement — if the parse is quirky, the explainer must be quirky the
+    same way).
+    """
+    try:
+        return int(str(config.get(key, str(default))).split("#", 1)[0].strip()
+                   or str(default))
+    except (ValueError, TypeError):
+        return default
+
+
 def dispatch(paths):
     """Process pending-dispatch.json: concurrency gate + worktree + progress init.
 
@@ -1372,10 +1388,7 @@ def dispatch(paths):
     config = read_config(paths["loop_dir"])
     remote = config["GIT_REMOTE"]
     main_branch = config["GIT_MAIN_BRANCH"]
-    try:
-        throttle = int(str(config.get("THROTTLE", "1")).split("#", 1)[0].strip() or "1")
-    except (ValueError, TypeError):
-        throttle = 1
+    throttle = config_int(config, "THROTTLE", 1)
     if throttle < 1:
         throttle = 1
 
@@ -1402,10 +1415,7 @@ def dispatch(paths):
     # briefs dispatched past it). Deterministic code gate — not the queen's
     # judgment. The drained head itself is still allowed through (it dispatches
     # once the board is empty).
-    try:
-        drain_secs = int(str(config.get("SOLO_DRAIN_AFTER_SECS", "0")).split("#", 1)[0].strip() or "0")
-    except (ValueError, TypeError):
-        drain_secs = 0
+    drain_secs = config_int(config, "SOLO_DRAIN_AFTER_SECS", 0)
     if drain_secs > 0 and active:
         _loop_queue = _load_queue_module()
         # brief-151: when this daemon is lane-partitioned (LOOP_LANE exported by
