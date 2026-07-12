@@ -191,3 +191,7 @@ the watcher-retirement list):
   confirmation. Close `#27` `#39` `#58` `#59` `#71` with the merge SHA.
 - `review.md` — gate runbook (Human-gate: review); link the `loop why` `claim_ref`
   receipts as the acceptance proof.
+
+**Tally addendum (2026-07-12 morning):** overnight run leaked another claim on
+the PARKED capture brief (released by the director's doctor) — parking is one
+of the exit paths piece 1 must make release-in-same-op.
