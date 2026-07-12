@@ -230,6 +230,103 @@ else
     fail "queue change → expected WAKE, got '$D4'"
 fi
 
+# ── fix-51c: Phase-1.5 gate runs on BOTH no-queen branches ───────────────────
+# The original build ran Phase 1.5 only when assess emitted NONE. Receipt
+# (2026-07-12, portal): ft-013 sat active-but-blocked on a human desk decision,
+# emitting `brief_blocked` every tick; that trigger DEDUPED after its first
+# queen, so the live trigger was `brief_blocked` (≠ NONE) forever — Phase 1.5
+# never RAN — while serve-009 sat cross-lane-dispatchable with a free slot for
+# 25+ min. The fix: Phase 1.5 evaluates whenever NO queen would otherwise fire
+# this tick — assess emitted NONE, OR the live trigger was dedup-suppressed.
+# Reproduced here to keep the gate placement in lockstep with lib/daemon.sh.
+#   phase15_gate <root> <trigger> <suppressed> → echoes the tick's queen action:
+#     "queen:<reason>"          a live trigger fired the queen (not suppressed)
+#     "queen:slots_available"   no queen would fire → Phase 1.5 woke slot-fill
+#     "idle"                    no queen would fire and no slot candidate
+phase15_gate() {
+    local root="$1" trigger="$2" suppressed="$3"
+    if [ "$trigger" = "NONE" ]; then
+        [ "$(slots_decide "$root")" = "WAKE" ] && { echo "queen:slots_available"; return; }
+        echo "idle"; return
+    fi
+    # A live trigger fires the queen UNLESS it was dedup-suppressed this tick.
+    if [ "$suppressed" != "yes" ]; then
+        echo "queen:$trigger"; return
+    fi
+    # Suppressed → no queen would otherwise fire → Phase 1.5 runs on this branch.
+    # (A slots wake here leaves the suppressed trigger's dedup untouched — the
+    #  daemon never writes LAST_CONDUCTOR_TRIGGER/TS on this path.)
+    [ "$(slots_decide "$root")" = "WAKE" ] && { echo "queen:slots_available"; return; }
+    echo "idle"
+}
+
+# ── Case 8: the live receipt — suppressed brief_blocked + free slot wakes ─────
+# ft-013 active-but-blocked (its brief_blocked trigger already deduped),
+# serve-009 queued cross-lane, one free THROTTLE slot. Old gate: idle (trigger
+# ≠ NONE, so Phase 1.5 never ran). New gate: slots_available wakes.
+P="$TMP/c8"; make_project "$P" 3
+add_card "$P" ft-013 active finetune false finetune/
+add_card "$P" serve-009 queued serving true serving/
+set_running "$P" '[{"brief":"ft-013","branch":"ft-013","program":"finetune","parallel_safe":false,"edit_surface":["finetune/"]}]'
+commit_cards "$P"
+: > "$SLOTS_KEY_FILE"; echo 0 > "$SLOTS_TS_FILE"   # fresh slots-dedup state
+G8="$(phase15_gate "$P" brief_blocked yes)"
+if [ "$G8" = "queen:slots_available" ]; then
+    pass "suppressed brief_blocked + free slot + cross-lane serve-009 → Phase 1.5 wakes slots_available (fix-51c)"
+else
+    fail "suppressed brief_blocked → expected queen:slots_available, got '$G8'"
+fi
+
+# ── Case 9: declining queen holds the dedup — no re-wake next tick ────────────
+# The woken queen DECLINES to dispatch (board+queue unchanged). Next tick the
+# same suppressed-trigger gate runs Phase 1.5 again; the slots key is unchanged
+# so it DEDUPS — the declining queen is not re-woken every tick (point 3).
+G9="$(phase15_gate "$P" brief_blocked yes)"
+if [ "$G9" = "idle" ]; then
+    pass "unchanged board next tick (queen declined) → slots dedup holds, no re-wake (fix-51c point 3)"
+else
+    fail "declining-queen re-wake guard → expected idle, got '$G9'"
+fi
+
+# ── Case 10: a NON-suppressed live trigger fires its own queen (no slot path) ─
+# When the live trigger is NOT deduped the queen fires on it directly; Phase 1.5
+# does not run (a queen already fires this tick).
+: > "$SLOTS_KEY_FILE"; echo 0 > "$SLOTS_TS_FILE"
+G10="$(phase15_gate "$P" brief_blocked no)"
+if [ "$G10" = "queen:brief_blocked" ]; then
+    pass "non-suppressed live trigger → its own queen fires, Phase 1.5 skipped"
+else
+    fail "non-suppressed live trigger → expected queen:brief_blocked, got '$G10'"
+fi
+
+# ── Case 11: trigger NONE path still wakes slot-fill (regression) ─────────────
+P="$TMP/c11"; make_project "$P" 3
+add_card "$P" serve-009 active serving true serving/
+add_card "$P" capture-005 queued capture true capture/
+set_running "$P" '[{"brief":"serve-009","branch":"serve-009","parallel_safe":true,"edit_surface":["serving/"]}]'
+commit_cards "$P"
+: > "$SLOTS_KEY_FILE"; echo 0 > "$SLOTS_TS_FILE"
+G11="$(phase15_gate "$P" NONE no)"
+if [ "$G11" = "queen:slots_available" ]; then
+    pass "trigger NONE + free slot + cross-lane brief → slots_available wakes (regression)"
+else
+    fail "NONE path regression → expected queen:slots_available, got '$G11'"
+fi
+
+# ── Case 12: NONE with a full board → idle (regression) ──────────────────────
+P="$TMP/c12"; make_project "$P" 1
+add_card "$P" serve-009 active serving true serving/
+add_card "$P" capture-005 queued capture true capture/
+set_running "$P" '[{"brief":"serve-009","branch":"serve-009","parallel_safe":true,"edit_surface":["serving/"]}]'
+commit_cards "$P"
+: > "$SLOTS_KEY_FILE"; echo 0 > "$SLOTS_TS_FILE"
+G12="$(phase15_gate "$P" NONE no)"
+if [ "$G12" = "idle" ]; then
+    pass "trigger NONE + full board → idle, no wake (regression)"
+else
+    fail "NONE full-board regression → expected idle, got '$G12'"
+fi
+
 echo ""
 echo "Passed: $PASSED   Failed: $FAILED"
 [ "$FAILED" -eq 0 ]

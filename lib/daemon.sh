@@ -13,11 +13,14 @@
 #
 #   Queen wake conditions (Phase 2): the queen is invoked when assess.py emits a
 #   trigger (no_active, brief_blocked, validator_blocked, stale_brief,
-#   pending_eval, active_signal) OR — issue #51 — when the board has an open
-#   THROTTLE slot AND a cross-lane brief is DISPATCHABLE (Phase 1.5
-#   `slots_available`, a pure why.py check). The wake never bypasses the queen's
-#   own decision; it only stops a single active brief from silencing all other
-#   lanes' queued work.
+#   pending_eval, active_signal) OR — issue #51 — when NO queen would otherwise
+#   fire this tick AND the board has an open THROTTLE slot AND a cross-lane brief
+#   is DISPATCHABLE (Phase 1.5 `slots_available`, a pure why.py check). "No queen
+#   would otherwise fire" covers BOTH assess emitting NONE and a live trigger
+#   getting dedup-suppressed (fix-51c) — otherwise an active-but-blocked brief
+#   whose trigger deduped starved every other lane. The wake never bypasses the
+#   queen's own decision; it only stops a single active brief from silencing all
+#   other lanes' queued work.
 #
 # Model tier policy (2026-04-21, revised from brief-003 baseline):
 #   heartbeat = haiku  (reserved — no heartbeat Claude calls today; assess.py is pure Python)
@@ -2037,6 +2040,41 @@ write_heartbeat('$HEARTBEAT_FILE', pid=$$, last_event='$event')
 " 2>/dev/null || true
 }
 
+# ┌──────────────────────────────────────────────────────────────────┐
+# │  Phase 1.5 helper: slots_available wake (issue #51 / fix-51c)     │
+# └──────────────────────────────────────────────────────────────────┘
+# The PURE why.py --slots-available check + its own dedup decision, factored so
+# BOTH no-queen branches call it in lockstep: assess emitted NONE, OR a live
+# trigger was dedup-suppressed this tick. Sets $_SLOTS_BRIEF to the woken
+# candidate and returns 0 when the queen should be woken; returns 1 (no wake)
+# on no-candidate or dedup. Updates ONLY the slots dedup state (LAST_SLOTS_KEY/
+# LAST_SLOTS_TS) — never LAST_CONDUCTOR_TRIGGER — so a wake from the
+# dedup-suppressed branch leaves the suppressed trigger's own dedup intact.
+maybe_wake_slots_available() {
+    _SLOTS_BRIEF=""
+    local _out _qfp _afp _key _now _age
+    _out=$(python3 "$DAEMON_LIB_DIR/why.py" "$PROJECT_DIR" --slots-available $_LANE_OPT 2>/dev/null || true)
+    _SLOTS_BRIEF=$(printf '%s\n' "$_out" | sed -n 1p)
+    [ -z "$_SLOTS_BRIEF" ] && return 1
+    _qfp=$(printf '%s\n' "$_out" | sed -n 2p)
+    _afp=$(printf '%s\n' "$_out" | sed -n 3p)
+    _key="${_qfp}|${_afp}"
+    _now=$(date +%s)
+    _age=$(( _now - LAST_SLOTS_TS ))
+    if [ "$_key" = "$LAST_SLOTS_KEY" ] && [ "$_age" -lt "$CONDUCTOR_DEDUP_TTL_SECS" ]; then
+        daemon_log "QUEEN: slots_available dedup — board+queue unchanged (key $_key, age ${_age}s / ttl ${CONDUCTOR_DEDUP_TTL_SECS}s), not re-waking"
+        _SLOTS_BRIEF=""  # keep queue_stuck's gate honest: the wake was suppressed
+        return 1
+    fi
+    daemon_log "QUEEN: slots_available — open slot + cross-lane dispatchable brief ($_SLOTS_BRIEF); waking queen (she remains the decider)"
+    # Stamp the key at wake-DECISION time (not after the queen runs): if the
+    # woken queen DECLINES to dispatch, the board+queue is unchanged next tick,
+    # so this same key dedups the re-wake until TTL (fix-51c point 3 guard rail).
+    LAST_SLOTS_KEY="$_key"
+    LAST_SLOTS_TS="$_now"
+    return 0
+}
+
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Project-dir sync (issue #19)                                    ║
 # ╚══════════════════════════════════════════════════════════════════╝
@@ -2320,50 +2358,41 @@ except Exception:
     VALIDATOR_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 3p)
 
     # ┌──────────────────────────────────────────────────────────────────┐
-    # │  Phase 1.5: slots_available wake (issue #51)                      │
+    # │  Phase 1.5: slots_available wake (issue #51 / fix-51c)            │
     # └──────────────────────────────────────────────────────────────────┘
-    # assess.py emits `NONE` when every active brief is running happily — no
-    # block, no stale branch, no review owed. Historically that meant the queen
-    # never woke while ANY brief was active, serializing the whole queue: the
-    # portal receipt (2026-07-11) had serve-009 running, capture-005 fully
-    # DISPATCHABLE in another lane, and an open THROTTLE slot, yet no queen was
-    # invoked because the only live trigger was `no_active` (which requires an
-    # empty board). This extends the wake condition from "board empty" to "board
-    # has capacity AND cross-lane work exists".
+    # Wake condition: NO queen would otherwise fire this tick AND the board has
+    # capacity + cross-lane dispatchable work. "No queen would fire" is TWO
+    # cases, both handled here in lockstep via maybe_wake_slots_available():
+    #   (A) assess emitted NONE (checked immediately below); and
+    #   (B) a live trigger fired but was DEDUP-SUPPRESSED (checked after the
+    #       Phase-2 dedup decision, in the skip branch of the case statement).
+    #
+    # The original build only handled (A). The fix-51c receipt (2026-07-12,
+    # portal): ft-013 sat active-but-blocked on a human desk decision, emitting
+    # `brief_blocked` every tick; that trigger DEDUPED after its first queen. So
+    # every subsequent tick the live trigger was `brief_blocked` (≠ NONE) —
+    # Phase 1.5 never RAN — while serve-009 sat fully dispatchable in another
+    # lane with a free THROTTLE slot for 25+ minutes, until a director hand-
+    # nudged the dedup clear. "Escalation pending must not starve other lanes."
     #
     # The whole check is PURE FUNCTIONS the repo already ships (Mattie's
     # doctrine — not everything needs inference; the wake is deterministic). It
-    # runs only when nothing higher-priority already woke the queen (trigger ==
-    # NONE), and only ever WAKES her — assess.py in the queen still decides
-    # whether to dispatch. why.py --slots-available reuses explain_dispatchability
-    # for at most the first 3 queue-head candidates: the load-bearing gates fall
-    # out for free — `throttle` (active < THROTTLE), `lane_mutex` (a same-lane
-    # candidate FAILS, so cross-lane is filtered by construction), `solo_drain`
-    # (a draining solo head suppresses the wake), plus depends_on/claim/queued.
-    # It emits the candidate id + a queue fingerprint + an active-set fingerprint;
-    # the two fingerprints form the dedup key so the wake re-fires when the queue
-    # or the board changes but never spams while the same blocked situation
-    # persists. Failure-safe: any error path yields no candidate (no wake), never
-    # a broken tick.
+    # only ever WAKES the queen — assess.py in the queen still decides whether to
+    # dispatch. why.py --slots-available reuses explain_dispatchability for at
+    # most the first 3 queue-head candidates: the load-bearing gates fall out for
+    # free — `throttle` (active < THROTTLE), `lane_mutex` (a same-lane candidate
+    # FAILS, so cross-lane is filtered by construction), `solo_drain` (a draining
+    # solo head suppresses the wake), plus depends_on/claim/queued. It emits the
+    # candidate id + a queue fingerprint + an active-set fingerprint; the two
+    # fingerprints form the slots dedup key (LAST_SLOTS_KEY, distinct from the
+    # trigger-name case-dedup) so the wake re-fires when the queue or the board
+    # changes but never spams while the same blocked situation persists.
+    # Failure-safe: any error path yields no candidate (no wake), never a broken
+    # tick.
     _SLOTS_BRIEF=""
     if [ "$CONDUCTOR_TRIGGER" = "NONE" ]; then
-        _SLOTS_OUT=$(python3 "$DAEMON_LIB_DIR/why.py" "$PROJECT_DIR" --slots-available $_LANE_OPT 2>/dev/null || true)
-        _SLOTS_BRIEF=$(printf '%s\n' "$_SLOTS_OUT" | sed -n 1p)
-        if [ -n "$_SLOTS_BRIEF" ]; then
-            _SLOTS_QFP=$(printf '%s\n' "$_SLOTS_OUT" | sed -n 2p)
-            _SLOTS_AFP=$(printf '%s\n' "$_SLOTS_OUT" | sed -n 3p)
-            _SLOTS_KEY="${_SLOTS_QFP}|${_SLOTS_AFP}"
-            _SLOTS_NOW=$(date +%s)
-            _SLOTS_AGE=$(( _SLOTS_NOW - LAST_SLOTS_TS ))
-            if [ "$_SLOTS_KEY" = "$LAST_SLOTS_KEY" ] && [ "$_SLOTS_AGE" -lt "$CONDUCTOR_DEDUP_TTL_SECS" ]; then
-                daemon_log "QUEEN: slots_available dedup — board+queue unchanged (key $_SLOTS_KEY, age ${_SLOTS_AGE}s / ttl ${CONDUCTOR_DEDUP_TTL_SECS}s), not re-waking"
-                _SLOTS_BRIEF=""  # keep queue_stuck's gate honest: the wake was suppressed
-            else
-                daemon_log "QUEEN: slots_available — open slot + cross-lane dispatchable brief ($_SLOTS_BRIEF); waking queen (she remains the decider)"
-                CONDUCTOR_TRIGGER="CONDUCTOR:slots_available"
-                LAST_SLOTS_KEY="$_SLOTS_KEY"
-                LAST_SLOTS_TS="$_SLOTS_NOW"
-            fi
+        if maybe_wake_slots_available; then
+            CONDUCTOR_TRIGGER="CONDUCTOR:slots_available"
         fi
     fi
 
@@ -2426,6 +2455,37 @@ except Exception:
 
             if [ "$_SHOULD_DEDUP" = "true" ]; then
                 daemon_log "QUEEN: dedup — same trigger ($REASON), skipping (age ${_TRIGGER_AGE}s / ttl ${CONDUCTOR_DEDUP_TTL_SECS}s)"
+                # fix-51c: the live trigger was suppressed, so no queen would
+                # otherwise fire this tick — the exact hole that starved
+                # serve-009 while ft-013's brief_blocked deduped. Run the
+                # Phase-1.5 slots check on THIS branch too. A wake uses its OWN
+                # dedup (LAST_SLOTS_KEY, stamped inside the helper) and must NOT
+                # disturb the suppressed trigger's dedup: LAST_CONDUCTOR_TRIGGER/
+                # TS stay put so ${REASON} remains suppressed next tick (the
+                # woken queen sees the blocked brief in her own assess anyway —
+                # she remains the decider). (slots_available never reaches this
+                # branch — the case-dedup bypasses it above — but guard anyway.)
+                if [ "$REASON" != "slots_available" ] && maybe_wake_slots_available; then
+                    write_heartbeat "phase2_queen:slots_available"
+                    invoke_conductor "slots_available"
+                    _CONDUCTOR_INVOKE_RC=$?
+                    CONDUCTOR_FIRED_THIS_TICK=$((CONDUCTOR_FIRED_THIS_TICK + 1))
+                    if [ "$_CONDUCTOR_INVOKE_RC" -ne 0 ]; then
+                        _cb_record_queen_result "fail"
+                    else
+                        _cb_record_queen_result "success"
+                    fi
+                    # Re-stat the queue AFTER the slot-fill queen ran — keeps her
+                    # dispatch from busting ${REASON}'s dedup next tick (same
+                    # rationale as the normal queen path below). LAST_CONDUCTOR_
+                    # TRIGGER/TS are deliberately NOT touched here.
+                    LAST_QUEUE_FP=$(python3 "$DAEMON_LIB_DIR/queue.py" "$PROJECT_DIR" --fingerprint $_LANE_OPT 2>/dev/null || echo "fp-unavailable")
+                    DID_WORK=true
+                    # Re-assess after the slot-fill queen
+                    ASSESS_OUTPUT=$(assess_state)
+                    WORKER_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 2p)
+                    VALIDATOR_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 3p)
+                fi
             else
                 if [ "$CONDUCTOR_TRIGGER" = "$LAST_CONDUCTOR_TRIGGER" ] && [ "$_TRIGGER_AGE" -ge "$CONDUCTOR_DEDUP_TTL_SECS" ]; then
                     daemon_log "QUEEN: dedup TTL expired (age ${_TRIGGER_AGE}s) — re-evaluating trigger ($REASON)"
