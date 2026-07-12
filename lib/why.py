@@ -342,7 +342,13 @@ def _color(s, code):
 def _print_checklist(brief_id, checks):
     dispatchable = all(c.ok for c in checks)
     head = _color("✓", _GREEN) if dispatchable else _color("✗", _RED)
+    # Honesty marker (review rec): a green built on a fail-open check must say
+    # so — the rollup names any passing check whose receipt admits it could not
+    # be verified (e.g. claim_ref with the remote unreachable).
+    unverified = [c.name for c in checks if c.ok and "not verified" in c.receipt]
     verdict = "DISPATCHABLE" if dispatchable else "BLOCKED"
+    if dispatchable and unverified:
+        verdict += f" (unverified: {', '.join(unverified)})"
     print(f"{head} {brief_id} — {verdict}")
     for c in checks:
         mark = _color("✓", _GREEN) if c.ok else _color("✗", _RED)
