@@ -55,3 +55,10 @@ four separate timeouts. Verify #44 #47 #49 #51 each stop reproducing under it.
 - `closeout.md` — the controller and per-issue confirmation. Close #44 #47 #49 #51
   with the merge SHA.
 - `review.md` — gate runbook.
+
+## Delivered early (2026-07-12): the #44 budget slice
+Card `Budget:` wired to real iteration caps (parser mirrors hive's — one
+vocabulary), burn logged per cycle, over-budget parks via the fix-15 site with
+receipt + notify-last. Global-cap crossing deliberately kept on historical
+mark-blocked behavior — unifying it under park+escalate is this card's
+remaining controller scope (#47 #49 #51 + the queen cheap-idle-tick).
