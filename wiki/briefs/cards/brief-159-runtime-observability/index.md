@@ -83,3 +83,10 @@ Merged via director-iteration (see merge for detail). Residuals for this card:
 cells cursor is positional (identity race bounded to one refresh — key by brief
 id if it ever bites); presence scan reads full daemon.log per state-load (add a
 windowed tail when the log grows past ~100k lines).
+
+## Follow-up (2026-07-12, from the ntfy-policy review)
+queue_stuck's fire-once latch can go permanently silent: a queue that never
+dispatches again alarms ONCE, and a missed ping means no re-nudge for exactly
+the failure the alarm targets. Add a periodic re-fire (every N hours while
+still stuck) when working this card — anti-spam default preserved, wedged-
+forever silence eliminated.
