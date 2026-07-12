@@ -202,6 +202,14 @@ after Mattie's explicit deploy approval, recorded on this card**. There is no
 Everything below is provable on one laptop. Railway deploy is the *last* step and
 only Mattie flips it.
 
+**Infrastructure isolation (Mattie, 2026-07-12, hard requirement):** the apiary
+deploys to its OWN Railway project with its OWN storage — never a service inside
+a product project, never a shared database/Redis with NT products, no product
+env vars or tokens in its environment. Blast-radius isolation is the point: the
+apiary is loss-tolerant by contract, so it must be *deletable* without a product
+thought; sharing infrastructure would silently revoke that property. v0's
+SQLite-inside-the-service satisfies this by construction — keep it that way.
+
 ## Success criteria (concrete, testable — all local, pre-deploy)
 
 - **Two-box render.** Local apiary + two simulated boxes (two clones, two `hum`s):
