@@ -1478,6 +1478,22 @@ fn render_dance_floor<'a>(df: &'a state::DanceFloorState) -> (Text<'a>, u16) {
             Span::styled("  ", Style::default()),
         ];
 
+        // brief-165: a remote row (from another box via the apiary) carries a
+        // box tag so the floor says *which* box a worker is on. Liveness keys on
+        // the server-stamped `received_at`: DEAD (coral) past cadence or missing,
+        // LIVE otherwise — never green on silence (no cross-box "silence = busy").
+        if let Some(box_name) = &ev.box_name {
+            let live = state::remote_liveness(ev.received_at, chrono::Utc::now());
+            let box_color = match live {
+                state::RemoteLiveness::Live => TEAL,
+                _ => CORAL,
+            };
+            spans.push(Span::styled(
+                format!("[{}] ", truncate_chars(box_name, 14)),
+                Style::default().fg(box_color),
+            ));
+        }
+
         if let Some(brief) = &ev.brief {
             let brief_short = truncate_chars(brief, 20);
             spans.push(Span::styled(
