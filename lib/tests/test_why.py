@@ -397,6 +397,52 @@ class WhyTests(unittest.TestCase):
         self.assertFalse(c["lane_mutex"].ok)
         self.assertIn("serve-005", c["lane_mutex"].receipt)
 
+    # ── cross-lane concurrency (fix-51b / #74) ───────────────────────
+    def test_parallel_safe_cross_lane_no_flag_dispatchable(self):
+        # A labeled candidate cross-lane to the WHOLE active board dispatches
+        # without Parallel-safe — the lane mutex is the safety.
+        _append_config(self.project, "THROTTLE=2")
+        _write_card(self.project, "ft-013", status="queued", program="finetune")  # no Parallel-safe
+        running = {"active": [
+            {"brief": "serve-009", "branch": "serve-009", "program": "serving",
+             "parallel_safe": True, "edit_surface": ["serving/"], "worker_slot": 0},
+        ]}
+        c = _checks(self.project, "ft-013", running=running)
+        self.assertTrue(c["parallel_safe"].ok, c["parallel_safe"].receipt)
+        self.assertIn("cross-lane", c["parallel_safe"].receipt)
+        self.assertIn("lane mutex is the safety", c["parallel_safe"].receipt)
+        self.assertTrue(c["lane_mutex"].ok)
+        self.assertTrue(self._dispatchable(c), c)
+
+    def test_parallel_safe_cross_lane_surface_overlap_refused(self):
+        # The edit-surface overlap check is retained cross-lane: two DECLARED
+        # surfaces that collide still refuse, across lanes.
+        _append_config(self.project, "THROTTLE=3")
+        _write_card(self.project, "ft-013", status="queued", program="finetune",
+                    parallel_safe="true", edit_surface="shared/")
+        running = {"active": [
+            {"brief": "serve-009", "branch": "serve-009", "program": "serving",
+             "parallel_safe": True, "edit_surface": ["shared/"], "worker_slot": 0},
+        ]}
+        c = _checks(self.project, "ft-013", running=running)
+        self.assertFalse(c["parallel_safe"].ok)
+        self.assertIn("cross-lane but edit-surface overlap", c["parallel_safe"].receipt)
+        self.assertIn("serve-009", c["parallel_safe"].receipt)
+        self.assertFalse(self._dispatchable(c))
+
+    def test_parallel_safe_unlabeled_keeps_legacy(self):
+        # Unlabeled candidate keeps the legacy single-slot semantics EXACTLY:
+        # Parallel-safe absent + a non-empty board → blocked (no cross-lane).
+        _write_card(self.project, "loose-001", status="queued")  # no Program:, no Parallel-safe
+        running = {"active": [
+            {"brief": "serve-009", "branch": "serve-009", "program": "serving",
+             "parallel_safe": True, "edit_surface": ["serving/"], "worker_slot": 0},
+        ]}
+        c = _checks(self.project, "loose-001", running=running)
+        self.assertFalse(c["parallel_safe"].ok)
+        self.assertIn("defaults false (single slot)", c["parallel_safe"].receipt)
+        self.assertIn("serve-009", c["parallel_safe"].receipt)
+
     # ── papercuts ledger ─────────────────────────────────────────────
     def test_papercut_appended_when_blocked(self):
         path = _seed_papercuts(self.project)
@@ -505,13 +551,17 @@ class SlotsAvailableTests(unittest.TestCase):
     # A draining solo head suppresses slot-filling wakes (solo_drain gate).
     def test_solo_drain_suppresses_wake(self):
         _append_config(self.project, "THROTTLE=3", "SOLO_DRAIN_AFTER_SECS=1")
-        # Solo (parallel-safe:false) brief at the queue head, committed long ago
-        # so it reads as past the drain threshold.
-        _write_card(self.project, "capture-001", status="queued",
-                    program="capture", parallel_safe="false", edit_surface="capture/x")
+        # An UNLABELED solo (parallel-safe:false) brief at the queue head keeps
+        # legacy single-slot semantics — it genuinely needs the board to drain,
+        # so it suppresses the labeled brief behind it. (A LABELED cross-lane
+        # solo head would ITSELF be dispatchable under the #74 cross-lane rule —
+        # see test_live_serving_board_cross_lane — which is the correct new
+        # behavior; keeping this head unlabeled preserves the drain test.)
+        _write_card(self.project, "solo-001", status="queued",
+                    parallel_safe="false", edit_surface="misc/x")  # no Program:
         _write_card(self.project, "fleets-002", status="queued",
                     program="fleets", parallel_safe="true", edit_surface="fleets/y")
-        _write_goals(self.project, ["capture-001", "fleets-002"])
+        _write_goals(self.project, ["solo-001", "fleets-002"])
         _commit_all_backdated(self.project)
         running = {"active": [self._active("serve-009", ["serving/z"])]}
         self.assertEqual(
@@ -528,27 +578,77 @@ class SlotsAvailableTests(unittest.TestCase):
             why.slots_available_candidate(self.project, running=running, lane=""),
             "")
 
-    # Cost bound: only the first `cap` queue-head candidates are evaluated. Three
-    # blocked (edit-surface-overlapping) heads ahead of a green brief → with
-    # cap=3 the green one is never reached, so no wake.
-    def test_cap_bounds_evaluation(self):
+    # Cost bound: `cap` bounds DISTINCT lane heads, not overall candidates. The
+    # first lane's head is blocked (surface overlap), the second lane's head is
+    # green; cap=1 stops before it, cap=2 reaches it.
+    def test_cap_bounds_distinct_lane_heads(self):
         _append_config(self.project, "THROTTLE=3")
-        # Three heads that overlap the active brief's surface (blocked), then a
-        # disjoint one. Goals order fixes the queue head order.
-        for i in range(3):
-            _write_card(self.project, f"blk-00{i}", status="queued",
-                        program="capture", parallel_safe="true", edit_surface="shared/")
-        _write_card(self.project, "green-009", status="queued",
-                    program="fleets", parallel_safe="true", edit_surface="green/")
-        _write_goals(self.project, ["blk-000", "blk-001", "blk-002", "green-009"])
-        running = {"active": [self._active("serve-009", ["shared/"])]}
+        _write_card(self.project, "capA-001", status="queued", program="capture",
+                    parallel_safe="true", edit_surface="shared/")  # overlaps active
+        _write_card(self.project, "fleetsB-001", status="queued", program="fleets",
+                    parallel_safe="true", edit_surface="green/")   # disjoint → green
+        _write_goals(self.project, ["capA-001", "fleetsB-001"])
+        running = {"active": [{"brief": "serve-009", "branch": "serve-009",
+                               "program": "serving", "parallel_safe": True,
+                               "edit_surface": ["shared/"]}]}
         self.assertEqual(
-            why.slots_available_candidate(self.project, running=running, lane="", cap=3),
+            why.slots_available_candidate(self.project, running=running, lane="", cap=1),
             "")
-        # With a larger cap it IS reached.
         self.assertEqual(
-            why.slots_available_candidate(self.project, running=running, lane="", cap=4),
-            "green-009")
+            why.slots_available_candidate(self.project, running=running, lane="", cap=2),
+            "fleetsB-001")
+
+    # Fix-51b: a lane stacking the queue head no longer starves other lanes.
+    # Four serving briefs stack the queue head with the serving lane HELD by an
+    # active brief; a cross-lane capture brief sits behind them → it wakes.
+    def test_lane_stacking_does_not_starve(self):
+        _append_config(self.project, "THROTTLE=3")
+        _write_card(self.project, "serve-009", status="active", program="serving",
+                    parallel_safe="true", edit_surface="serving/")
+        for i in (5, 6, 7, 8):
+            _write_card(self.project, f"serve-00{i}", status="queued",
+                        program="serving", parallel_safe="true",
+                        edit_surface=f"serving/{i}")
+        _write_card(self.project, "capture-005", status="queued", program="capture",
+                    parallel_safe="true", edit_surface="capture/")
+        _write_goals(self.project, ["serve-005", "serve-006", "serve-007",
+                                    "serve-008", "capture-005"])
+        running = {"active": [self._active("serve-009", ["serving/"])]}
+        self.assertEqual(
+            why.slots_available_candidate(self.project, running=running, lane=""),
+            "capture-005")
+
+    # The full receipt fixture: active serving brief + serving queue head +
+    # cross-lane capture + cross-lane finetune with NO Parallel-safe. slots
+    # finds capture-005; ft-013 is independently dispatchable (fix 2); the
+    # same-lane serve-005 is held by the lane mutex.
+    def test_live_serving_board_cross_lane(self):
+        _append_config(self.project, "THROTTLE=3")
+        _write_card(self.project, "serve-009", status="active", program="serving",
+                    parallel_safe="true", edit_surface="serving/")
+        for i in (5, 6, 7, 8):
+            _write_card(self.project, f"serve-00{i}", status="queued",
+                        program="serving", parallel_safe="true",
+                        edit_surface=f"serving/{i}")
+        _write_card(self.project, "capture-005", status="queued", program="capture",
+                    parallel_safe="true", edit_surface="capture/")
+        _write_card(self.project, "ft-013", status="queued", program="finetune")  # no Parallel-safe
+        _write_goals(self.project, ["serve-005", "serve-006", "serve-007",
+                                    "serve-008", "capture-005", "ft-013"])
+        running = {"active": [self._active("serve-009", ["serving/"])]}
+        # slots picks the first non-serving lane head (serving heads mutex-skipped).
+        self.assertEqual(
+            why.slots_available_candidate(self.project, running=running, lane=""),
+            "capture-005")
+        # ft-013 is independently dispatchable — cross-lane, no Parallel-safe.
+        ft = {c.name: c for c in why.explain_dispatchability(
+            self.project, "ft-013", running=running, lane="")}
+        self.assertTrue(all(c.ok for c in ft.values()), ft)
+        self.assertIn("cross-lane", ft["parallel_safe"].receipt)
+        # serve-005 (same lane as the active brief) is held by the lane mutex.
+        s5 = {c.name: c for c in why.explain_dispatchability(
+            self.project, "serve-005", running=running, lane="")}
+        self.assertFalse(s5["lane_mutex"].ok)
 
     # The --slots-available CLI emits candidate + queue-fp + active-fp (exit 0),
     # or nothing (exit 1). These three lines are the daemon's dedup key.
