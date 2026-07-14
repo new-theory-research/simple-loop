@@ -193,6 +193,32 @@ def clean_stale_queues(running: dict, state_dir: str, project_dir: str,
     return running, actions
 
 
+def reconcile_claim_refs(paths: dict, running: dict, project_dir: str, config: dict) -> list:
+    """brief-160: release own-box ORPHAN claim refs — a claim whose brief is not
+    in the live working set (active[] ∪ pending_merges[]) on THIS box.
+
+    An orphaned active[] entry and a leaked claim are the same fault seen from
+    two sides; this is the claim-ref side. Foreign/unknown-owner claims are
+    observed only, never reaped (the "never reap on local ignorance" law —
+    brief-167's registry owns cross-box liveness later). Loud: every action is
+    written to log.jsonl. Best-effort; an unreachable remote is a no-op.
+    """
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from claim import reconcile_claims
+    from actions import log_action
+
+    remote = config.get("GIT_REMOTE", "origin")
+    working = (
+        [e.get("brief") for e in running.get("active", [])]
+        + [e.get("brief") for e in running.get("pending_merges", [])]
+    )
+    return reconcile_claims(
+        project_dir, remote, working,
+        log=lambda action: log_action(paths, "claim_reconcile", action),
+    )
+
+
 def run_startup_repair(paths: dict, project_dir: str) -> list:
     """Orchestrator: run all repair steps, save if any changes, log all actions.
 
@@ -262,6 +288,20 @@ def run_startup_repair(paths: dict, project_dir: str) -> list:
     except Exception as _e:
         log_action(paths, "startup_repair", {
             "reason": "migrate_runtime_events_failed",
+            "error": str(_e),
+        })
+
+    # D. brief-160: reconcile claim refs against the freshest projected state —
+    # a claim owned by this box with no live brief is a startup orphan (the
+    # #71 fault, seen from the claim side). Re-load running so the working set
+    # reflects the re-projection above.
+    try:
+        fresh = load_running(paths)
+        claim_actions = reconcile_claim_refs(paths, fresh, project_dir, config)
+        all_actions.extend(claim_actions)
+    except Exception as _e:
+        log_action(paths, "startup_repair", {
+            "reason": "reconcile_claims_failed",
             "error": str(_e),
         })
 

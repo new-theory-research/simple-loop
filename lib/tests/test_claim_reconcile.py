@@ -161,5 +161,54 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(reconcile_claims(self.clone, bogus, working_brief_ids=[]), [])
 
 
+class StartupReconcileWiringTests(unittest.TestCase):
+    """The startup_repair.reconcile_claim_refs wrapper: builds the working set
+    from active[] ∪ pending_merges[], releases own-box orphans, and writes each
+    action to log.jsonl (loud)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.remote = os.path.join(self.tmp, "remote.git")
+        _git(self.tmp, "init", "--bare", "remote.git")
+        self.project = os.path.join(self.tmp, "project")
+        _git(self.tmp, "clone", "--quiet", self.remote, "project")
+        self.state = os.path.join(self.project, ".loop", "state")
+        os.makedirs(self.state)
+        with open(os.path.join(self.project, ".loop", "config.sh"), "w") as f:
+            f.write('GIT_REMOTE="origin"\n')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_wrapper_releases_orphan_and_logs(self):
+        sys.path.insert(0, _LIB_DIR)
+        from startup_repair import reconcile_claim_refs
+        from actions import init_paths
+
+        claim_brief(self.project, "brief-live", self.remote)     # in working set
+        claim_brief(self.project, "brief-merging", self.remote)  # pending_merges
+        claim_brief(self.project, "brief-orphan", self.remote)   # orphan
+        paths = init_paths(self.project)
+        running = {"active": [{"brief": "brief-live"}],
+                   "pending_merges": [{"brief": "brief-merging"}]}
+
+        actions = reconcile_claim_refs(paths, running, self.project,
+                                       {"GIT_REMOTE": "origin"})
+        self.assertEqual([a["reason"] for a in actions], ["orphan_claim_released"])
+        self.assertEqual(actions[0]["brief"], "brief-orphan")
+
+        # Loud: the release landed in log.jsonl.
+        with open(paths["log_file"]) as f:
+            logged = f.read()
+        self.assertIn("claim_reconcile", logged)
+        self.assertIn("brief-orphan", logged)
+
+        # live + pending survive; orphan gone.
+        remaining = _git(self.remote, "for-each-ref", "--format=%(refname)",
+                         "refs/claims/").stdout.split()
+        self.assertEqual(sorted(remaining),
+                         [_ref_for("brief-live"), _ref_for("brief-merging")])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -360,6 +360,33 @@ def release_claim_on_route(project_dir: str, brief_id: str) -> None:
                           "brief": brief_id, "error": str(e)}))
 
 
+def reconcile_claims_in_sweep(project_dir: str, running: dict) -> list:
+    """brief-160: verify refs/claims/* against the live working set (active[] ∪
+    pending_merges[]) and release own-box ORPHANS loudly — foreign/unknown-owner
+    claims are observed only, never reaped (the never-reap-on-local-ignorance
+    law). Best-effort: never raises into the sweep; an unreachable remote is a
+    no-op."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from claim import reconcile_claims
+        from actions import read_config, init_paths, log_action
+        remote = read_config(os.path.join(project_dir, ".loop")).get("GIT_REMOTE", "origin")
+        working = (
+            [e.get("brief") for e in running.get("active", [])]
+            + [e.get("brief") for e in running.get("pending_merges", [])]
+        )
+        paths = init_paths(project_dir)
+
+        def _log(action):
+            print(json.dumps({"action": "claim-reconcile", **action}))
+            log_action(paths, "claim_reconcile", action)
+
+        return reconcile_claims(project_dir, remote, working, log=_log)
+    except Exception as e:
+        print(json.dumps({"action": "claim-reconcile-error", "error": str(e)}))
+        return []
+
+
 # ── Snapshot I/O ──────────────────────────────────────────────────────────
 
 def load_snapshot(snapshot_dir: str) -> dict:
@@ -527,6 +554,11 @@ def run_sweep(project_dir: str, quick: bool = False, auto_route: bool = False,
                 }))
                 # brief-160: release the claim in the SAME operation as the move.
                 release_claim_on_route(project_dir, brief_id)
+
+    # brief-160: claims pass — release own-box orphan claim refs whose brief is
+    # no longer in the live working set. Shares the invariant with startup
+    # repair; here it runs every sweep so a leak is caught within a tick.
+    reconcile_claims_in_sweep(project_dir, running)
 
     # If no active briefs, report clean
     if not active:
