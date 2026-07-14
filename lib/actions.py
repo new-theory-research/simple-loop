@@ -2177,6 +2177,10 @@ def merge(paths):
                           auto_merge=False)
             project_running(paths)
             os.remove(paths["pending_merge"])
+            # Release-in-same-op (brief-160 invariant): the conflict route is an
+            # exit from the working set; the claim transferred through
+            # pending_merges must not outlive it (reviewer-160a's one leak).
+            _release_claim_quiet(paths, brief)
             log_action(paths, "merge_conflict_abort", {
                 "brief": brief, "branch": branch,
                 "reason": "merge_conflict_routed_to_awaiting_review",

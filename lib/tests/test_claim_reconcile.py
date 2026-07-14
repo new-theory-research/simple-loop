@@ -212,3 +212,15 @@ class StartupReconcileWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMergeConflictReleasesClaim:
+    def test_merge_conflict_route_releases_claim(self, tmp_path):
+        """reviewer-160a's one leak: the merge-CONFLICT exit must release the
+        transferred claim in the same operation, like every other exit."""
+        import re
+        src = open(__file__.replace("tests/test_claim_reconcile.py", "actions.py")).read()
+        conflict_block = re.search(
+            r'kind="merge-conflict".*?return False', src, re.S).group(0)
+        assert "_release_claim_quiet" in conflict_block, (
+            "merge-conflict route must release the claim in-operation")
