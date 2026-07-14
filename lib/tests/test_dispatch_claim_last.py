@@ -25,7 +25,7 @@ if _LIB_DIR not in sys.path:
     sys.path.insert(0, _LIB_DIR)
 
 import actions  # noqa: E402
-from actions import dispatch, init_paths  # noqa: E402
+from actions import dispatch, init_paths, move_to_awaiting_review  # noqa: E402
 from claim import claim_brief, claim_owner, claim_box, _ref_for  # noqa: E402
 
 _GIT_ENV = {
@@ -151,6 +151,21 @@ class ClaimLastTests(unittest.TestCase):
             rc = json.load(f)
         self.assertIn(self.brief, {e.get("brief") for e in rc.get("active", [])})
         self.assertEqual(self._remote_claim_refs(), [_ref_for(self.brief)])
+
+    # ── acceptance receipt: park leaves no claim_ref (the loop why check) ─────
+    def test_park_after_dispatch_leaves_no_claim_ref(self):
+        """The card's named acceptance surface: after a park, `loop why`'s
+        claim_ref check (git ls-remote refs/claims/<brief>) is clean — the
+        release is part of the move, not a hoped-for later cleanup."""
+        self.assertTrue(dispatch(self.paths))
+        self.assertEqual(self._remote_claim_refs(), [_ref_for(self.brief)])
+        # Park (manual-recovery kind skips the complete-only cycle gate).
+        self.assertTrue(move_to_awaiting_review(self.paths, self.brief,
+                                                kind="manual-recovery"))
+        # claim_ref receipt is green: no ref on the remote for a re-queue.
+        self.assertEqual(
+            self._remote_claim_refs(), [],
+            "a parked brief must leave NO claim ref (loop why claim_ref clean)")
 
 
 if __name__ == "__main__":
