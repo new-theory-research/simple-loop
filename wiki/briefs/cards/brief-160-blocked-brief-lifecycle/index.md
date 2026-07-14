@@ -9,7 +9,7 @@ Human-gate: review
 Target repo: ScavieFae/simple-loop master
 Parallel-safe: false
 Program: harness-improvements
-Issues: ["#27", "#39", "#58", "#59", "#71", "#62", "#83", "#84", "#92", "#93", "#96"]
+Issues: ["#27", "#39", "#58", "#59", "#71", "#62", "#83", "#84", "#92", "#93", "#96", "#97"]
 Depends-on: none
 Tags: [harness, blocked, parked, claims, lifecycle, invariant]
 ---
@@ -195,3 +195,11 @@ the watcher-retirement list):
 **Tally addendum (2026-07-12 morning):** overnight run leaked another claim on
 the PARKED capture brief (released by the director's doctor) — parking is one
 of the exit paths piece 1 must make release-in-same-op.
+
+## Ruling (Mattie, 2026-07-14, via #97 — the spine of piece 2)
+"The queue must never shut down on invisible blockers of indeterminate
+length... 'waiting on a human' must cost zero throughput." Blocked-on-external
+⇒ auto-park (slot released in the same op, claims invariant applies), blocker
+on a human-visible surface with a named owner + explicit re-trigger, and
+auto-requeue when the trigger fires. Receipts: serve-009's 15h lane hold;
+ft-008 freezing a board with two free slots.
