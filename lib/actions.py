@@ -894,6 +894,11 @@ def move_to_eval(paths, brief_id):
     runtime_event(paths, "completed", brief_id, kind="complete", auto_merge=False)
     project_running(paths)
 
+    signal_dedup_clear(paths, brief_id)
+    # brief-160: this legacy path also removes the brief from active[] (routes it
+    # to awaiting_review via the completed event) — release the claim in the SAME
+    # operation, exactly as move_to_awaiting_review does, so it is not a leak path.
+    _release_claim_quiet(paths, brief_id)
     log_action(paths, "move-to-eval", {"brief": brief_id})
     print(f"Moved {brief_id} to awaiting_review (kind=complete via move-to-eval)")
     return True
@@ -925,6 +930,11 @@ def move_to_pending_merges(paths, brief_id):
     runtime_event(paths, "approved", brief_id)
     project_running(paths)
 
+    # brief-160: the claim is intentionally NOT released here. pending_merges is
+    # still THIS box's work (the merge runs next), so by the invariant the claim
+    # ref must persist — it TRANSFERS from active[] to the merge, and merge()
+    # releases it on completion. Releasing here would let another box grab the
+    # brief mid-merge. (Do not "fix" this by adding a release.)
     log_action(paths, "move-to-pending-merges", {"brief": brief_id})
     print(f"Moved {brief_id} to pending_merges")
     return True
@@ -1306,6 +1316,23 @@ def remove_worktree(paths, brief):
         git(paths["project_dir"], "worktree", "remove", wt_dir, "--force", check=False)
     # Clean up any stale worktree entries
     git(paths["project_dir"], "worktree", "prune", check=False)
+
+
+def _abort_unclaimed_dispatch(paths, project_dir, brief, branch):
+    """brief-160: tear down the local-only worktree + branch built before the
+    claim was pushed, when the claim was lost (another box won) or errored.
+
+    Nothing was pushed to the remote at this point — the worktree and its branch
+    are purely local — so removing them leaves no residue and lets a later
+    re-dispatch cut fresh (no #83 stale-branch resurrection). Best-effort."""
+    try:
+        remove_worktree(paths, brief)
+        # Delete the local branch only after its worktree is gone (git refuses to
+        # delete a branch checked out in a worktree).
+        git(project_dir, "branch", "-D", branch, check=False)
+    except Exception as e:
+        print(f"dispatch: cleanup after lost claim for {brief} failed: {e} (non-fatal)",
+              file=sys.stderr)
 
 
 def _init_commit_already_landed(wt_dir, brief):
@@ -1698,26 +1725,14 @@ def dispatch(paths):
     # Fetch latest (no checkout needed — main tree untouched)
     git(project_dir, "fetch", remote, check=False)
 
-    # brief-151: atomic cross-box claim BEFORE any worktree exists. Two daemons
-    # sharing this repo+lane race to push refs/claims/<brief>; exactly one wins.
-    # On contention (another daemon holds it) skip cleanly; on a real push error
-    # (auth/network) fail loud and create NO branch/worktree (engineering rule
-    # 10 — claim-first is the whole point, anti-pattern: never push after).
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from claim import claim_brief
-    try:
-        claimed = claim_brief(project_dir, brief, remote)
-    except Exception as e:
-        log_action(paths, "claim_error", {"brief": brief, "error": str(e)})
-        print(f"dispatch: claim push for {brief} failed (fail-loud, no worktree): {e}",
-              file=sys.stderr)
-        os.remove(paths["pending_dispatch"])
-        return False
-    if not claimed:
-        log_action(paths, "claim_skip", {"brief": brief})
-        print(f"loop: brief {brief} already claimed — skipping", file=sys.stderr)
-        os.remove(paths["pending_dispatch"])
-        return False
+    # brief-160: the atomic cross-box claim is pushed LAST — after the worktree
+    # and init-commit have landed locally and immediately BEFORE the branch push
+    # (see the claim block below). Everything between here and there is LOCAL
+    # only (worktree create, progress.json init commit); nothing touches the
+    # shared remote until the claim wins, so a losing/aborted attempt leaves no
+    # remote residue to reap. This kills the starved-window wedge (reviewer-64):
+    # a claim pushed before a failed init-commit used to strand a brief behind a
+    # ref that only manual surgery could clear.
 
     # Never reuse a STALE branch ref (issues #83/#84). The fetch above does not
     # --prune, so a branch deleted on origin leaves refs/remotes/<remote>/<branch>
@@ -1770,6 +1785,65 @@ def dispatch(paths):
         # it; merge() strips it back off main below. Worker-branch only.
         git(wt_dir, "add", "-f", ".loop/state/progress.json")
         git(wt_dir, "commit", "-m", f"Initialize brief {brief}")
+
+    # ── brief-160: CLAIM LAST — the atomic mutex, pushed after the init-commit
+    # landed locally and immediately before the branch push. ──────────────────
+    #
+    # This is the exactly-one-winner compare-and-swap (git push --force-with-
+    # lease over an empty expected value; see lib/claim.py). Placing it here —
+    # not before the worktree — is the brief-160 reorder. Race analysis, honest:
+    #
+    #   * Two boxes dispatching the same brief can now BOTH build a worktree and
+    #     a local init-commit before either claims — wasted local work for the
+    #     loser, but NO remote effect (both are local-only). The claim CAS is
+    #     still the mutex: exactly one wins (proven by test_lane_and_claim golden
+    #     ii). Moving it later only widens the window of duplicated LOCAL work,
+    #     never the window of double EXECUTION.
+    #   * The claim push IS the "re-check immediately before the atomic push":
+    #     there is no separate check→push gap to race, because the check and the
+    #     push are the same atomic operation.
+    #   * The loser aborts WITHOUT pushing the branch — so no remote branch
+    #     collision, and the worker only ever spawns off a completed dispatch
+    #     (active[] projection), which only the winner reaches. The loser's
+    #     local worktree + branch are torn down.
+    #   * Starved-window wedge is gone: if the worktree/init-commit step failed
+    #     above, we never reach this push, so no ref is ever left behind.
+    #   * Mid-dispatch crash idempotency: a crash after this push but before
+    #     pending-dispatch is consumed leaves OUR ref standing. On retry the CAS
+    #     returns False, but claim_owner shows this box — so we resume (finish
+    #     the dispatch) rather than abort. Only a foreign/unknown owner aborts.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from claim import claim_brief, claim_owner, claim_box
+    try:
+        claimed = claim_brief(project_dir, brief, remote)
+    except Exception as e:
+        # Fail loud (auth/network) — abort with NO branch push (rule 10). Tear
+        # down the local-only worktree/branch we built above.
+        log_action(paths, "claim_error", {"brief": brief, "error": str(e)})
+        print(f"dispatch: claim push for {brief} failed (fail-loud, no branch pushed): {e}",
+              file=sys.stderr)
+        _abort_unclaimed_dispatch(paths, project_dir, brief, branch)
+        os.remove(paths["pending_dispatch"])
+        return False
+    if not claimed:
+        owner = claim_owner(project_dir, brief, remote)
+        if owner == claim_box():
+            # We already hold it — this is a crash-retry of our own dispatch.
+            # Resume: the init-commit idempotency above already handled the
+            # worktree, and the branch push below is a no-op if up-to-date.
+            log_action(paths, "claim_retry_own", {"brief": brief})
+            print(f"dispatch: {brief} claim already held by this box — resuming "
+                  f"dispatch (retry)", file=sys.stderr)
+        else:
+            # A different box won the race. Abort WITHOUT the branch push and
+            # tear down the local-only worktree/branch.
+            log_action(paths, "claim_skip", {"brief": brief, "owner": owner or "unknown"})
+            print(f"loop: brief {brief} already claimed"
+                  f"{f' by {owner}' if owner else ''} — skipping (no branch pushed)",
+                  file=sys.stderr)
+            _abort_unclaimed_dispatch(paths, project_dir, brief, branch)
+            os.remove(paths["pending_dispatch"])
+            return False
 
     # Push is idempotent — up-to-date branches push as no-op.
     git(wt_dir, "push", "-u", remote, branch)
@@ -1881,9 +1955,18 @@ def dispatch(paths):
 # dispatch still plumbing-commits it (bypasses gitignore, see #88) — until that
 # path closes, main tracks it transiently between dispatch and the next
 # merge-strip. This strip is the janitor, not an invariant.
+# The full daemon-volatile state family. Any of these can ride into main's tree
+# via a branch cut BEFORE the file was untracked (the resurrection class — third
+# live instance on portal main tonight was watchdog-pids + hum-cursors/). Entries
+# may be FILES or a whole DIRECTORY (hum-cursors); the strip loop handles both.
 STRIP_ON_MAIN = [
     os.path.join(".loop", "state", "progress.json"),
     os.path.join(".loop", "state", "runtime-events.jsonl"),
+    os.path.join(".loop", "state", "failure-fingerprints.json"),
+    os.path.join(".loop", "state", "watchdog-pids"),
+    os.path.join(".loop", "state", "lane-mutex-dedup.json"),
+    os.path.join(".loop", "state", "queue-stuck-dedup.json"),
+    os.path.join(".loop", "state", "hum-cursors"),  # directory-shaped
 ]
 
 
@@ -2094,6 +2177,10 @@ def merge(paths):
                           auto_merge=False)
             project_running(paths)
             os.remove(paths["pending_merge"])
+            # Release-in-same-op (brief-160 invariant): the conflict route is an
+            # exit from the working set; the claim transferred through
+            # pending_merges must not outlive it (reviewer-160a's one leak).
+            _release_claim_quiet(paths, brief)
             log_action(paths, "merge_conflict_abort", {
                 "brief": brief, "branch": branch,
                 "reason": "merge_conflict_routed_to_awaiting_review",
@@ -2197,14 +2284,20 @@ def merge(paths):
     # tracked at HEAD in a SINGLE follow-up commit before the push, so main's
     # tip tree stays clean and old branches can never re-track them. The
     # physical files stay on disk (daemon-local, gitignored). See STRIP_ON_MAIN.
+    # `ls-files -- <path>` lists tracked entries matching the pathspec: for a
+    # file it returns that file if tracked, for a DIRECTORY it returns every
+    # tracked file under it. Non-empty output == tracked (handles both shapes;
+    # `--error-unmatch` would have falsely reported a tracked directory as
+    # untracked, since a dir is never itself an index entry).
     _to_strip = [
         rel for rel in STRIP_ON_MAIN
-        if git(project_dir, "ls-files", "--error-unmatch", rel,
-               check=False).returncode == 0
+        if git(project_dir, "ls-files", "--", rel, check=False).stdout.strip()
     ]
     if _to_strip:
         for rel in _to_strip:
-            git(project_dir, "rm", "--cached", "--quiet", rel, check=False)
+            # -r so a tracked directory (hum-cursors/) strips recursively; a
+            # plain file ignores -r. --cached leaves the on-disk copy intact.
+            git(project_dir, "rm", "-r", "--cached", "--quiet", rel, check=False)
         # Bare commit (NOT `commit -- <paths>`): a pathspec commit is `--only`,
         # which rebuilds the tree from HEAD plus the WORKING-TREE content of the
         # named paths — silently throwing away the `git rm --cached` deletions

@@ -460,6 +460,126 @@ class TestMergeStripsBothFilesOneCommit(unittest.TestCase):
             shutil.rmtree(str(tmp), ignore_errors=True)
 
 
+WATCHDOG_REL = ".loop/state/watchdog-pids"
+HUM_CURSOR_REL = ".loop/state/hum-cursors/box-a.json"
+
+
+class TestMergeStripsDirectoryAndFileFamily(unittest.TestCase):
+    """brief-160 addendum: the strip family now covers the FULL volatile-state
+    set, including a directory-shaped member (hum-cursors/). A branch carrying a
+    stale watchdog-pids FILE and a hum-cursors/ DIRECTORY file → after merge,
+    main tracks NEITHER, stripped in the single strip commit. Drives real
+    actions.merge()."""
+
+    BRIEF = "brief-160-strip-family"
+
+    def _setup(self, tmp: Path):
+        brief = self.BRIEF
+        origin = tmp / "origin.git"
+        origin.mkdir()
+        _git(origin, "init", "--bare", "-q", "-b", "main")
+
+        project = tmp / "project"
+        project.mkdir()
+        _git(project, "init", "-q", "-b", "main")
+        _git(project, "config", "user.email", "t@t")
+        _git(project, "config", "user.name", "t")
+        _git(project, "remote", "add", "origin", str(origin))
+
+        state = project / ".loop" / "state"
+        state.mkdir(parents=True)
+        # Steady state: the whole family gitignored; main tracks none of it.
+        (project / ".gitignore").write_text(
+            "\n".join([PROGRESS_REL, WATCHDOG_REL, ".loop/state/hum-cursors/"]) + "\n"
+        )
+        (project / "README").write_text("seed\n")
+        _git(project, "add", "README", ".gitignore")
+        _git(project, "commit", "-q", "-m", "seed")
+        _git(project, "push", "-u", "origin", "main", "-q")
+
+        # Brief branch: real work + a stale watchdog-pids FILE and a
+        # hum-cursors/ DIRECTORY file force-added (branch cut before untracking).
+        _git(project, "checkout", "-q", "-b", brief)
+        (project / "work.txt").write_text("work output\n")
+        _write_progress(project, brief, 2, status="complete")
+        (state / "watchdog-pids").write_text("12345 brief-old\n")
+        (state / "hum-cursors").mkdir(parents=True, exist_ok=True)
+        (state / "hum-cursors" / "box-a.json").write_text('{"cursor": 42}\n')
+        _git(project, "add", "work.txt")
+        _git(project, "add", "-f", PROGRESS_REL, WATCHDOG_REL, HUM_CURSOR_REL)
+        _git(project, "commit", "-q", "-m", f"[worker] {brief} done")
+        _git(project, "push", "-u", "origin", brief, "-q")
+        _git(project, "checkout", "-q", "main")
+
+        card = project / "wiki" / "briefs" / "cards" / brief
+        card.mkdir(parents=True)
+        (card / "index.md").write_text(
+            f"---\nID: {brief}\nStatus: active\nAuto-merge: true\n---\n\n# {brief}\n"
+        )
+        _git(project, "add", f"wiki/briefs/cards/{brief}/index.md")
+        _git(project, "commit", "-q", "-m", f"loop: card active for {brief}")
+        _git(project, "push", "origin", "main", "-q")
+
+        state.mkdir(parents=True, exist_ok=True)
+        (project / ".loop" / "config.sh").write_text(
+            "GIT_REMOTE=origin\nGIT_MAIN_BRANCH=main\n"
+        )
+        (state / "log.jsonl").write_text("")
+        with open(state / "runtime-events.jsonl", "w") as f:
+            for e in (
+                {"event": "dispatched", "brief": brief, "branch": brief},
+                {"event": "completed", "brief": brief, "kind": "complete",
+                 "auto_merge": True},
+                {"event": "approved", "brief": brief},
+            ):
+                f.write(json.dumps(e) + "\n")
+        write_running_json(str(project))
+        with open(state / "pending-merge.json", "w") as f:
+            json.dump({"brief": brief, "branch": brief, "title": brief}, f)
+        return project
+
+    def test_watchdog_file_and_hum_cursor_dir_stripped_in_one_commit(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            project = self._setup(tmp)
+
+            # Pre-condition: the BRANCH carries the file AND the directory member.
+            for rel in (WATCHDOG_REL, HUM_CURSOR_REL):
+                self.assertEqual(
+                    _git(project, "show", f"{self.BRIEF}:{rel}", check=False).returncode, 0,
+                    f"pre-condition: brief branch must carry committed {rel}",
+                )
+
+            paths = init_paths(str(project))
+            self.assertTrue(merge(paths), "merge() must succeed")
+
+            tracked = _git(project, "ls-files").stdout
+            self.assertIn("work.txt", tracked, "worker's real content must land on main")
+            self.assertNotIn(WATCHDOG_REL, tracked,
+                             "watchdog-pids must NOT be tracked on main after merge")
+            self.assertNotIn(HUM_CURSOR_REL, tracked,
+                             "hum-cursors/ dir member must NOT be tracked on main "
+                             "after merge (directory strip)")
+
+            # A single strip commit removing both the file and the dir member.
+            strip_log = _git(
+                project, "log", "--format=%H",
+                "--grep=strip daemon-volatile bookkeeping",
+            ).stdout.split()
+            self.assertEqual(len(strip_log), 1,
+                             f"expected exactly ONE strip commit, got {len(strip_log)}")
+            removed = _git(
+                project, "show", "--name-only", "--diff-filter=D",
+                "--format=", strip_log[0],
+            ).stdout
+            self.assertIn(WATCHDOG_REL, removed,
+                          "the single strip commit must remove watchdog-pids")
+            self.assertIn(HUM_CURSOR_REL, removed,
+                          "the single strip commit must remove the hum-cursors/ member")
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+
 class TestDispatchNeverReusesStaleBranchRef(unittest.TestCase):
     """#83/#84: dispatch must not resurrect a branch deleted on origin off a
     stale local remote-tracking ref. Exercises the real branch_reusable_on_origin

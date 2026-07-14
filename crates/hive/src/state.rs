@@ -889,6 +889,11 @@ pub struct PendingBrief {
     /// the signal payload (e.g. "~60s"). None for signals without options
     /// or without estimates on the recommended option.
     pub estimated_time: Option<String>,
+    /// Signal file this row was sourced from (e.g.
+    /// `.loop/state/signals/escalate.json`). Set only for signal-backed rows;
+    /// `None` for briefs discovered via running.json (awaiting-review, eval).
+    /// The escalation-detail pane opens this file on Enter.
+    pub source_file: Option<PathBuf>,
 }
 
 /// Whether a queued brief is dispatchable, derived from its `Depends-on:` field.
@@ -2107,6 +2112,7 @@ impl CellsState {
                         latest_validator_cycle: cycle,
                         cycle_budget: budget,
                         estimated_time,
+                        source_file: Some(path.clone()),
                     });
                 }
             }
@@ -2130,6 +2136,7 @@ impl CellsState {
                     latest_validator_cycle: cycle,
                     cycle_budget: budget,
                     estimated_time: None,
+                    source_file: None,
                 });
             }
         }
@@ -2152,6 +2159,7 @@ impl CellsState {
                     latest_validator_cycle: cycle,
                     cycle_budget: budget,
                     estimated_time: None,
+                    source_file: None,
                 });
             }
         }
@@ -3464,6 +3472,313 @@ impl Signal {
 
 pub struct SignalsState {
     pub signals: Vec<Signal>,
+}
+
+// ── EscalationDetail ──────────────────────────────────────────────────────────
+
+/// Parsed escalation content, assembled for the read-only detail pane opened
+/// with Enter on a Decide-section escalation row (issue #82). Escalations vary
+/// wildly in shape across raisers and eras (the fix-15 receipt schema, the
+/// queen's `issues[]` decision escalates, the daemon's sync-diverged signal,
+/// …), so this parses the raw JSON permissively: the known "spine" fields land
+/// in typed slots, everything else falls through to a `key: value` tail. Every
+/// field is optional — a missing or unparseable file yields a `load_error`, not
+/// a panic.
+///
+/// Mattie's design rule (issue #82, point 5): any escalation class that can't
+/// produce a readable artifact is a bug in its RAISER, not here. This viewer
+/// renders whatever content exists honestly; if a shape shows up with no
+/// human-readable field at all, fix the raiser to write one — don't paper over
+/// it by inventing text on the read side.
+#[derive(Clone, Default)]
+pub struct EscalationDetail {
+    /// The signal file this was parsed from, kept for the pane footer and for
+    /// cache-staleness comparison against the selected row.
+    pub source: Option<PathBuf>,
+    /// Set when the file is missing or unparseable — the pane renders this
+    /// honest message in place of fields. Never a panic.
+    pub load_error: Option<String>,
+    /// One-line headline: `one_liner` → `title` → `plain_version` → `summary`
+    /// → `reason` (first present).
+    pub headline: Option<String>,
+    /// THE answer to "what does it need from me" (issue #82) — rendered
+    /// prominently. Synthesized from the first present ask-shaped field:
+    /// a string `human_action_required`, then `decision_needed`,
+    /// `action_required_from_mattie`, `open_decision_for_mattie`, `your_part`,
+    /// `resume_instructions`, `off_ramp`.
+    pub human_action: Option<String>,
+    /// The raiser's `human_action_required` boolean, when it's a bool (the
+    /// fix-15 receipt schema uses a flag, not prose). Lets the pane say
+    /// "action required" even when no ask prose was written — surfacing a
+    /// raiser gap rather than hiding it.
+    pub action_required_flag: Option<bool>,
+    /// `summary`, rendered as context when distinct from the headline.
+    pub summary: Option<String>,
+    /// `reason`, rendered as context when distinct from the headline/summary.
+    pub reason: Option<String>,
+    /// `recommendation` — the raiser's lean, when present.
+    pub recommendation: Option<String>,
+    pub brief: Option<String>,
+    /// `severity` → `urgency` → `kind` (first present).
+    pub severity: Option<String>,
+    /// `raised_by` → `by` → `actor` (first present).
+    pub raised_by: Option<String>,
+    /// `raised_at` → `escalated_at` → `ts` → `timestamp` (first present).
+    pub raised_at: Option<String>,
+    /// Receipt facts (site/count/failure_line/first_ts/last_ts, plus the
+    /// sync-diverged remote/branch/ahead/behind/consecutive_failures) as
+    /// `(label, value)` pairs — only those present.
+    pub receipt: Vec<(String, String)>,
+    /// Sub-decisions from an `issues[]` or `items[]` array: each element's
+    /// string fields as `(key, value)` pairs. Escalations that carry their
+    /// whole substance here (the queen's multi-item decision escalates) stay
+    /// readable.
+    pub issues: Vec<Vec<(String, String)>>,
+    /// Top-level fields not consumed by this parse, rendered `key: value`.
+    /// Includes LOSING synonym-chain members: when `urgency` wins the severity
+    /// slot, a co-present `kind` lands here instead of vanishing (real shape:
+    /// ft-011 carried both `urgency` and `kind` as distinct fields). Only keys
+    /// whose values were actually rendered elsewhere are excluded.
+    pub extra: Vec<(String, String)>,
+}
+
+/// Receipt-shaped keys, rendered together in a "Receipt" block in this order.
+const ESCALATION_RECEIPT_KEYS: &[&str] = &[
+    "site",
+    "count",
+    "failure_line",
+    "first_ts",
+    "last_ts",
+    "remote",
+    "branch",
+    "ahead",
+    "behind",
+    "consecutive_failures",
+];
+
+/// First key in `keys` whose value is a non-empty string. The WINNING key is
+/// recorded in `consumed` (excluded from the `extra` tail); losing chain
+/// members are deliberately NOT consumed, so they fall through to the tail
+/// instead of being dropped.
+fn consume_first_str(
+    map: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&'static str],
+    consumed: &mut HashSet<&'static str>,
+) -> Option<String> {
+    for k in keys {
+        if let Some(s) = map.get(*k).and_then(|v| v.as_str()) {
+            let t = s.trim();
+            if !t.is_empty() {
+                consumed.insert(k);
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Render a JSON value as a compact display string: strings verbatim, scalars
+/// stringified, arrays/objects as compact JSON. Never panics.
+fn escalation_value_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+impl EscalationDetail {
+    /// Parse the escalation file at `source`. Returns a detail with
+    /// `load_error` set (never an `Err`, never a panic) when the source is
+    /// absent, missing on disk, or not a JSON object — so the pane always has
+    /// something honest to render.
+    pub fn load(source: Option<PathBuf>) -> Self {
+        let Some(path) = source else {
+            return EscalationDetail {
+                source: None,
+                load_error: Some(
+                    "no escalation source file is recorded for this row".to_string(),
+                ),
+                ..Default::default()
+            };
+        };
+        let body = match fs::read_to_string(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                return EscalationDetail {
+                    source: Some(path.clone()),
+                    load_error: Some(format!(
+                        "escalation file could not be read ({}): {}",
+                        path.display(),
+                        e
+                    )),
+                    ..Default::default()
+                };
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return EscalationDetail {
+                    source: Some(path.clone()),
+                    load_error: Some(format!(
+                        "escalation file is not valid JSON ({}): {}",
+                        path.display(),
+                        e
+                    )),
+                    ..Default::default()
+                };
+            }
+        };
+        let serde_json::Value::Object(map) = value else {
+            return EscalationDetail {
+                source: Some(path.clone()),
+                load_error: Some(format!(
+                    "escalation file is not a JSON object ({})",
+                    path.display()
+                )),
+                ..Default::default()
+            };
+        };
+
+        Self::from_map(&map, Some(path))
+    }
+
+    /// Test-only: assemble a detail from an already-parsed JSON object,
+    /// bypassing the filesystem. Lets the render layer (in `main.rs`, a
+    /// separate module) exercise assembly without writing a temp file.
+    #[cfg(test)]
+    pub fn load_from_map_for_test(
+        map: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        Self::from_map(&map, Some(PathBuf::from("escalate.json")))
+    }
+
+    /// Assemble the typed slots + tail from a parsed JSON object. Split out so
+    /// parsing is unit-testable without touching the filesystem.
+    ///
+    /// The `extra` tail excludes only keys ACTUALLY consumed by this parse —
+    /// synonym-chain winners, dedicated-render keys present, receipt keys
+    /// present, and the issues/items array that rendered. Losing chain members
+    /// (e.g. `kind` when `urgency` won the severity slot) fall through to the
+    /// tail rather than vanishing.
+    fn from_map(
+        map: &serde_json::Map<String, serde_json::Value>,
+        source: Option<PathBuf>,
+    ) -> Self {
+        let mut consumed: HashSet<&'static str> = HashSet::new();
+
+        let headline = consume_first_str(
+            map,
+            &["one_liner", "title", "plain_version", "summary", "reason"],
+            &mut consumed,
+        );
+
+        // "What it needs from you": a string `human_action_required` wins
+        // (some raisers put the ask there directly); otherwise the flag is a
+        // bool and the ask lives in one of the prose fields below. The key is
+        // consumed only when it actually rendered as ask-prose or as the flag.
+        let har = map.get("human_action_required");
+        let action_required_flag = har.and_then(|v| v.as_bool());
+        let mut human_action = har
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if action_required_flag.is_some() || human_action.is_some() {
+            consumed.insert("human_action_required");
+        }
+        if human_action.is_none() {
+            human_action = consume_first_str(
+                map,
+                &[
+                    "decision_needed",
+                    "action_required_from_mattie",
+                    "open_decision_for_mattie",
+                    "your_part",
+                    "resume_instructions",
+                    "off_ramp",
+                ],
+                &mut consumed,
+            );
+        }
+
+        let receipt: Vec<(String, String)> = ESCALATION_RECEIPT_KEYS
+            .iter()
+            .filter_map(|k| {
+                map.get(*k).map(|v| {
+                    consumed.insert(k);
+                    (k.to_string(), escalation_value_to_string(v))
+                })
+            })
+            .collect();
+
+        // issues[] / items[]: first key holding an array of objects wins and
+        // is consumed; a present-but-unrendered candidate (non-array, or no
+        // object elements) stays in the tail instead of vanishing.
+        let mut issues: Vec<Vec<(String, String)>> = Vec::new();
+        for key in ["issues", "items"] {
+            let Some(arr) = map.get(key).and_then(|v| v.as_array()) else {
+                continue;
+            };
+            issues = arr
+                .iter()
+                .filter_map(|el| el.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .map(|(k, v)| (k.clone(), escalation_value_to_string(v)))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|pairs: &Vec<(String, String)>| !pairs.is_empty())
+                .collect();
+            if !issues.is_empty() {
+                consumed.insert(key);
+                break;
+            }
+        }
+
+        // Dedicated-render slots: these keys always render when present (the
+        // pane dedupes summary/reason against the headline), so they are
+        // consumed regardless of who won the headline chain.
+        let summary = consume_first_str(map, &["summary"], &mut consumed);
+        let reason = consume_first_str(map, &["reason"], &mut consumed);
+        let recommendation = consume_first_str(map, &["recommendation"], &mut consumed);
+        let brief = consume_first_str(map, &["brief"], &mut consumed);
+        let severity = consume_first_str(map, &["severity", "urgency", "kind"], &mut consumed);
+        let raised_by = consume_first_str(map, &["raised_by", "by", "actor"], &mut consumed);
+        let raised_at = consume_first_str(
+            map,
+            &["raised_at", "escalated_at", "ts", "timestamp"],
+            &mut consumed,
+        );
+
+        let mut extra: Vec<(String, String)> = map
+            .iter()
+            .filter(|(k, _)| !consumed.contains(k.as_str()))
+            .map(|(k, v)| (k.clone(), escalation_value_to_string(v)))
+            .collect();
+        extra.sort_by(|a, b| a.0.cmp(&b.0));
+
+        EscalationDetail {
+            source,
+            load_error: None,
+            headline,
+            human_action,
+            action_required_flag,
+            summary,
+            reason,
+            recommendation,
+            brief,
+            severity,
+            raised_by,
+            raised_at,
+            receipt,
+            issues,
+            extra,
+        }
+    }
 }
 
 // ── LearningsState ────────────────────────────────────────────────────────────
@@ -5418,6 +5733,206 @@ some non-bracket junk line
     fn extract_brief_from_message_returns_none_when_absent() {
         let msg = "daemon started, no briefs active";
         assert!(extract_brief_from_message(msg).is_none());
+    }
+
+    // ── escalation-detail (issue #82) parse tests ─────────────────────────────
+
+    fn escalation_from_json(json: &str) -> EscalationDetail {
+        let map = match serde_json::from_str::<serde_json::Value>(json).unwrap() {
+            serde_json::Value::Object(m) => m,
+            _ => panic!("test json not an object"),
+        };
+        EscalationDetail::from_map(&map, Some(PathBuf::from("escalate.json")))
+    }
+
+    #[test]
+    fn escalation_detail_parses_fix15_receipt_schema() {
+        // The daemon's repeat-failure receipt (lib/failure_tracker.py) — the
+        // fix-15 spine: one_liner + human_action_required flag + receipt fields.
+        let json = r#"{
+            "type": "repeat_failure",
+            "reason": "Repeat failure: railway-deploy refused 3x on brief-42",
+            "site": "railway-deploy",
+            "brief": "brief-42",
+            "failure_line": "railway up: build failed",
+            "count": 3,
+            "first_ts": "2026-07-12T01:00:00Z",
+            "last_ts": "2026-07-12T01:10:00Z",
+            "timestamp": "2026-07-12T01:10:05Z",
+            "raised_by": "daemon",
+            "raised_at": "2026-07-12T01:10:05Z",
+            "severity": "ops-recovery",
+            "human_action_required": true,
+            "director_clearable": true,
+            "one_liner": "Repeat failure: railway-deploy refused 3x on brief-42"
+        }"#;
+        let d = escalation_from_json(json);
+        assert!(d.load_error.is_none());
+        assert_eq!(
+            d.headline.as_deref(),
+            Some("Repeat failure: railway-deploy refused 3x on brief-42")
+        );
+        // Bool flag captured; no prose ask on this shape.
+        assert_eq!(d.action_required_flag, Some(true));
+        assert!(d.human_action.is_none());
+        assert_eq!(d.brief.as_deref(), Some("brief-42"));
+        assert_eq!(d.severity.as_deref(), Some("ops-recovery"));
+        assert_eq!(d.raised_by.as_deref(), Some("daemon"));
+        // Receipt block carries the site/count/failure_line/ts fields.
+        let receipt: std::collections::HashMap<_, _> = d.receipt.iter().cloned().collect();
+        assert_eq!(receipt.get("site").map(String::as_str), Some("railway-deploy"));
+        assert_eq!(receipt.get("count").map(String::as_str), Some("3"));
+        assert!(receipt.contains_key("failure_line"));
+        // director_clearable/type/timestamp land in the extra tail, not lost.
+        let extra: std::collections::HashMap<_, _> = d.extra.iter().cloned().collect();
+        assert_eq!(extra.get("type").map(String::as_str), Some("repeat_failure"));
+        assert_eq!(extra.get("director_clearable").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn escalation_detail_prose_ask_wins_when_present() {
+        // The queen's `decision_needed` shape — the ask is prose, and the
+        // string is what Mattie needs to see under "what it needs from you".
+        let json = r#"{
+            "brief": "ft-011",
+            "raised_by": "queen",
+            "one_liner": "ft-011 is spend-gated at the Modal deploy.",
+            "decision_needed": "Authorize the A100 redeploy, or hold the brief.",
+            "recommendation": "authorize — bounded one-deploy spend"
+        }"#;
+        let d = escalation_from_json(json);
+        assert_eq!(
+            d.human_action.as_deref(),
+            Some("Authorize the A100 redeploy, or hold the brief.")
+        );
+        assert_eq!(d.recommendation.as_deref(), Some("authorize — bounded one-deploy spend"));
+        assert!(d.action_required_flag.is_none());
+    }
+
+    #[test]
+    fn escalation_detail_flattens_issues_array() {
+        // Multi-item decision escalate — the whole substance is in issues[].
+        let json = r#"{
+            "summary": "Three open items on the desk.",
+            "issues": [
+                {"id": "cap-005", "what": "task 4 is a live smoke", "ask": "waive or hold"},
+                {"id": "serve-009", "what": "spend-gated proof", "ask": "authorize A100"}
+            ]
+        }"#;
+        let d = escalation_from_json(json);
+        assert_eq!(d.headline.as_deref(), Some("Three open items on the desk."));
+        assert_eq!(d.issues.len(), 2);
+        let first: std::collections::HashMap<_, _> = d.issues[0].iter().cloned().collect();
+        assert_eq!(first.get("id").map(String::as_str), Some("cap-005"));
+        assert_eq!(first.get("ask").map(String::as_str), Some("waive or hold"));
+    }
+
+    #[test]
+    fn escalation_detail_losing_synonym_members_fall_to_tail() {
+        // Real shape (escalate.json.resolved-ft-011-option1-approved-mattie):
+        // `urgency` AND `kind` are both present as DISTINCT fields. `urgency`
+        // wins the severity slot; `kind` must fall through to the Other-fields
+        // tail — not be silently dropped by a blanket known-keys exclusion.
+        let json = r#"{
+            "brief": "ft-011",
+            "raised_at": "2026-07-10T00:40:00Z",
+            "raised_by": "queen",
+            "kind": "scope-decision",
+            "urgency": "non-urgent",
+            "one_liner": "ft-011 hit its own named escalation trigger.",
+            "decision_needed": "Pick one resolution option.",
+            "recommendation": "Option 1"
+        }"#;
+        let d = escalation_from_json(json);
+        assert_eq!(d.severity.as_deref(), Some("non-urgent"));
+        let extra: std::collections::HashMap<_, _> = d.extra.iter().cloned().collect();
+        assert_eq!(
+            extra.get("kind").map(String::as_str),
+            Some("scope-decision"),
+            "losing severity-chain member must render in the tail"
+        );
+        // The winner and every rendered slot stay out of the tail.
+        for k in ["urgency", "one_liner", "decision_needed", "recommendation", "brief", "raised_by", "raised_at"] {
+            assert!(!extra.contains_key(k), "{k} rendered in a slot; must not duplicate in tail");
+        }
+    }
+
+    #[test]
+    fn escalation_detail_losing_headline_and_ask_members_fall_to_tail() {
+        // Same rule on the other chains: `title` loses the headline to
+        // `one_liner`, `off_ramp` loses the ask to `decision_needed`, and
+        // `timestamp` loses raised_at to `raised_at` — all must surface in
+        // the tail rather than vanish.
+        let json = r#"{
+            "one_liner": "headline winner",
+            "title": "headline loser",
+            "decision_needed": "ask winner",
+            "off_ramp": "ask loser",
+            "raised_at": "2026-07-12T00:00:00Z",
+            "timestamp": "2026-07-12T00:00:01Z"
+        }"#;
+        let d = escalation_from_json(json);
+        assert_eq!(d.headline.as_deref(), Some("headline winner"));
+        assert_eq!(d.human_action.as_deref(), Some("ask winner"));
+        assert_eq!(d.raised_at.as_deref(), Some("2026-07-12T00:00:00Z"));
+        let extra: std::collections::HashMap<_, _> = d.extra.iter().cloned().collect();
+        assert_eq!(extra.get("title").map(String::as_str), Some("headline loser"));
+        assert_eq!(extra.get("off_ramp").map(String::as_str), Some("ask loser"));
+        assert_eq!(extra.get("timestamp").map(String::as_str), Some("2026-07-12T00:00:01Z"));
+    }
+
+    #[test]
+    fn escalation_detail_minimal_shape_is_honest() {
+        // A near-empty escalation still renders — no panic, no invented text.
+        let d = escalation_from_json(r#"{"reason": "sync diverged"}"#);
+        assert!(d.load_error.is_none());
+        assert_eq!(d.headline.as_deref(), Some("sync diverged"));
+        assert!(d.human_action.is_none());
+        assert!(d.action_required_flag.is_none());
+    }
+
+    #[test]
+    fn escalation_detail_load_missing_file_is_honest() {
+        let d = EscalationDetail::load(Some(PathBuf::from(
+            "/nonexistent/.loop/state/signals/escalate.json",
+        )));
+        assert!(d.load_error.is_some(), "missing file must set load_error, not panic");
+        assert!(d.headline.is_none());
+    }
+
+    #[test]
+    fn escalation_detail_load_none_source_is_honest() {
+        let d = EscalationDetail::load(None);
+        assert!(d.load_error.is_some());
+    }
+
+    #[test]
+    fn escalation_detail_garbage_json_is_honest() {
+        let dir = std::env::temp_dir().join(format!("hive-esc-garbage-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("escalate.json");
+        fs::write(&path, "{not valid json at all").unwrap();
+        let d = EscalationDetail::load(Some(path.clone()));
+        assert!(d.load_error.is_some(), "unparseable json must set load_error, not panic");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn escalation_detail_non_object_json_is_honest() {
+        let d = escalation_from_json_or_load("[1, 2, 3]");
+        assert!(d.load_error.is_some());
+    }
+
+    // Non-object top-level JSON can't go through `from_map`, so route it through
+    // a temp file to exercise the `load` guard.
+    fn escalation_from_json_or_load(json: &str) -> EscalationDetail {
+        let dir = std::env::temp_dir().join(format!("hive-esc-nonobj-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("escalate.json");
+        fs::write(&path, json).unwrap();
+        let d = EscalationDetail::load(Some(path));
+        let _ = fs::remove_dir_all(&dir);
+        d
     }
 
     // ── escalate payload + queue discovery tests ──────────────────────────────
