@@ -469,6 +469,15 @@ def project_running_json(project_dir, events=None, lane=None):
                 out["active"].append(_build_active_entry(brief_id, fm, evs))
             continue
 
+        if status == "parked":
+            # brief-160 piece 2: parked is a first-class non-slot-holding state.
+            # A parked brief holds NO dispatch slot — it is dropped from active[]
+            # (and every other running.json bucket) by construction. The card is
+            # the truth; hive's Parked shelf and `loop why` read the parked block
+            # off the card. Never dispatched (queue.py filters Status: queued),
+            # never re-invoked (assess emits no trigger for a non-active card).
+            continue
+
         if status == "merged":
             history_entries[brief_id] = _build_history_entry(brief_id, fm, evs)
             continue

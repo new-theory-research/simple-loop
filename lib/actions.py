@@ -1227,6 +1227,303 @@ def close_as_delivered(paths, brief_id, delivered_via, reason=""):
     return True
 
 
+# ─── brief-160 piece 2: parked lifecycle (Mattie's ruling, #97/#39) ──────
+#
+# Blocked-on-external must cost zero throughput. Parking is a first-class card
+# state: `Status: parked` releases the dispatch slot (the projector drops a
+# parked card from active[]) AND the claim ref in the SAME operation, and writes
+# a machine+human-readable parked block INTO the card (blocker / owner /
+# re-trigger / parked_at) — the visible surface hive's Parked shelf and
+# `loop why` read. Un-parking is the mirror: flip parked→queued, clear the block
+# into `## Park history`, bust dedup so the queue re-enters the brief now.
+
+# A park owner is human (→ escalation fires) unless it names an autonomous role.
+_NON_HUMAN_OWNERS = {"director", "scout", "daemon", "queen", "auto", "harness"}
+
+_PARKED_FIELDS = ("Parked-blocker", "Parked-owner", "Parked-retrigger", "Parked-at")
+
+
+def _owner_is_human(owner):
+    """True unless the owner names an autonomous role (director/scout/daemon…)."""
+    return (owner or "").strip().lower() not in _NON_HUMAN_OWNERS
+
+
+def _frontmatter_bounds(lines):
+    """Return (start, end) indices of the `---`-fenced frontmatter, or (-1, -1)."""
+    if not lines or lines[0].strip() != "---":
+        return (-1, -1)
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return (0, i)
+    return (-1, -1)
+
+
+def _upsert_frontmatter_fields(content, fields):
+    """Insert/replace `Key: value` lines in the YAML frontmatter. Pure transform.
+
+    fields: list of (key, value). An existing key (case-insensitive) is replaced
+    in place; a new key is appended just before the closing `---`. No-ops when the
+    card has no frontmatter.
+    """
+    lines = content.splitlines(keepends=True)
+    _, fm_end = _frontmatter_bounds(lines)
+    if fm_end == -1:
+        return content
+    done = set()
+    for i in range(1, fm_end):
+        stripped = lines[i].lstrip()
+        for k, v in fields:
+            if k in done:
+                continue
+            if stripped.lower().startswith(k.lower() + ":"):
+                leading = lines[i][: len(lines[i]) - len(stripped)]
+                lines[i] = f"{leading}{k}: {v}\n"
+                done.add(k)
+                break
+    appended = [f"{k}: {v}\n" for k, v in fields if k not in done]
+    lines[fm_end:fm_end] = appended
+    return "".join(lines)
+
+
+def _remove_frontmatter_fields(content, keys):
+    """Remove named `Key:` lines from the frontmatter. Returns (content, removed).
+
+    removed: {lowercased-key: value} for every field that was present.
+    """
+    lines = content.splitlines(keepends=True)
+    _, fm_end = _frontmatter_bounds(lines)
+    if fm_end == -1:
+        return content, {}
+    lower_keys = {k.lower() for k in keys}
+    removed = {}
+    kept = []
+    for i, line in enumerate(lines):
+        if 1 <= i < fm_end:
+            stripped = line.strip()
+            if ":" in stripped:
+                key = stripped.split(":", 1)[0].strip().lower()
+                if key in lower_keys:
+                    removed[key] = stripped.split(":", 1)[1].strip()
+                    continue
+        kept.append(line)
+    return "".join(kept), removed
+
+
+def _read_card_status(card_path):
+    """Return the lowercased frontmatter Status: value, or ''. Tolerant reader."""
+    try:
+        with open(card_path) as f:
+            lines = f.readlines()
+    except (IOError, OSError):
+        return ""
+    _, fm_end = _frontmatter_bounds(lines)
+    if fm_end == -1:
+        return ""
+    for i in range(1, fm_end):
+        s = lines[i].strip()
+        if s.lower().startswith("status:"):
+            return s.split(":", 1)[1].strip().lower()
+    return ""
+
+
+def _append_park_history(content, bullet):
+    """Append a bullet under a `## Park history` section (creating it if absent)."""
+    marker = "## Park history"
+    if marker in content:
+        idx = content.index(marker) + len(marker)
+        # Insert just after the header line.
+        nl = content.find("\n", idx)
+        if nl == -1:
+            return content + "\n" + bullet
+        return content[: nl + 1] + bullet + content[nl + 1 :]
+    sep = "" if content.endswith("\n") else "\n"
+    return f"{content}{sep}\n{marker}\n\n{bullet}"
+
+
+def _write_park_escalation(paths, brief_id, blocker, owner, retrigger, parked_at):
+    """Raise escalate.json for a human-owned park. Guarded — never clobbers."""
+    signals_dir = paths.get("signals_dir", os.path.join(paths["state_dir"], "signals"))
+    os.makedirs(signals_dir, exist_ok=True)
+    esc = os.path.join(signals_dir, "escalate.json")
+    if os.path.exists(esc):
+        print(f"park: escalate.json already present — not clobbering ({brief_id})",
+              file=sys.stderr)
+        return
+    payload = {
+        "type": "brief_parked",
+        "reason": "blocked_on_external",
+        "timestamp": parked_at,
+        "brief": brief_id,
+        "blocker": blocker,
+        "owner": owner,
+        "retrigger": retrigger,
+    }
+    with open(esc, "w") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+
+
+def park_brief(paths, brief_id, blocker="", owner="", retrigger="", reason="", parked_at=""):
+    """Auto-park a blocked-on-external brief. brief-160 piece 2 (#97).
+
+    Card Status → parked, the dispatch slot + claim ref released in the SAME
+    operation, and a parked block (blocker / owner / re-trigger / parked_at)
+    written INTO the card frontmatter. A human-owned blocker also raises
+    escalate.json so it lands on a human-visible surface. Idempotent: a re-park
+    refreshes the block. Card-status commit rides normal bookkeeping (the daemon
+    /  `loop park` pushes).
+    """
+    project_dir = paths["project_dir"]
+    card_path = os.path.join(project_dir, "wiki", "briefs", "cards", brief_id, "index.md")
+    if not os.path.exists(card_path):
+        print(f"park: card not found for {brief_id} at {card_path}", file=sys.stderr)
+        return False
+
+    parked_at = parked_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    blocker = (blocker or "blocked on external dependency").replace("\n", " ").strip()
+    owner = (owner or "human").replace("\n", " ").strip()
+    retrigger = (retrigger or f"blocker resolved, then: loop unpark {brief_id}").replace("\n", " ").strip()
+
+    try:
+        with open(card_path) as f:
+            content = f.read()
+    except (IOError, OSError) as e:
+        print(f"park: cannot read card for {brief_id}: {e}", file=sys.stderr)
+        return False
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from _set_card_status import transform_card_status_content
+    content, _ = transform_card_status_content(content, "parked")
+    content = _upsert_frontmatter_fields(content, [
+        ("Parked-blocker", blocker),
+        ("Parked-owner", owner),
+        ("Parked-retrigger", retrigger),
+        ("Parked-at", parked_at),
+    ])
+    try:
+        with open(card_path, "w") as f:
+            f.write(content)
+    except (IOError, OSError) as e:
+        print(f"park: cannot write card for {brief_id}: {e}", file=sys.stderr)
+        return False
+
+    git(project_dir, "add", card_path, check=False)
+    git(project_dir, "commit", "-m",
+        f"loop: park {brief_id} (blocked on external — owner {owner})", check=False)
+    log_action(paths, "card_status_set_parked", {"brief": brief_id})
+
+    # Audit event (unknown type — projector ignores it, mirrors over_budget).
+    runtime_event(paths, "parked", brief_id,
+                  blocker=blocker, owner=owner, retrigger=retrigger, parked_at=parked_at)
+    # Re-project: a parked card drops out of active[] → slot released.
+    project_running(paths)
+
+    # Human-owned blocker → escalation channel (Mattie's ruling: land it where a
+    # human sees it, not just the daemon log).
+    if _owner_is_human(owner):
+        _write_park_escalation(paths, brief_id, blocker, owner, retrigger, parked_at)
+
+    signal_dedup_clear(paths, brief_id)
+    # Release-in-same-op (brief-160 invariant): a parked brief holds no box.
+    _release_claim_quiet(paths, brief_id)
+    log_action(paths, "park-brief", {
+        "brief": brief_id, "blocker": blocker, "owner": owner,
+        "retrigger": retrigger, "parked_at": parked_at, "reason": reason or "",
+    })
+    print(f"Parked {brief_id}: Status → parked (blocker: {blocker}; owner: {owner})")
+    return True
+
+
+def unpark_brief(paths, brief_id, reason="", by=""):
+    """Auto-requeue a parked brief. brief-160 piece 2 (#39).
+
+    The re-trigger fired (a human/director/scout judged the blocker cleared, or an
+    escalate.json for this brief resolved). Card Status parked → queued, the parked
+    block cleared into a `## Park history` entry, dedup busted so the enumerator
+    re-picks the brief THIS tick. Idempotent: a brief that is not parked is a
+    logged no-op (returns False).
+    """
+    project_dir = paths["project_dir"]
+    card_path = os.path.join(project_dir, "wiki", "briefs", "cards", brief_id, "index.md")
+    if not os.path.exists(card_path):
+        print(f"unpark: card not found for {brief_id}", file=sys.stderr)
+        return False
+
+    if _read_card_status(card_path) != "parked":
+        print(f"unpark: {brief_id} is not parked — no-op", file=sys.stderr)
+        return False
+
+    try:
+        with open(card_path) as f:
+            content = f.read()
+    except (IOError, OSError) as e:
+        print(f"unpark: cannot read card for {brief_id}: {e}", file=sys.stderr)
+        return False
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from _set_card_status import transform_card_status_content
+
+    content, removed = _remove_frontmatter_fields(content, _PARKED_FIELDS)
+    content, _ = transform_card_status_content(content, "queued")
+    resolved_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    bullet = (
+        f"- **Unparked {resolved_at}** — blocker: {removed.get('parked-blocker', '?')}; "
+        f"owner: {removed.get('parked-owner', '?')}; "
+        f"re-trigger: {removed.get('parked-retrigger', '?')}; "
+        f"parked_at: {removed.get('parked-at', '?')}"
+        + (f"; by: {by}" if by else "")
+        + (f" — {reason}" if reason else "")
+        + "\n"
+    )
+    content = _append_park_history(content, bullet)
+    try:
+        with open(card_path, "w") as f:
+            f.write(content)
+    except (IOError, OSError) as e:
+        print(f"unpark: cannot write card for {brief_id}: {e}", file=sys.stderr)
+        return False
+
+    git(project_dir, "add", card_path, check=False)
+    git(project_dir, "commit", "-m",
+        f"loop: unpark {brief_id} (re-trigger fired — {by or 'manual'})", check=False)
+
+    runtime_event(paths, "unparked", brief_id, by=by or "manual", reason=reason or "")
+    project_running(paths)
+    # Bust dedup so the daemon re-enumerates now rather than after the TTL.
+    signal_dedup_clear(paths, brief_id)
+    log_action(paths, "unpark-brief", {"brief": brief_id, "by": by or "manual", "reason": reason or ""})
+    print(f"Unparked {brief_id}: Status → queued (by: {by or 'manual'})")
+    return True
+
+
+def _parse_flags(extra, known):
+    """Parse `--key value` / `--key=value` pairs from a positional-extra list.
+
+    known: set of flag names (without leading --). Returns {name: value}. Bare
+    trailing positionals (no flag) are ignored — callers use explicit flags.
+    """
+    out = {}
+    i = 0
+    while i < len(extra):
+        tok = extra[i]
+        if tok.startswith("--"):
+            body = tok[2:]
+            if "=" in body:
+                name, _, val = body.partition("=")
+                if name in known:
+                    out[name] = val
+                i += 1
+                continue
+            name = body
+            val = extra[i + 1] if i + 1 < len(extra) else ""
+            if name in known:
+                out[name] = val
+            i += 2
+            continue
+        i += 1
+    return out
+
+
 # ─── Action: dispatch ─────────────────────────────────────────────────
 
 def _load_queue_module():
@@ -3104,8 +3401,19 @@ def main():
         parse_budget(brief_path)
         sys.exit(0)
 
+    # card-status takes <brief_id> <project_dir> and prints the card's Status.
+    # Handle before the generic guard — used by the daemon's park/unpark paths.
+    if len(sys.argv) >= 2 and sys.argv[1] == "card-status":
+        if len(sys.argv) < 4:
+            print("card-status requires <brief_id> <project_dir>", file=sys.stderr)
+            sys.exit(1)
+        _cs_card = os.path.join(sys.argv[3], "wiki", "briefs", "cards", sys.argv[2], "index.md")
+        print(_read_card_status(_cs_card))
+        sys.exit(0)
+
     BRIEF_ACTIONS = ("move-to-eval", "move-to-pending-merges", "move-to-awaiting-review",
-                     "approve-brief", "reject-brief", "close-brief", "ensure-progress-for-brief")
+                     "approve-brief", "reject-brief", "close-brief", "ensure-progress-for-brief",
+                     "park-brief", "unpark-brief")
 
     if len(sys.argv) < 3:
         print(f"Usage: {sys.argv[0]} <action> <project_dir> [args]", file=sys.stderr)
@@ -3116,6 +3424,9 @@ def main():
         print("         approve-brief <brief_id> <project_dir>", file=sys.stderr)
         print("         reject-brief <brief_id> <project_dir> [reason]", file=sys.stderr)
         print("         close-brief <brief_id> <project_dir> <delivered_via> [reason]", file=sys.stderr)
+        print("         park-brief <brief_id> <project_dir> [--blocker X --owner Y --retrigger Z --reason R]", file=sys.stderr)
+        print("         unpark-brief <brief_id> <project_dir> [--by X --reason R]", file=sys.stderr)
+        print("         card-status <brief_id> <project_dir>", file=sys.stderr)
         print("         dispatch <project_dir>", file=sys.stderr)
         print("         merge <project_dir>", file=sys.stderr)
         print("         cleanup <project_dir>", file=sys.stderr)
@@ -3164,6 +3475,15 @@ def main():
             delivered_via = extra[0]
             reason = " ".join(extra[1:]) if len(extra) > 1 else ""
             success = close_as_delivered(paths, brief_id, delivered_via, reason)
+        elif action == "park-brief":
+            f = _parse_flags(extra, {"blocker", "owner", "retrigger", "reason", "parked-at"})
+            success = park_brief(paths, brief_id,
+                                 blocker=f.get("blocker", ""), owner=f.get("owner", ""),
+                                 retrigger=f.get("retrigger", ""), reason=f.get("reason", ""),
+                                 parked_at=f.get("parked-at", ""))
+        elif action == "unpark-brief":
+            f = _parse_flags(extra, {"by", "reason"})
+            success = unpark_brief(paths, brief_id, reason=f.get("reason", ""), by=f.get("by", ""))
         elif action == "dispatch":
             success = dispatch(paths)
         elif action == "merge":
