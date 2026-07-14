@@ -1955,9 +1955,18 @@ def dispatch(paths):
 # dispatch still plumbing-commits it (bypasses gitignore, see #88) — until that
 # path closes, main tracks it transiently between dispatch and the next
 # merge-strip. This strip is the janitor, not an invariant.
+# The full daemon-volatile state family. Any of these can ride into main's tree
+# via a branch cut BEFORE the file was untracked (the resurrection class — third
+# live instance on portal main tonight was watchdog-pids + hum-cursors/). Entries
+# may be FILES or a whole DIRECTORY (hum-cursors); the strip loop handles both.
 STRIP_ON_MAIN = [
     os.path.join(".loop", "state", "progress.json"),
     os.path.join(".loop", "state", "runtime-events.jsonl"),
+    os.path.join(".loop", "state", "failure-fingerprints.json"),
+    os.path.join(".loop", "state", "watchdog-pids"),
+    os.path.join(".loop", "state", "lane-mutex-dedup.json"),
+    os.path.join(".loop", "state", "queue-stuck-dedup.json"),
+    os.path.join(".loop", "state", "hum-cursors"),  # directory-shaped
 ]
 
 
@@ -2271,14 +2280,20 @@ def merge(paths):
     # tracked at HEAD in a SINGLE follow-up commit before the push, so main's
     # tip tree stays clean and old branches can never re-track them. The
     # physical files stay on disk (daemon-local, gitignored). See STRIP_ON_MAIN.
+    # `ls-files -- <path>` lists tracked entries matching the pathspec: for a
+    # file it returns that file if tracked, for a DIRECTORY it returns every
+    # tracked file under it. Non-empty output == tracked (handles both shapes;
+    # `--error-unmatch` would have falsely reported a tracked directory as
+    # untracked, since a dir is never itself an index entry).
     _to_strip = [
         rel for rel in STRIP_ON_MAIN
-        if git(project_dir, "ls-files", "--error-unmatch", rel,
-               check=False).returncode == 0
+        if git(project_dir, "ls-files", "--", rel, check=False).stdout.strip()
     ]
     if _to_strip:
         for rel in _to_strip:
-            git(project_dir, "rm", "--cached", "--quiet", rel, check=False)
+            # -r so a tracked directory (hum-cursors/) strips recursively; a
+            # plain file ignores -r. --cached leaves the on-disk copy intact.
+            git(project_dir, "rm", "-r", "--cached", "--quiet", rel, check=False)
         # Bare commit (NOT `commit -- <paths>`): a pathspec commit is `--only`,
         # which rebuilds the tree from HEAD plus the WORKING-TREE content of the
         # named paths — silently throwing away the `git rm --cached` deletions
