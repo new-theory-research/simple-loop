@@ -1900,7 +1900,10 @@ def dispatch(paths):
 
     # brief-108-d: project running.json from cards + events. Single-write owner.
     # harness-001/003: running.json is daemon-local — project locally but do
-    # NOT commit it. Only runtime-events.jsonl goes to main.
+    # NOT commit it. runtime-events.jsonl is ALSO daemon-local (#88): it is
+    # written locally by runtime_event() above, and its cross-box transport is
+    # the hum presence sidecar (brief-165), NOT git. Nothing reads it from a git
+    # tree, so it never goes to main.
     project_running(paths)
 
     # Issue #29: verify the post-dispatch invariant before declaring success —
@@ -1909,25 +1912,17 @@ def dispatch(paths):
     # half-projected dispatch as done.
     _assert_dispatch_projection(paths, project_dir, main_branch, brief, _card_repo_path)
 
-    # Commit state files to main via plumbing — immune to worktree branch drift.
-    # running.json is explicitly excluded: it is daemon-local volatile state.
-    try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from git_plumbing import commit_files_to_branch as _commit_files_fn
-        _events_path = os.path.join(project_dir, ".loop", "state", "runtime-events.jsonl")
-        _state_files = []
-        if os.path.exists(_events_path):
-            _state_files.append((_events_path,
-                                  os.path.relpath(_events_path, project_dir)))
-        if _state_files:
-            _commit_files_fn(
-                project_dir, _state_files, main_branch,
-                f"loop: append runtime-events (dispatch {brief})",
-            )
-    except Exception as e:
-        print(f"dispatch: runtime-events plumbing commit failed for {brief}: {e} (non-fatal)",
-              file=sys.stderr)
-
+    # #88: dispatch no longer plumbing-commits runtime-events.jsonl to main.
+    # The old block here used commit_files_to_branch (a tree-write path that
+    # bypasses .gitignore) to append the events journal to main on every
+    # dispatch — re-tracking a gitignored, daemon-local file and forcing the
+    # merge-time strip to act as a janitor instead of an invariant. runtime-
+    # events is written locally by runtime_event() above; its cross-box
+    # transport is the hum presence sidecar (brief-165), and nothing reads it
+    # from a git tree (proven inert for resurrection in the #84 review). The
+    # only state this dispatch commits to main is the card Status → active
+    # change above — the coordination plane, which is genuinely git. The
+    # push below carries that card-status commit.
     push_bookkeeping(paths, remote, main_branch, f"dispatch {brief}")
 
     # Remove queue file
@@ -1950,11 +1945,13 @@ def dispatch(paths):
 # runtime-events.jsonl. A merge can drag either into main's tree. merge() strips
 # any that end up tracked at HEAD — in a single follow-up commit — so main's tip
 # tree stays clean and old branches can never re-track them (the resurrection
-# class, #83). The physical files stay on disk (gitignored, daemon-local);
-# runtime-events SHOULD leave git main entirely (hum sidecar, brief-165) but
-# dispatch still plumbing-commits it (bypasses gitignore, see #88) — until that
-# path closes, main tracks it transiently between dispatch and the next
-# merge-strip. This strip is the janitor, not an invariant.
+# class, #83). The physical files stay on disk (gitignored, daemon-local).
+# runtime-events now leaves git main entirely (hum sidecar, brief-165): #88
+# removed dispatch's plumbing commit of it (the tree-write path that bypassed
+# gitignore), so no live code path re-tracks it. This strip remains as belt-
+# and-suspenders — a branch cut BEFORE a file's wave-1b untracking can still
+# drag a stale copy into main at merge, and the strip keeps main's tip tree
+# clean regardless of branch vintage.
 # The full daemon-volatile state family. Any of these can ride into main's tree
 # via a branch cut BEFORE the file was untracked (the resurrection class — third
 # live instance on portal main tonight was watchdog-pids + hum-cursors/). Entries

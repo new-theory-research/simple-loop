@@ -235,5 +235,73 @@ class TestDispatchFailsLoudOnProjectionWriteFailure(unittest.TestCase):
             )
 
 
+_EVENTS_REL = os.path.join(".loop", "state", "runtime-events.jsonl")
+
+
+class TestDispatchDoesNotTrackRuntimeEventsOnMain(unittest.TestCase):
+    """#88: dispatch() must NOT commit runtime-events.jsonl to main.
+
+    Pre-fix, dispatch appended the events journal to main via a git-plumbing
+    tree-write (commit_files_to_branch) that bypasses .gitignore — so main
+    transiently tracked a gitignored, daemon-local file between every dispatch
+    and the next merge-strip (the churn #88 closes). The journal's cross-box
+    transport is the hum presence sidecar (brief-165); nothing reads it from a
+    git tree (proven inert for resurrection in the #84 review). These tests
+    drive the real dispatch() and assert main's HEAD tree never tracks
+    runtime-events.jsonl — while the LOCAL working file is still written (the
+    append path is untouched; only the git plumbing of it dies)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.brief_id = "brief-88-events-untracked"
+        self.project_dir, self.card_repo_path, self.paths = _seed_project(
+            self.tmp, self.brief_id
+        )
+        # Model production: runtime-events.jsonl is gitignored on main. The
+        # plumbing bypass is exactly what made it land on main DESPITE this —
+        # so with the gitignore in place, a passing assertion proves the bypass
+        # is gone, not merely that git happened to skip the file.
+        with open(os.path.join(self.project_dir, ".gitignore"), "w") as f:
+            f.write(_EVENTS_REL.replace(os.sep, "/") + "\n")
+        _git(self.project_dir, "add", ".gitignore")
+        _git(self.project_dir, "commit", "--quiet", "-m", "gitignore runtime-events")
+        _git(self.project_dir, "push", "--quiet", "origin", "main")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_main_head_never_tracks_runtime_events_after_dispatch(self):
+        self.assertTrue(dispatch(self.paths), "dispatch() must succeed")
+
+        events_pathspec = _EVENTS_REL.replace(os.sep, "/")
+        # main's committed tree must NOT track the volatile journal.
+        self.assertNotEqual(
+            _git(self.project_dir, "show", f"HEAD:{events_pathspec}",
+                 check=False).returncode, 0,
+            "main's HEAD tree tracks runtime-events.jsonl after dispatch — the "
+            "#88 plumbing bypass re-tracked a gitignored daemon-local file",
+        )
+        self.assertNotIn(
+            events_pathspec, _git(self.project_dir, "ls-files").stdout,
+            "runtime-events.jsonl must not be tracked on main after dispatch (#88)",
+        )
+
+    def test_runtime_events_still_written_locally(self):
+        """The journal must still be WRITTEN on disk — only its git plumbing
+        dies. The append path (state.append_event) is untouched."""
+        dispatch(self.paths)
+
+        events_disk = os.path.join(self.project_dir, _EVENTS_REL)
+        self.assertTrue(
+            os.path.exists(events_disk),
+            "runtime-events.jsonl must still be written locally on dispatch",
+        )
+        with open(events_disk) as f:
+            body = f.read()
+        self.assertIn("dispatched", body,
+                      "the dispatched event must be appended to the local journal")
+        self.assertIn(self.brief_id, body)
+
+
 if __name__ == "__main__":
     unittest.main()
