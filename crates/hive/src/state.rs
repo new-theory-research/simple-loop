@@ -3534,49 +3534,13 @@ pub struct EscalationDetail {
     /// whole substance here (the queen's multi-item decision escalates) stay
     /// readable.
     pub issues: Vec<Vec<(String, String)>>,
-    /// Unknown/extra top-level fields not claimed above, rendered `key: value`.
+    /// Top-level fields not consumed by this parse, rendered `key: value`.
+    /// Includes LOSING synonym-chain members: when `urgency` wins the severity
+    /// slot, a co-present `kind` lands here instead of vanishing (real shape:
+    /// ft-011 carried both `urgency` and `kind` as distinct fields). Only keys
+    /// whose values were actually rendered elsewhere are excluded.
     pub extra: Vec<(String, String)>,
 }
-
-/// Top-level keys consumed into typed slots — excluded from the `extra` tail.
-const ESCALATION_KNOWN_KEYS: &[&str] = &[
-    "one_liner",
-    "title",
-    "plain_version",
-    "summary",
-    "reason",
-    "recommendation",
-    "brief",
-    "severity",
-    "urgency",
-    "kind",
-    "raised_by",
-    "by",
-    "actor",
-    "raised_at",
-    "escalated_at",
-    "ts",
-    "timestamp",
-    "human_action_required",
-    "decision_needed",
-    "action_required_from_mattie",
-    "open_decision_for_mattie",
-    "your_part",
-    "resume_instructions",
-    "off_ramp",
-    "site",
-    "count",
-    "failure_line",
-    "first_ts",
-    "last_ts",
-    "remote",
-    "branch",
-    "ahead",
-    "behind",
-    "consecutive_failures",
-    "issues",
-    "items",
-];
 
 /// Receipt-shaped keys, rendered together in a "Receipt" block in this order.
 const ESCALATION_RECEIPT_KEYS: &[&str] = &[
@@ -3592,12 +3556,20 @@ const ESCALATION_RECEIPT_KEYS: &[&str] = &[
     "consecutive_failures",
 ];
 
-/// First key in `keys` whose value is a non-empty string.
-fn first_str_field(map: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
+/// First key in `keys` whose value is a non-empty string. The WINNING key is
+/// recorded in `consumed` (excluded from the `extra` tail); losing chain
+/// members are deliberately NOT consumed, so they fall through to the tail
+/// instead of being dropped.
+fn consume_first_str(
+    map: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&'static str],
+    consumed: &mut HashSet<&'static str>,
+) -> Option<String> {
     for k in keys {
         if let Some(s) = map.get(*k).and_then(|v| v.as_str()) {
             let t = s.trim();
             if !t.is_empty() {
+                consumed.insert(k);
                 return Some(t.to_string());
             }
         }
@@ -3686,18 +3658,28 @@ impl EscalationDetail {
 
     /// Assemble the typed slots + tail from a parsed JSON object. Split out so
     /// parsing is unit-testable without touching the filesystem.
+    ///
+    /// The `extra` tail excludes only keys ACTUALLY consumed by this parse —
+    /// synonym-chain winners, dedicated-render keys present, receipt keys
+    /// present, and the issues/items array that rendered. Losing chain members
+    /// (e.g. `kind` when `urgency` won the severity slot) fall through to the
+    /// tail rather than vanishing.
     fn from_map(
         map: &serde_json::Map<String, serde_json::Value>,
         source: Option<PathBuf>,
     ) -> Self {
-        let headline = first_str_field(
+        let mut consumed: HashSet<&'static str> = HashSet::new();
+
+        let headline = consume_first_str(
             map,
             &["one_liner", "title", "plain_version", "summary", "reason"],
+            &mut consumed,
         );
 
         // "What it needs from you": a string `human_action_required` wins
         // (some raisers put the ask there directly); otherwise the flag is a
-        // bool and the ask lives in one of the prose fields below.
+        // bool and the ask lives in one of the prose fields below. The key is
+        // consumed only when it actually rendered as ask-prose or as the flag.
         let har = map.get("human_action_required");
         let action_required_flag = har.and_then(|v| v.as_bool());
         let mut human_action = har
@@ -3705,8 +3687,11 @@ impl EscalationDetail {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        if action_required_flag.is_some() || human_action.is_some() {
+            consumed.insert("human_action_required");
+        }
         if human_action.is_none() {
-            human_action = first_str_field(
+            human_action = consume_first_str(
                 map,
                 &[
                     "decision_needed",
@@ -3716,39 +3701,62 @@ impl EscalationDetail {
                     "resume_instructions",
                     "off_ramp",
                 ],
+                &mut consumed,
             );
         }
 
         let receipt: Vec<(String, String)> = ESCALATION_RECEIPT_KEYS
             .iter()
             .filter_map(|k| {
-                map.get(*k)
-                    .map(|v| (k.to_string(), escalation_value_to_string(v)))
+                map.get(*k).map(|v| {
+                    consumed.insert(k);
+                    (k.to_string(), escalation_value_to_string(v))
+                })
             })
             .collect();
 
-        // issues[] / items[]: whichever is present, each object element's
-        // string-ish fields flattened to (key, value) pairs.
-        let issues = map
-            .get("issues")
-            .or_else(|| map.get("items"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|el| el.as_object())
-                    .map(|obj| {
-                        obj.iter()
-                            .map(|(k, v)| (k.clone(), escalation_value_to_string(v)))
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|pairs: &Vec<(String, String)>| !pairs.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        // issues[] / items[]: first key holding an array of objects wins and
+        // is consumed; a present-but-unrendered candidate (non-array, or no
+        // object elements) stays in the tail instead of vanishing.
+        let mut issues: Vec<Vec<(String, String)>> = Vec::new();
+        for key in ["issues", "items"] {
+            let Some(arr) = map.get(key).and_then(|v| v.as_array()) else {
+                continue;
+            };
+            issues = arr
+                .iter()
+                .filter_map(|el| el.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .map(|(k, v)| (k.clone(), escalation_value_to_string(v)))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|pairs: &Vec<(String, String)>| !pairs.is_empty())
+                .collect();
+            if !issues.is_empty() {
+                consumed.insert(key);
+                break;
+            }
+        }
+
+        // Dedicated-render slots: these keys always render when present (the
+        // pane dedupes summary/reason against the headline), so they are
+        // consumed regardless of who won the headline chain.
+        let summary = consume_first_str(map, &["summary"], &mut consumed);
+        let reason = consume_first_str(map, &["reason"], &mut consumed);
+        let recommendation = consume_first_str(map, &["recommendation"], &mut consumed);
+        let brief = consume_first_str(map, &["brief"], &mut consumed);
+        let severity = consume_first_str(map, &["severity", "urgency", "kind"], &mut consumed);
+        let raised_by = consume_first_str(map, &["raised_by", "by", "actor"], &mut consumed);
+        let raised_at = consume_first_str(
+            map,
+            &["raised_at", "escalated_at", "ts", "timestamp"],
+            &mut consumed,
+        );
 
         let mut extra: Vec<(String, String)> = map
             .iter()
-            .filter(|(k, _)| !ESCALATION_KNOWN_KEYS.contains(&k.as_str()))
+            .filter(|(k, _)| !consumed.contains(k.as_str()))
             .map(|(k, v)| (k.clone(), escalation_value_to_string(v)))
             .collect();
         extra.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3759,13 +3767,13 @@ impl EscalationDetail {
             headline,
             human_action,
             action_required_flag,
-            summary: first_str_field(map, &["summary"]),
-            reason: first_str_field(map, &["reason"]),
-            recommendation: first_str_field(map, &["recommendation"]),
-            brief: first_str_field(map, &["brief"]),
-            severity: first_str_field(map, &["severity", "urgency", "kind"]),
-            raised_by: first_str_field(map, &["raised_by", "by", "actor"]),
-            raised_at: first_str_field(map, &["raised_at", "escalated_at", "ts", "timestamp"]),
+            summary,
+            reason,
+            recommendation,
+            brief,
+            severity,
+            raised_by,
+            raised_at,
             receipt,
             issues,
             extra,
@@ -5817,6 +5825,60 @@ some non-bracket junk line
         let first: std::collections::HashMap<_, _> = d.issues[0].iter().cloned().collect();
         assert_eq!(first.get("id").map(String::as_str), Some("cap-005"));
         assert_eq!(first.get("ask").map(String::as_str), Some("waive or hold"));
+    }
+
+    #[test]
+    fn escalation_detail_losing_synonym_members_fall_to_tail() {
+        // Real shape (escalate.json.resolved-ft-011-option1-approved-mattie):
+        // `urgency` AND `kind` are both present as DISTINCT fields. `urgency`
+        // wins the severity slot; `kind` must fall through to the Other-fields
+        // tail — not be silently dropped by a blanket known-keys exclusion.
+        let json = r#"{
+            "brief": "ft-011",
+            "raised_at": "2026-07-10T00:40:00Z",
+            "raised_by": "queen",
+            "kind": "scope-decision",
+            "urgency": "non-urgent",
+            "one_liner": "ft-011 hit its own named escalation trigger.",
+            "decision_needed": "Pick one resolution option.",
+            "recommendation": "Option 1"
+        }"#;
+        let d = escalation_from_json(json);
+        assert_eq!(d.severity.as_deref(), Some("non-urgent"));
+        let extra: std::collections::HashMap<_, _> = d.extra.iter().cloned().collect();
+        assert_eq!(
+            extra.get("kind").map(String::as_str),
+            Some("scope-decision"),
+            "losing severity-chain member must render in the tail"
+        );
+        // The winner and every rendered slot stay out of the tail.
+        for k in ["urgency", "one_liner", "decision_needed", "recommendation", "brief", "raised_by", "raised_at"] {
+            assert!(!extra.contains_key(k), "{k} rendered in a slot; must not duplicate in tail");
+        }
+    }
+
+    #[test]
+    fn escalation_detail_losing_headline_and_ask_members_fall_to_tail() {
+        // Same rule on the other chains: `title` loses the headline to
+        // `one_liner`, `off_ramp` loses the ask to `decision_needed`, and
+        // `timestamp` loses raised_at to `raised_at` — all must surface in
+        // the tail rather than vanish.
+        let json = r#"{
+            "one_liner": "headline winner",
+            "title": "headline loser",
+            "decision_needed": "ask winner",
+            "off_ramp": "ask loser",
+            "raised_at": "2026-07-12T00:00:00Z",
+            "timestamp": "2026-07-12T00:00:01Z"
+        }"#;
+        let d = escalation_from_json(json);
+        assert_eq!(d.headline.as_deref(), Some("headline winner"));
+        assert_eq!(d.human_action.as_deref(), Some("ask winner"));
+        assert_eq!(d.raised_at.as_deref(), Some("2026-07-12T00:00:00Z"));
+        let extra: std::collections::HashMap<_, _> = d.extra.iter().cloned().collect();
+        assert_eq!(extra.get("title").map(String::as_str), Some("headline loser"));
+        assert_eq!(extra.get("off_ramp").map(String::as_str), Some("ask loser"));
+        assert_eq!(extra.get("timestamp").map(String::as_str), Some("2026-07-12T00:00:01Z"));
     }
 
     #[test]
