@@ -18,7 +18,7 @@ Read these files now:
 - `.loop/state/signals/` — check for escalate.json, pause.json, resume.json
 - `.loop/state/log.jsonl` — tail the last 20 lines for recent decisions
 - `.loop/knowledge/learnings.md` — accumulated knowledge
-- Note: a brief's `progress.json` `status` (e.g. `blocked`) is read from the brief's committed **branch** via `git_show` (`lib/assess.py`), not from the worktree — unblocking a parked brief means committing the status flip to that branch (see `docs/operating/harness-updates.md` § Known escape hatches).
+- Note: a brief's `progress.json` `status` (e.g. `blocked`) is read from the brief's committed **branch** via `git_show` (`lib/assess.py`), not from the worktree — editing the worktree copy is a silent no-op. The first-class unblock path is now `loop unpark <brief>` (see § Parked below); the branch-progress escape hatch is retired.
 
 ## Step 2: Assess
 
@@ -26,7 +26,8 @@ What's the situation?
 
 - **Brief complete?** → Evaluate it. Read the diff (`git diff <main_branch>...<branch> --stat`), check quality, write evaluation to `.loop/evaluations/`. Decide: merge, fix, or escalate.
 - **Brief active and running?** → The daemon handles worker iterations. No action needed unless it's blocked.
-- **Brief blocked?** → Read the learnings. Can you unblock it, or does the human need to intervene? If stuck, write `.loop/state/signals/escalate.json`. Re-verify a blocker with the same operation class that failed, not an identity check. (E.g. verify Railway auth with `railway status`, not `railway whoami` — whoami always fails under project-scoped tokens even when service ops work.)
+- **Brief blocked-on-external?** → Blocked on a human, a supervised spend, a console redeploy — anything of indeterminate length that YOU cannot clear this tick. **Park it, don't hold the lane** (Mattie's ruling, #97: waiting on a human must cost zero throughput). Run `loop park <brief> --blocker "<what>" --owner "<who: a person, or director/scout>" --retrigger "<the condition that resumes it>"`. Parking releases the slot + claim in one op, writes the blocker onto the card, and — for a human owner — raises escalate.json. When a worker itself ends a cycle with `status: blocked`, the daemon already auto-parks; you only park briefs the assess surfaces as blocked-on-external that the daemon hasn't parked. Re-verify a blocker with the same operation class that failed, not an identity check (e.g. `railway status`, not `railway whoami`).
+- **Brief parked?** → **Do not dispatch, do not re-invoke — await unblock.** A `Status: parked` card is a first-class non-slot-holding state: the enumerator skips it and assess emits no trigger for it. When the re-trigger fires (the human/you judge the blocker cleared), run `loop unpark <brief>` — it flips parked→queued, clears the parked block to history, and the queue re-enters it. Resolving the brief's `escalate.json` also auto-unparks it.
 - **No active brief?** → Check goals.md for what to do next. Run `python3 ~/.local/share/simple-loop/lib/queue.py . --lane "$LOOP_LANE"` to get the dispatchable queue; dispatch the queue head.
 - **Nothing to do?** → Idle. That's fine.
 
@@ -102,6 +103,33 @@ python3 scripts/log-event.py --actor queen --event evaluate \
 The script injects a wall-clock `ts` and appends one JSON line. Do NOT append to log.jsonl via `cat >>`, `Write`, or any other path — LLM-invented timestamps drift hours into the future and break downstream consumers (hive, morning reports). Incident context: `wiki/operating-docs/incidents/2026-04-23-hive-parse-log-ts-break.md`.
 
 Write state clearly otherwise — next time you wake up, you reconstruct context from files.
+
+## Parked (the blocked-on-external lifecycle)
+
+`parked` is a first-class card `Status:` — a brief that cannot proceed on a
+blocker of indeterminate length (waiting on a human, a supervised spend, an
+external system). The invariant (Mattie's ruling, #97): **blocked-on-external
+costs zero throughput.**
+
+- **Parking** (`loop park`, or the daemon's auto-park when a worker cycle ends
+  `status: blocked`) flips the card to `Status: parked` and, in the SAME
+  operation, releases the dispatch slot and the claim ref — the lane frees
+  instantly. It writes `Parked-blocker` / `Parked-owner` / `Parked-retrigger` /
+  `Parked-at` onto the card (the surface hive's Parked shelf and `loop why`
+  read), and raises `escalate.json` when the owner is human.
+- **A parked brief is inert to the queue:** the enumerator dispatches only
+  `Status: queued`, and assess emits no trigger for a non-active card — so a
+  parked brief never busy-loops the queen (the `#39` gap) and never holds a
+  slot (the serve-009 / ft-008 freeze).
+- **Unparking** (`loop unpark <brief>`, a `signals/unpark-<brief>.json` signal,
+  or resolving the brief's `escalate.json`) flips `parked → queued`, clears the
+  parked block into a `## Park history` note, and busts dedup so the queue
+  re-enters the brief the same tick. The re-trigger being satisfied is a human's
+  (or director's / a future scout's) judgment — the machinery just makes firing
+  it one command.
+- `progress.json.status` is read from the committed **branch** (`git_show`),
+  never the worktree — so the card-status flip, not a worktree edit, is what the
+  system sees. `loop unpark` handles this for you.
 
 ## Rules
 
