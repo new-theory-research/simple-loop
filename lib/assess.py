@@ -120,6 +120,31 @@ def parse_depends_on_value(raw, validate_brief_id=True):
     return out
 
 
+def _card_owned_live(project_dir, brief_id):
+    """True if the brief's card carries an `Owned-live:` frontmatter flag.
+
+    brief-160 piece 2 (#92): director-live arcs (worked with a human, land on
+    main, no branch) set this so the staleness predicate skips them. Tolerant:
+    reads the working-tree card frontmatter; False on any miss/error.
+    """
+    card_path = os.path.join(project_dir, "wiki", "briefs", "cards", brief_id, "index.md")
+    try:
+        with open(card_path) as f:
+            in_fm = False
+            for raw in f:
+                s = raw.strip()
+                if s == "---":
+                    if not in_fm:
+                        in_fm = True
+                        continue
+                    break
+                if in_fm and s.lower().startswith("owned-live:"):
+                    return bool(s.split(":", 1)[1].strip())
+    except (IOError, OSError):
+        pass
+    return False
+
+
 def git_show(project_dir, ref, path):
     try:
         r = subprocess.run(
@@ -444,7 +469,12 @@ def main():
                      f"WORKER:{brief_id},{branch}")
                 )
         elif not branch_exists:
-            if conductor == "NONE":
+            # brief-160 piece 2 (#92, minimal slice): a card flagged `Owned-live:`
+            # is a director-live arc — worked with a human, lands on main, no
+            # branch to observe. The staleness predicate must SKIP it, or the
+            # queen re-diagnoses the same known-benign FALSE-POSITIVE every TTL
+            # window (ft-015). Full #92 state design can wait; the skip ships now.
+            if conductor == "NONE" and not _card_owned_live(project_dir, brief_id):
                 conductor = f"CONDUCTOR:stale_brief:{brief_id}"
 
         # Validator logic — only meaningful if we actually found the branch.

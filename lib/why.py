@@ -120,6 +120,31 @@ def _card_status_lookup(project_dir, card_id):
     return _queue._parse_card_status(path)
 
 
+def _read_parked_block(card_path):
+    """Read the Parked-* frontmatter fields off a parked card (brief-160 piece 2).
+
+    Returns {lowercased-key: value} for Parked-blocker / Parked-owner /
+    Parked-retrigger / Parked-at. Tolerant: {} on any read error.
+    """
+    out = {}
+    try:
+        with open(card_path) as f:
+            in_fm = False
+            for raw in f:
+                s = raw.strip()
+                if s == "---":
+                    if not in_fm:
+                        in_fm = True
+                        continue
+                    break
+                if in_fm and s.lower().startswith("parked-") and ":" in s:
+                    key, _, val = s.partition(":")
+                    out[key.strip().lower()] = val.strip()
+    except (IOError, OSError):
+        pass
+    return out
+
+
 def explain_dispatchability(project_dir, brief_id, running=None, lane=None):
     """Return a list[Check] — every dispatch predicate for brief_id, evaluated.
 
@@ -142,6 +167,18 @@ def explain_dispatchability(project_dir, brief_id, running=None, lane=None):
         status = _queue._parse_card_status(card_path)
         if status == "queued":
             checks.append(Check("queued", True, "card Status: queued"))
+        elif status == "parked":
+            # brief-160 piece 2: a parked brief is intentionally non-dispatchable
+            # (blocked on external). Explain the block — blocker, named owner, and
+            # the re-trigger — so the surface says WHY and HOW it resumes.
+            meta = _read_parked_block(card_path)
+            checks.append(Check(
+                "parked", False,
+                "card Status: parked — blocked on external, not dispatchable. "
+                f"blocker: {meta.get('parked-blocker', '(unspecified)')}; "
+                f"owner: {meta.get('parked-owner', '(unspecified)')}; "
+                f"re-trigger: {meta.get('parked-retrigger', 'loop unpark ' + brief_id)}"
+                + (f"; parked_at: {meta['parked-at']}" if meta.get("parked-at") else "")))
         else:
             checks.append(Check("queued", False,
                                 f"card Status: {status or '(none)'!r} — not queued"))

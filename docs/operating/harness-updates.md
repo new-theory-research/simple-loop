@@ -113,33 +113,32 @@ If the daemon's misbehaving but you need work to move:
 3. **Hand-merge a brief on main** via `git merge --no-ff <branch>` when the daemon's stuck in a state-mismatch or other internal error (see [hand-merge-brief.md](hand-merge-brief.md))
 4. **Stop the daemon entirely** and run cycles by dispatching loop-coder agents directly from the main-thread session
 5. **Clean running.json by hand** (pure-JSON edits) to prune stale active entries or backfill missed merges — last-resort because it's easy to corrupt state further
-6. **Unblock a parked (`status:"blocked"`) brief** — commit `progress.json` status `blocked`→`running` + a learnings note to the brief's **branch** (see below; issue #39)
 
 Each escape hatch is a signal the harness wanted something it didn't have. File that observation somewhere durable (`.loop/knowledge/learnings.md`, or a runway entry for the permanent fix).
 
-#### Unblocking a parked brief — read the trap first
+#### Parking and unblocking a brief — first-class as of brief-160
 
-`lib/assess.py` reads `.loop/state/progress.json` via `git_show(project_dir, ref, ...)` (`git_show(project_dir, branch, ".loop/state/progress.json")`, `assess.py:400`) — **from the brief's committed branch (or its remote), never from the worktree.** A brief a worker deliberately parked with `status:"blocked"` (e.g. pending director-supervised spend) produces `CONDUCTOR:brief_blocked` on every tick until that status flips on the branch.
+`parked` is a first-class card `Status:` (brief-160 piece 2, Mattie's ruling #97 — *blocked-on-external must cost zero throughput*). The old branch-surgery escape hatch is **retired**; use the CLI.
 
-**The trap:** editing the worktree's `.loop/state/progress.json` is the obvious move and a silent no-op — assess never reads it. There is no unblock signal today; nothing in the daemon, queen prompt, or these docs defines how a parked brief resumes on its own (tracked as a fix-shape decision on issue #39). Until then, this is the only working path:
+**Parking** (`loop park <brief> --blocker "<what>" --owner "<who>" --retrigger "<condition>"`, or the daemon's auto-park when a worker cycle ends `status: blocked`) flips the card to `Status: parked` and, in the *same operation*, releases the dispatch slot and the claim ref — the lane frees instantly, so "waiting on a human" no longer holds throughput. It writes a `Parked-blocker` / `Parked-owner` / `Parked-retrigger` / `Parked-at` block onto the card (the surface hive's Parked shelf and `loop why` read), and — when the owner is human — raises `escalate.json`. A parked brief is inert to the queue: the enumerator dispatches only `Status: queued`, and `assess` emits no trigger for a non-active card, so a parked brief never busy-loops the queen (the old `brief_blocked`-every-tick wedge, issue #39) and never holds a slot (serve-009 / ft-008).
+
+**Unblocking** — three ways, all first-class:
 
 ```bash
-# 1. Temp worktree of the brief's branch (not the daemon's live worktree)
-git worktree add /tmp/unblock-<brief-id> <brief-id>
-cd /tmp/unblock-<brief-id>
-
-# 2. Flip status and record why, in progress.json
-#    - "status": "blocked" -> "running"
-#    - append a learnings entry pointing at the receipts that satisfy the block
-#      (e.g. "unblocked 2026-07-05: supervised Modal run completed GREEN, receipts at <commit>")
-
-# 3. Commit and push to the brief's branch
-git add -f .loop/state/progress.json   # -f: gitignored on main, carried on branches (issue #64)
-git commit -m "[scav] unblock <brief-id>: <why>"
-git push origin <brief-id>
+loop unpark <brief-id> [why]        # the direct command
 ```
 
-The next tick's `assess` sees the brief's status as `running` again and emits a `WORKER` trigger — a different conductor target than the cached `brief_blocked` dedup, so the stale dedup window doesn't suppress it. Clean up the temp worktree (`git worktree remove /tmp/unblock-<brief-id>`) once the daemon picks the brief back up.
+or drop a signal the running daemon consumes at tick-top:
+
+```bash
+echo '{"brief":"<brief-id>"}' > .loop/state/signals/unpark-<brief-id>.json
+```
+
+or **resolve the brief's `escalate.json`** (rename it to `escalate.json.resolved-*`, exactly as you clear any escalation) — the daemon's escalate-resolved detection auto-unparks the brief it named.
+
+Any of these flips `Status: parked → queued`, clears the parked block into a `## Park history` note on the card, and busts the dedup cache so the enumerator re-enters the brief the same tick. The re-trigger being *satisfied* is a human's (or director's / a future scout's) judgment — the machinery just makes firing it one command.
+
+**The old trap, still true:** `lib/assess.py` reads `.loop/state/progress.json` from the brief's committed **branch** via `git_show`, never the worktree — so editing the worktree copy is a silent no-op. `loop unpark` operates on the card (the cross-box truth), which is why it works where a worktree edit didn't. Do not hand-edit branch progress.json to unblock; use the CLI.
 
 ## Script-over-inference
 

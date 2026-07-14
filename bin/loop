@@ -2082,6 +2082,72 @@ cmd_close() {
     echo "Branch preserved for forensics. Worktree removed."
 }
 
+# ── park / unpark (brief-160 piece 2: parked lifecycle) ──────
+
+cmd_park() {
+    require_loop_dir
+    local brief_id="${1:-}"
+    [ -z "$brief_id" ] && die "Usage: loop park <brief-id> [--blocker X] [--owner Y] [--retrigger Z] [--reason R]"
+    shift
+
+    local actions_script="$LIB_DIR/actions.py"
+    if [ ! -f "$actions_script" ]; then
+        actions_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/actions.py"
+    fi
+    [ -f "$actions_script" ] || die "actions.py not found. Is Simple Loop installed?"
+
+    # Flags pass straight through to park-brief (--blocker/--owner/--retrigger/--reason).
+    python3 "$actions_script" park-brief "$brief_id" "$PROJECT_DIR" "$@" \
+        || die "park-brief action failed"
+
+    if git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        cd "$PROJECT_DIR"
+        git add ".loop/state/running.json" ".loop/state/runtime-events.jsonl" \
+                ".loop/state/log.jsonl" 2>/dev/null
+        git commit -m "loop: park $brief_id (blocked on external)" -q 2>/dev/null || true
+        git push "${GIT_REMOTE:-origin}" "${GIT_MAIN_BRANCH:-main}" -q 2>/dev/null || true
+    fi
+
+    echo "Parked: $brief_id (slot + claim released; see the card's Parked-* block)"
+}
+
+cmd_unpark() {
+    require_loop_dir
+    local brief_id="${1:-}"
+    [ -z "$brief_id" ] && die "Usage: loop unpark <brief-id> [reason]"
+    shift
+    local reason="$*"
+
+    local actions_script="$LIB_DIR/actions.py"
+    if [ ! -f "$actions_script" ]; then
+        actions_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/actions.py"
+    fi
+    [ -f "$actions_script" ] || die "actions.py not found. Is Simple Loop installed?"
+
+    # Fire the re-trigger via signal so a running daemon consumes it at tick-top
+    # (parked→queued + dedup bust in one place). Also run unpark-brief directly so
+    # `loop unpark` works with the daemon stopped and gives immediate feedback.
+    mkdir -p "$PROJECT_DIR/.loop/state/signals"
+    printf '{"brief":"%s","reason":"%s"}\n' "$brief_id" "$reason" \
+        > "$PROJECT_DIR/.loop/state/signals/unpark-${brief_id}.json"
+
+    if python3 "$actions_script" unpark-brief "$brief_id" "$PROJECT_DIR" --by cli --reason "$reason"; then
+        # Direct run succeeded — the signal is redundant; drop it so the daemon
+        # doesn't log a no-op next tick.
+        rm -f "$PROJECT_DIR/.loop/state/signals/unpark-${brief_id}.json"
+        if git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            cd "$PROJECT_DIR"
+            git add ".loop/state/running.json" ".loop/state/runtime-events.jsonl" \
+                    ".loop/state/log.jsonl" 2>/dev/null
+            git commit -m "loop: unpark $brief_id (re-trigger fired)" -q 2>/dev/null || true
+            git push "${GIT_REMOTE:-origin}" "${GIT_MAIN_BRANCH:-main}" -q 2>/dev/null || true
+        fi
+        echo "Unparked: $brief_id (Status → queued)"
+    else
+        echo "unpark: $brief_id not parked, or ran with daemon stopped — signal left for the daemon to consume."
+    fi
+}
+
 # ── lint ─────────────────────────────────────────────────────
 
 cmd_lint() {
@@ -2467,6 +2533,12 @@ Signals:
                            Close a brief as delivered-elsewhere: supersede from
                            any queue state, append delivered_via to history,
                            remove worktree (branch preserved). Idempotent.
+  park <brief-id> [--blocker X --owner Y --retrigger Z]
+                           Park a blocked-on-external brief: Status → parked,
+                           slot + claim released in one op, blocker written to
+                           the card. Human-owned blockers also escalate.
+  unpark <brief-id> [why]  Re-trigger a parked brief: Status → queued, parked
+                           block cleared to history, queue re-enters it.
 
 Quality:
   lint <path>              Lint a brief file or directory for format drift
@@ -2509,6 +2581,8 @@ case "${1:-help}" in
     approve) shift; cmd_approve "$@" ;;
     reject)  shift; cmd_reject "$@" ;;
     close)   shift; cmd_close "$@" ;;
+    park)    shift; cmd_park "$@" ;;
+    unpark)  shift; cmd_unpark "$@" ;;
     metrics) shift; cmd_metrics "$@" ;;
     lint)    shift; cmd_lint "$@" ;;
     why)     shift; cmd_why "$@" ;;
