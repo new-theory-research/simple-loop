@@ -201,6 +201,14 @@ struct App {
     /// Cached parsed detail for the selected brief. Rebuilt only when the
     /// selection changes (keyed by brief id) — never per frame.
     brief_detail: Option<BriefDetailView>,
+    /// True when the main pane shows the read-only Escalation Detail view
+    /// (Enter on a selected Decide-section escalation row, issue #82) instead
+    /// of the dance floor. Mutually exclusive with `show_brief_detail`.
+    show_escalation_detail: bool,
+    /// Cached parsed escalation content for the selected escalation row.
+    /// Rebuilt only when the selection changes (keyed by source path) — never
+    /// per frame (mirrors the `brief_detail` precedent).
+    escalation_detail: Option<state::EscalationDetail>,
     /// Runtime apiary toggle (`a`). ON = merged all-boxes view; OFF = local-only
     /// fallback. Default ON; when no apiary is configured the key is a no-op and
     /// this flag has no effect (the fetch is skipped regardless).
@@ -225,11 +233,27 @@ struct BriefDetailView {
 }
 
 /// One selectable Cells row: its brief id, the render-order section it came
-/// from, and the line index of its primary row (used for scroll-follow).
+/// from, the line index of its primary row (used for scroll-follow), and what
+/// Enter should open for it.
 pub struct CellSelect {
     pub brief: String,
     pub section: &'static str,
     pub line: usize,
+    pub kind: CellSelectKind,
+}
+
+/// What Enter opens for a selected Cells row. Most rows are brief-backed and
+/// open the Brief Detail pane; Decide-section escalation rows (issue #82) open
+/// the Escalation Detail pane instead, parsed from their signal file.
+#[derive(Clone)]
+pub enum CellSelectKind {
+    /// A brief-backed row (Active/Queued/Backlog/Parked/Draft/Anomalies, and
+    /// awaiting-review Decide rows) → Brief Detail.
+    Brief,
+    /// A Decide-section escalation row → Escalation Detail, parsed from this
+    /// signal file (`None` only if the row somehow carried no source — the
+    /// pane then renders an honest "no source" message rather than panicking).
+    Escalation(Option<std::path::PathBuf>),
 }
 
 const LEARNING_ROTATION_SECS: u64 = 60;
@@ -280,6 +304,8 @@ impl App {
             cells_cursor: 0,
             show_brief_detail: false,
             brief_detail: None,
+            show_escalation_detail: false,
+            escalation_detail: None,
             apiary_enabled,
             apiary_last_ok,
             status_hint: None,
@@ -400,12 +426,31 @@ impl App {
     /// brief id; here we only flip the flag.
     fn open_brief_detail(&mut self) {
         self.show_brief_detail = true;
+        // Brief and escalation panes share the main slot — only one at a time.
+        self.show_escalation_detail = false;
+        self.escalation_detail = None;
     }
 
     /// Restore the dance floor.
     fn close_brief_detail(&mut self) {
         self.show_brief_detail = false;
         self.brief_detail = None;
+    }
+
+    /// Open (or re-open) the Escalation Detail view for the current selection
+    /// (issue #82). Like `open_brief_detail`, the cache is filled lazily in the
+    /// render loop, which knows the selected row's source file; here we only
+    /// flip the flag and clear any stale brief-detail state.
+    fn open_escalation_detail(&mut self) {
+        self.show_escalation_detail = true;
+        self.show_brief_detail = false;
+        self.brief_detail = None;
+    }
+
+    /// Restore the dance floor from the Escalation Detail view.
+    fn close_escalation_detail(&mut self) {
+        self.show_escalation_detail = false;
+        self.escalation_detail = None;
     }
 
     fn tick_spinner(&mut self) {
@@ -686,8 +731,9 @@ fn budget_color(current: usize, budget: usize) -> Color {
 /// selectable row (None when the pane isn't focused). Returns the text plus
 /// the ordered list of selectable rows (brief id + primary line index) so the
 /// caller can drive navigation and scroll-follow. Selectable sections, in
-/// render order: Active, Queued, Backlog, Parked, Draft, Anomalies — headers,
-/// blank lines, sub-rows, Pending, and Recent are not selectable.
+/// render order: Active, Pending→Decide (escalations + awaiting-review),
+/// Queued, Backlog, Parked, Draft, Anomalies — headers, blank lines, sub-rows,
+/// Pending→In-flight, and Recent are not selectable.
 fn render_cells<'a>(
     cells: &state::CellsState,
     active_section_height: u16,
@@ -699,7 +745,12 @@ fn render_cells<'a>(
     // Called with the current `lines.len()` (the primary row's line index).
     let record = |selectable: &mut Vec<CellSelect>, line: usize, brief: &str, section: &'static str| -> bool {
         let is_sel = selected == Some(selectable.len());
-        selectable.push(CellSelect { brief: brief.to_string(), section, line });
+        selectable.push(CellSelect {
+            brief: brief.to_string(),
+            section,
+            line,
+            kind: CellSelectKind::Brief,
+        });
         is_sel
     };
     // Apply the selection highlight to a primary row when it's selected.
@@ -873,7 +924,7 @@ fn render_cells<'a>(
             }
         }
 
-        let render_pending_row = |lines: &mut Vec<Line<'a>>, pb: &state::PendingBrief| {
+        let render_pending_row = |lines: &mut Vec<Line<'a>>, pb: &state::PendingBrief, is_sel: bool| {
             let (glyph, color) = match pb.reason {
                 state::PendingReason::Escalate => ("!", CORAL),
                 state::PendingReason::PendingMerge => ("✓", STAMP_GREEN),
@@ -909,7 +960,7 @@ fn render_cells<'a>(
                 format!("  ·  {}", age),
                 Style::default().fg(MUTED),
             ));
-            lines.push(Line::from(row));
+            lines.push(highlight(Line::from(row), is_sel));
 
             if let Some(budget) = pb.cycle_budget {
                 let current = pb.latest_validator_cycle.unwrap_or(0);
@@ -952,8 +1003,26 @@ fn render_cells<'a>(
                 Style::default().fg(MUTED),
             )));
         } else {
+            // Decide rows are selectable (issue #82): escalations resolve to
+            // their signal file (→ Escalation Detail); awaiting-review rows
+            // resolve by brief id (→ Brief Detail, reused). Recorded here so
+            // j/k reaches them and Enter can route by kind.
             for pb in &decide {
-                render_pending_row(&mut lines, pb);
+                let line = lines.len();
+                let is_sel = selected == Some(selectable.len());
+                let kind = match pb.reason {
+                    state::PendingReason::Escalate => {
+                        CellSelectKind::Escalation(pb.source_file.clone())
+                    }
+                    _ => CellSelectKind::Brief,
+                };
+                selectable.push(CellSelect {
+                    brief: pb.brief.clone(),
+                    section: "Decide",
+                    line,
+                    kind,
+                });
+                render_pending_row(&mut lines, pb, is_sel);
             }
         }
 
@@ -967,8 +1036,10 @@ fn render_cells<'a>(
                     Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
                 ),
             ]));
+            // In-flight rows aren't selectable — the daemon owns them; there's
+            // no decision for Mattie to open. Rendered with no highlight.
             for pb in &in_flight {
-                render_pending_row(&mut lines, pb);
+                render_pending_row(&mut lines, pb, false);
             }
         }
     }
@@ -1321,6 +1392,199 @@ fn render_brief_detail<'a>(view: &BriefDetailView) -> Text<'a> {
         label("card "),
         Span::styled(card.card_dir.clone(), Style::default().fg(MUTED)),
     ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  (read-only · esc / enter to close)",
+        Style::default().fg(MUTED),
+    )));
+
+    Text::from(lines)
+}
+
+/// Render the Escalation Detail view (issue #82) — a read-only pane that
+/// answers Mattie's two questions about a highlighted escalation: *what is it*
+/// and *what does it need from me*. Content is parsed once per selection into
+/// `state::EscalationDetail` (never recomputed here); this function only lays
+/// it out. A missing / unparseable source renders an honest message, never a
+/// panic. Everything the parser couldn't slot into a spine field still shows
+/// in the key/value tail — nothing is silently dropped.
+fn render_escalation_detail<'a>(d: &state::EscalationDetail) -> Text<'a> {
+    let label = |s: String| Span::styled(s, Style::default().fg(MUTED));
+    let val = |s: String| Span::styled(s, Style::default().fg(Color::White));
+    let mut lines: Vec<Line<'a>> = Vec::new();
+
+    // Header: brief id (or source filename), the "escalation" tag, severity.
+    let name = d
+        .brief
+        .clone()
+        .or_else(|| {
+            d.source
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "escalation".to_string());
+    let mut header = vec![
+        Span::styled(
+            name,
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("   ", Style::default()),
+        Span::styled("escalation", Style::default().fg(CORAL).add_modifier(Modifier::BOLD)),
+    ];
+    if let Some(sev) = &d.severity {
+        header.push(Span::styled(
+            format!("   [{}]", sev),
+            Style::default().fg(AMBER),
+        ));
+    }
+    lines.push(Line::from(header));
+
+    // Honest failure: missing file, unreadable, or not JSON. No fields to show.
+    if let Some(err) = &d.load_error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", err),
+            Style::default().fg(AMBER),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  (read-only · esc / enter to close)",
+            Style::default().fg(MUTED),
+        )));
+        return Text::from(lines);
+    }
+
+    // Headline: what happened, in one line.
+    lines.push(Line::from(""));
+    match &d.headline {
+        Some(h) => lines.push(Line::from(Span::styled(
+            h.clone(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ))),
+        None => lines.push(Line::from(Span::styled(
+            "— no headline field (one_liner / title / summary) in this escalation",
+            Style::default().fg(MUTED),
+        ))),
+    }
+
+    // The centerpiece: what it needs from Mattie. Rendered prominently even
+    // when the ask is absent — an escalation that flags human_action_required
+    // but writes no ask prose is a raiser gap worth seeing, not hiding.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "What it needs from you",
+        Style::default().fg(CORAL).add_modifier(Modifier::BOLD),
+    )));
+    match &d.human_action {
+        Some(a) => lines.push(Line::from(Span::styled(
+            a.clone(),
+            Style::default().fg(Color::White),
+        ))),
+        None => {
+            let msg = match d.action_required_flag {
+                Some(true) => {
+                    "— raiser flagged human_action_required but wrote no ask prose (raiser gap)"
+                }
+                _ => "— no explicit ask recorded on this escalation",
+            };
+            lines.push(Line::from(Span::styled(msg, Style::default().fg(MUTED))));
+        }
+    }
+
+    // Context: summary / reason (only when they add something past the
+    // headline), then the raiser's recommendation.
+    let headline_ref = d.headline.as_deref();
+    if let Some(s) = &d.summary {
+        if Some(s.as_str()) != headline_ref {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![label("summary  ".to_string()), val(s.clone())]));
+        }
+    }
+    if let Some(r) = &d.reason {
+        if Some(r.as_str()) != headline_ref && Some(r.as_str()) != d.summary.as_deref() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![label("reason  ".to_string()), val(r.clone())]));
+        }
+    }
+    if let Some(rec) = &d.recommendation {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("recommendation  ", Style::default().fg(LAVENDER)),
+            val(rec.clone()),
+        ]));
+    }
+
+    // Provenance meta.
+    let mut meta: Vec<Span> = Vec::new();
+    if let Some(by) = &d.raised_by {
+        meta.push(label("raised by ".to_string()));
+        meta.push(val(by.clone()));
+    }
+    if let Some(at) = &d.raised_at {
+        if !meta.is_empty() {
+            meta.push(label("   ".to_string()));
+        }
+        meta.push(label("at ".to_string()));
+        meta.push(val(at.clone()));
+    }
+    if !meta.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(meta));
+    }
+
+    // Receipt block (repeat-failure / sync-diverged fields).
+    if !d.receipt.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Receipt",
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        )));
+        for (k, v) in &d.receipt {
+            lines.push(Line::from(vec![
+                label(format!("  {}  ", k)),
+                val(v.clone()),
+            ]));
+        }
+    }
+
+    // Multi-item decision escalates: one sub-block per issue/item.
+    if !d.issues.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Decisions",
+            Style::default().fg(CORAL).add_modifier(Modifier::BOLD),
+        )));
+        for (i, issue) in d.issues.iter().enumerate() {
+            lines.push(Line::from(Span::styled(
+                format!("  · item {}", i + 1),
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            )));
+            for (k, v) in issue {
+                lines.push(Line::from(vec![
+                    label(format!("      {}  ", k)),
+                    val(v.clone()),
+                ]));
+            }
+        }
+    }
+
+    // Everything the spine didn't claim — shown, never dropped.
+    if !d.extra.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Other fields",
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        )));
+        for (k, v) in &d.extra {
+            lines.push(Line::from(vec![
+                label(format!("  {}: ", k)),
+                val(v.clone()),
+            ]));
+        }
+    }
+
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  (read-only · esc / enter to close)",
@@ -2260,8 +2524,8 @@ fn render_help_modal<'a>() -> Text<'a> {
         Line::from(vec![key("  ctrl-c"), sep(), desc("quit")]),
         Line::from(vec![key("  tab"), sep(), desc("cycle focus between panels")]),
         Line::from(vec![key("  j / k"), sep(), desc("scroll panel, or move selection in Cells / Signals")]),
-        Line::from(vec![key("  enter"), sep(), desc("open detail — brief (Cells) or signal (Signals)")]),
-        Line::from(vec![key("  esc"), sep(), desc("close modal / brief detail")]),
+        Line::from(vec![key("  enter"), sep(), desc("open detail — brief or escalation (Cells) or signal (Signals)")]),
+        Line::from(vec![key("  esc"), sep(), desc("close modal / brief / escalation detail")]),
         Line::from(vec![key("  r"), sep(), desc("toggle Run Cards view in Signals slot (auto-promotes when runs are active)")]),
         Line::from(vec![key("  a"), sep(), desc("fall back to local-only view / return to apiary view")]),
         Line::from(vec![key("  ?"), sep(), desc("toggle this help modal")]),
@@ -2408,6 +2672,34 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
         } else {
             None
         };
+        // Escalation Detail cache: same precedent — parse the signal file once
+        // per selection here, keyed by source path, never inside the draw
+        // closure. If the selected row isn't an escalation anymore (j/k moved
+        // off it), restore the dance floor.
+        if app.show_escalation_detail {
+            match cells_selectable.get(app.cells_cursor).map(|s| &s.kind) {
+                Some(CellSelectKind::Escalation(source)) => {
+                    let stale = app
+                        .escalation_detail
+                        .as_ref()
+                        .map(|d| d.source != *source)
+                        .unwrap_or(true);
+                    if stale {
+                        app.escalation_detail =
+                            Some(state::EscalationDetail::load(source.clone()));
+                    }
+                }
+                _ => {
+                    app.show_escalation_detail = false;
+                    app.escalation_detail = None;
+                }
+            }
+        }
+        let escalation_detail_text = if app.show_escalation_detail {
+            app.escalation_detail.as_ref().map(render_escalation_detail)
+        } else {
+            None
+        };
         // Apiary view label for the strip: Live reads present (teal); the
         // deliberate local-only fallback reads warm/muted (amber); a configured
         // fetch that failed reads as an honest degraded warning (orange), never
@@ -2457,6 +2749,8 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
         let df_manual_scroll = app.scroll[Panel::DanceFloor as usize];
         let show_buzz = app.focused == Panel::Buzz;
         let show_brief_detail = app.show_brief_detail && brief_detail_text.is_some();
+        let show_escalation_detail =
+            app.show_escalation_detail && escalation_detail_text.is_some();
         let show_help = app.show_help;
         // Transient footer hint (e.g. the `a` no-op when no apiary configured),
         // shown for a few seconds after it's set, then it self-clears.
@@ -2572,9 +2866,27 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                 main_row[0],
             );
 
-            // Right main slot: Brief Detail (Enter on a Cells row) takes
-            // precedence, then Buzz when focused, otherwise the Dance Floor.
-            if let Some(detail_text) = brief_detail_text {
+            // Right main slot: a detail pane (Enter on a Cells row) takes
+            // precedence — Escalation Detail for escalation rows (issue #82),
+            // Brief Detail for brief-backed rows — then Buzz when focused,
+            // otherwise the Dance Floor. The two detail panes are mutually
+            // exclusive (opening one closes the other).
+            if let Some(detail_text) = escalation_detail_text {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(CORAL))
+                    .title(Span::styled(
+                        " Escalation ",
+                        Style::default().fg(CORAL).add_modifier(Modifier::BOLD),
+                    ));
+                f.render_widget(
+                    Paragraph::new(detail_text)
+                        .wrap(ratatui::widgets::Wrap { trim: false })
+                        .block(block),
+                    main_row[1],
+                );
+            } else if let Some(detail_text) = brief_detail_text {
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -2650,7 +2962,12 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
             let key = |k: &'static str| Span::styled(k, Style::default().fg(GOLD));
             let dsc = |d: &'static str| Span::styled(d, Style::default().fg(MUTED));
             let mut footer: Vec<Span> = vec![key("  q "), dsc("quit  ")];
-            if show_brief_detail {
+            if show_escalation_detail {
+                footer.push(key("·  esc "));
+                footer.push(dsc("back  "));
+                footer.push(key("·  j/k "));
+                footer.push(dsc("change row  "));
+            } else if show_brief_detail {
                 footer.push(key("·  esc "));
                 footer.push(dsc("back  "));
                 footer.push(key("·  j/k "));
@@ -2817,18 +3134,31 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                             KeyCode::Char('c') => app.focused = Panel::Cells,
                             // a → fall back to local-only view / return to apiary view
                             KeyCode::Char('a') => app.toggle_apiary(),
-                            // Brief Detail back behavior — esc or a second enter
+                            // Detail-pane back behavior — esc or a second enter
                             // restores the dance floor (mirrors the signal modal).
+                            KeyCode::Esc if app.show_escalation_detail => {
+                                app.close_escalation_detail()
+                            }
+                            KeyCode::Enter if app.show_escalation_detail => {
+                                app.close_escalation_detail()
+                            }
                             KeyCode::Esc if app.show_brief_detail => app.close_brief_detail(),
                             KeyCode::Enter if app.show_brief_detail => app.close_brief_detail(),
                             KeyCode::Enter if app.focused == Panel::Signals => {
                                 app.open_signal_detail();
                             }
-                            // Enter on a selected Cells row → open Brief Detail.
+                            // Enter on a selected Cells row → open the pane its
+                            // kind resolves to: escalation rows (issue #82) open
+                            // Escalation Detail; everything else opens Brief Detail.
                             KeyCode::Enter
                                 if app.focused == Panel::Cells && !cells_selectable.is_empty() =>
                             {
-                                app.open_brief_detail();
+                                match cells_selectable.get(app.cells_cursor).map(|s| &s.kind) {
+                                    Some(CellSelectKind::Escalation(_)) => {
+                                        app.open_escalation_detail()
+                                    }
+                                    _ => app.open_brief_detail(),
+                                }
                             }
                             KeyCode::Char('j') => {
                                 if app.focused == Panel::Signals
@@ -3057,6 +3387,125 @@ mod tests {
     fn render_cells_empty_has_no_selectable_rows() {
         let (_text, selectable) = render_cells(&empty_cells(), 8, None);
         assert!(selectable.is_empty());
+    }
+
+    #[test]
+    fn render_cells_records_decide_rows_selectable_with_kind() {
+        // Issue #82: Pending→Decide rows are selectable. An escalation row
+        // carries its source file (→ Escalation Detail); an awaiting-review row
+        // resolves by brief id (→ Brief Detail). An in-flight row is not
+        // selectable.
+        let mut cells = empty_cells();
+        cells.pending.push(state::PendingBrief {
+            brief: "brief-9-escalation".to_string(),
+            reason: state::PendingReason::Escalate,
+            age: None,
+            latest_validator_cycle: None,
+            cycle_budget: None,
+            estimated_time: None,
+            source_file: Some(std::path::PathBuf::from(
+                ".loop/state/signals/escalate.json",
+            )),
+        });
+        cells.pending.push(state::PendingBrief {
+            brief: "brief-8-review".to_string(),
+            reason: state::PendingReason::AwaitingReview,
+            age: None,
+            latest_validator_cycle: None,
+            cycle_budget: None,
+            estimated_time: None,
+            source_file: None,
+        });
+        // In-flight — daemon-owned, must NOT be selectable.
+        cells.pending.push(state::PendingBrief {
+            brief: "brief-7-merge".to_string(),
+            reason: state::PendingReason::PendingMerge,
+            age: None,
+            latest_validator_cycle: None,
+            cycle_budget: None,
+            estimated_time: None,
+            source_file: Some(std::path::PathBuf::from(
+                ".loop/state/signals/pending-merge.json",
+            )),
+        });
+
+        let (_text, selectable) = render_cells(&cells, 8, None);
+        let ids: Vec<&str> = selectable.iter().map(|s| s.brief.as_str()).collect();
+        // Both Decide rows are recorded (in render order); the in-flight row is
+        // not. Pending renders before Queued, so Decide rows lead the list.
+        assert_eq!(ids, vec!["brief-9-escalation", "brief-8-review"]);
+        // The escalation row carries an Escalation kind with its source file.
+        let esc = selectable
+            .iter()
+            .find(|s| s.brief == "brief-9-escalation")
+            .unwrap();
+        match &esc.kind {
+            CellSelectKind::Escalation(Some(p)) => {
+                assert!(p.ends_with("escalate.json"))
+            }
+            other => panic!("escalation row should carry Escalation(source); got {:?}", match other {
+                CellSelectKind::Brief => "Brief",
+                CellSelectKind::Escalation(None) => "Escalation(None)",
+                CellSelectKind::Escalation(Some(_)) => unreachable!(),
+            }),
+        }
+        // Awaiting-review resolves via Brief Detail (reuse), not escalation.
+        let rev = selectable
+            .iter()
+            .find(|s| s.brief == "brief-8-review")
+            .unwrap();
+        assert!(matches!(rev.kind, CellSelectKind::Brief));
+    }
+
+    #[test]
+    fn render_escalation_detail_assembles_without_panic() {
+        // Detail assembly over the fix-15 receipt spine: renders headline,
+        // the "what it needs" centerpiece, and never panics.
+        let map = match serde_json::from_str::<serde_json::Value>(
+            r#"{
+                "brief": "brief-42",
+                "one_liner": "Repeat failure: railway-deploy refused 3x",
+                "decision_needed": "Authorize the redeploy or hold.",
+                "severity": "ops-recovery",
+                "raised_by": "daemon",
+                "site": "railway-deploy",
+                "count": 3
+            }"#,
+        )
+        .unwrap()
+        {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        let d = state::EscalationDetail::load_from_map_for_test(map);
+        let text = render_escalation_detail(&d);
+        let joined: String = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("What it needs from you"));
+        assert!(joined.contains("Authorize the redeploy or hold."));
+        assert!(joined.contains("Repeat failure: railway-deploy refused 3x"));
+        assert!(joined.contains("Receipt"));
+    }
+
+    #[test]
+    fn render_escalation_detail_honest_on_load_error() {
+        let d = state::EscalationDetail::load(Some(std::path::PathBuf::from(
+            "/nonexistent/escalate.json",
+        )));
+        let text = render_escalation_detail(&d);
+        // Renders the error message, no panic, no fabricated fields.
+        let joined: String = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.to_lowercase().contains("could not be read")
+            || joined.to_lowercase().contains("not"));
     }
 
     #[test]
