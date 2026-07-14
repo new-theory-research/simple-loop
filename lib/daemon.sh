@@ -996,6 +996,38 @@ print(first or '$now')
     notify brief_escalated "$brief_id: over budget ($iterations_used/$budget cycles) — parked to awaiting_review + escalated"
 }
 
+# ── Auto-park a worker-blocked brief (brief-160 piece 2, Mattie's ruling #97) ──
+# When a worker iteration ends with progress.json status=blocked (the worker hit
+# an EXTERNAL blocker — human auth, supervised spend, a console redeploy) the
+# brief must cost zero throughput: park it so the slot + claim release in the
+# SAME op (actions.py park-brief), land the blocker on a human-visible surface
+# (escalate.json + notify when human-owned), and stop holding the lane. Mirrors
+# over_budget_park's shape — STATE CHANGE first, notify() last. The park flips
+# the card to Status: parked, so assess emits no trigger next tick (no #39
+# busy-loop) and the enumerator never re-dispatches it (Status != queued).
+_owner_is_human_owner() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        director|scout|daemon|queen|auto|harness) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+auto_park_blocked() {
+    local brief_id="$1" blocker="$2" owner="$3" retrigger="$4"
+    # 1) STATE CHANGE: park (card Status → parked, slot + claim released in-op,
+    #    escalate.json raised when human-owned). Card-status commit lands here.
+    python3 "$DAEMON_LIB_DIR/actions.py" park-brief "$brief_id" "$PROJECT_DIR" \
+        --blocker "$blocker" --owner "$owner" --retrigger "$retrigger" \
+        2>>"$LOG_DIR/daemon.log" || true
+    # Push the park so a remote box sees the freed lane immediately.
+    git -C "$PROJECT_DIR" push "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
+    # 2) notify() last — only for a human-owned blocker (the escalation channel).
+    if _owner_is_human_owner "$owner"; then
+        notify brief_escalated "$brief_id: blocked on external ($blocker) — auto-parked; owner $owner, re-trigger: $retrigger"
+    fi
+    daemon_log "AUTO-PARK: $brief_id parked (blocked on external — owner $owner); slot + claim released"
+}
+
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Worker Iteration                                               ║
 # ╚══════════════════════════════════════════════════════════════════╝
@@ -1372,6 +1404,25 @@ with open('$PROGRESS_FILE', 'w') as f:
         wlog "WORKER: iteration complete (${WORKER_DURATION}s), pushed to $branch"
         notify ops "$brief_id: iteration done (${WORKER_DURATION}s)"
         CONSECUTIVE_WORKER_FAILURES=0
+
+        # brief-160 piece 2: the worker deliberately parked itself on an external
+        # blocker (progress.json status=blocked — serve-009's human auth, ft-001's
+        # supervised spend). Auto-park so "waiting on a human" costs zero
+        # throughput (#97): release slot + claim in the same op, surface the
+        # blocker. The worker may write blocked_reason / blocked_owner /
+        # blocked_retrigger into progress.json to name the block; else defaults
+        # (owner=human → escalation fires; re-trigger = loop unpark <brief>).
+        local _wstatus
+        _wstatus=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('status',''))" 2>/dev/null || echo "")
+        if [ "$_wstatus" = "blocked" ]; then
+            local _blk _own _rtr
+            _blk=$(python3 -c "import json; p=json.load(open('$PROGRESS_FILE')); print(p.get('blocked_reason') or (p.get('learnings') or ['blocked on external dependency'])[-1])" 2>/dev/null || echo "blocked on external dependency")
+            _own=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('blocked_owner','human'))" 2>/dev/null || echo "human")
+            _rtr=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('blocked_retrigger','') or 'blocker resolved, then: loop unpark $brief_id')" 2>/dev/null || echo "blocker resolved, then: loop unpark $brief_id")
+            wlog "WORKER: $brief_id ended blocked — auto-parking (blocked on external)"
+            auto_park_blocked "$brief_id" "$_blk" "$_own" "$_rtr"
+            return 0
+        fi
     else
         wlog "WORKER: iteration FAILED (exit $WORKER_EXIT, ${WORKER_DURATION}s)"
         notify ops "$brief_id: worker FAILED (exit $WORKER_EXIT)"
@@ -2123,6 +2174,7 @@ LAST_QUEUE_FP=""
 LAST_SLOTS_KEY=""
 LAST_SLOTS_TS=0
 LAST_ESCALATE_PRESENT=false
+LAST_ESCALATE_BRIEF=""   # brief-160: brief named by the live escalate.json (for auto-unpark on resolve)
 HEARTBEAT_FILE="$STATE_DIR/heartbeat.json"
 
 # Brief-014 fix 4: heartbeat helper. Fires at top of each tick, plus after each
@@ -2318,6 +2370,9 @@ while true; do
     # across ticks; on the tick where it disappears, reset the dedup marker.
     if [ -f "$SIGNALS_DIR/escalate.json" ]; then
         CURRENT_ESCALATE_PRESENT=true
+        # Remember which brief this escalation names (empty for infra escalations
+        # like push_failed). Used below to auto-unpark on resolve (brief-160).
+        LAST_ESCALATE_BRIEF=$(python3 -c "import json; print(json.load(open('$SIGNALS_DIR/escalate.json')).get('brief',''))" 2>/dev/null || echo "")
     else
         CURRENT_ESCALATE_PRESENT=false
     fi
@@ -2325,6 +2380,16 @@ while true; do
         daemon_log "QUEEN: escalate.json resolved — resetting dedup so next queen re-evaluates"
         LAST_CONDUCTOR_TRIGGER=""
         LAST_CONDUCTOR_TRIGGER_TS=0
+        # brief-160 piece 2: resolving an escalation whose brief is PARKED is a
+        # re-trigger — the human cleared the blocker by resolving. Auto-unpark it
+        # (parked→queued, block cleared to history, dedup busted). unpark-brief is
+        # a logged no-op if the brief isn't parked, so a non-park resolve is safe.
+        if [ -n "${LAST_ESCALATE_BRIEF:-}" ]; then
+            if python3 "$DAEMON_LIB_DIR/actions.py" unpark-brief "$LAST_ESCALATE_BRIEF" "$PROJECT_DIR" --by escalate-resolved 2>>"$LOG_DIR/daemon.log"; then
+                git -C "$PROJECT_DIR" push "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
+                daemon_log "UNPARK: $LAST_ESCALATE_BRIEF auto-unparked (escalate resolved)"
+            fi
+        fi
     fi
     LAST_ESCALATE_PRESENT="$CURRENT_ESCALATE_PRESENT"
 
@@ -2351,6 +2416,33 @@ while true; do
         _CLEAR_COUNT=$((_CLEAR_COUNT + 1))
     done
     if [ "$_CLEAR_COUNT" -gt 0 ]; then
+        LAST_CONDUCTOR_TRIGGER=""
+        LAST_CONDUCTOR_TRIGGER_TS=0
+    fi
+
+    # --- Unpark signal consumption (brief-160 piece 2) ---
+    # signals/unpark-<brief>.json means "the re-trigger fired" — a human,
+    # director, or future scout judged the blocker cleared and made firing it one
+    # command (`loop unpark <brief>` writes the signal; the daemon consumes it
+    # here at tick-top). Flip parked→queued, clear the parked block into history,
+    # and bust dedup so the brief re-enters the queue THIS tick, not after the
+    # TTL. Mirrors the dedup-clear consumer above.
+    _UNPARK_COUNT=0
+    for _UNPARK_FILE in "$SIGNALS_DIR"/unpark-*.json; do
+        [ -f "$_UNPARK_FILE" ] || continue
+        _UNPARK_FNAME=$(basename "$_UNPARK_FILE")
+        _UNPARK_BRIEF="${_UNPARK_FNAME#unpark-}"
+        _UNPARK_BRIEF="${_UNPARK_BRIEF%.json}"
+        if python3 "$DAEMON_LIB_DIR/actions.py" unpark-brief "$_UNPARK_BRIEF" "$PROJECT_DIR" --by signal 2>>"$LOG_DIR/daemon.log"; then
+            git -C "$PROJECT_DIR" push "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
+            daemon_log "UNPARK: $_UNPARK_BRIEF flipped parked→queued by signal"
+            _UNPARK_COUNT=$((_UNPARK_COUNT + 1))
+        else
+            daemon_log "UNPARK: $_UNPARK_BRIEF signal present but unpark was a no-op (not parked?)"
+        fi
+        rm -f "$_UNPARK_FILE"
+    done
+    if [ "$_UNPARK_COUNT" -gt 0 ]; then
         LAST_CONDUCTOR_TRIGGER=""
         LAST_CONDUCTOR_TRIGGER_TS=0
     fi
