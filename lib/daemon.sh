@@ -2202,6 +2202,50 @@ maybe_wake_slots_available() {
 SYNC_FAIL_COUNT=0
 
 sync_project_checkout() {
+    # Issue #95: refresh the stat cache BEFORE any dirty/diverged reasoning.
+    # PHANTOM dirt (tracked files stat-modified with EMPTY diffs — a stale stat
+    # cache, not real changes) made the first ff-only pull fail and the checkout
+    # misclassify as "diverged (0 ahead / N behind)" for 7 consecutive ticks,
+    # never auto-healing. `--really-refresh` re-stats every tracked file and
+    # clears phantom marks; a genuinely-dirty file stays dirty. Must run first.
+    git update-index -q --really-refresh 2>/dev/null || true
+
+    # Issue #94: self-heal resurrected daemon-volatile files. STRIP_ON_MAIN
+    # untracking runs only inside actions.merge() (the daemon's own path); a
+    # hand-merge or a GitHub-PR-merge to main re-tracks the volatile family from
+    # a branch cut BEFORE it was untracked, and the daemon then chokes on its own
+    # dirty tracked copies. When any STRIP_ON_MAIN path is tracked at HEAD,
+    # untrack it (files stay on disk — gitignored, daemon-local), commit with a
+    # loop: prefix (so the fall-through auto-heal reconciles it if we are also
+    # behind), push, and shout. The list is IMPORTED from lib/actions.py — never
+    # duplicated here.
+    local _volatile_paths
+    _volatile_paths=$(python3 -c "
+import sys
+sys.path.insert(0, '$DAEMON_LIB_DIR')
+from actions import STRIP_ON_MAIN
+print('\n'.join(STRIP_ON_MAIN))
+" 2>/dev/null || true)
+    if [ -n "$_volatile_paths" ]; then
+        local _tracked_volatiles
+        _tracked_volatiles=$(printf '%s\n' "$_volatile_paths" | tr '\n' '\0' \
+            | xargs -0 git ls-files -- 2>/dev/null)
+        if [ -n "$_tracked_volatiles" ]; then
+            # -r so a tracked directory (hum-cursors/) strips recursively; a
+            # plain file ignores -r. --cached leaves the on-disk copy intact.
+            printf '%s\n' "$_volatile_paths" | while IFS= read -r _vp; do
+                [ -n "$_vp" ] && git rm -r --cached --quiet -- "$_vp" 2>/dev/null
+            done
+            local _stripped_line
+            _stripped_line=$(printf '%s' "$_tracked_volatiles" | tr '\n' ' ')
+            git commit -q -m "loop: self-heal — untrack volatile ${_stripped_line}(resurrected by a non-daemon merge)" 2>/dev/null
+            git push "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
+            daemon_log "GIT SYNC: self-heal — untracked resurrected volatile paths: ${_stripped_line}(#94)"
+            python3 "$DAEMON_LIB_DIR/state.py" append-event "$PROJECT_DIR" sync_self_heal "-" \
+                paths="$(printf '%s' "$_tracked_volatiles" | tr '\n' ',')" 2>/dev/null || true
+        fi
+    fi
+
     if git pull --ff-only "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null; then
         SYNC_FAIL_COUNT=0
         return 0
@@ -2215,23 +2259,31 @@ sync_project_checkout() {
     case "$ahead" in ''|*[!0-9]*) ahead=0 ;; esac
     case "$behind" in ''|*[!0-9]*) behind=0 ;; esac
 
-    # Issue #28: when ahead==0 AND behind==0 the refs are identical — HEAD IS
-    # origin/main. The pull failed because the working tree is dirty (untracked
-    # or modified bookkeeping files), NOT because the checkout diverged. This is
-    # a false positive; log "SYNC FAILED: diverged (0 ahead / 0 behind)" 89×
-    # was the observed symptom. Fix: autostash everything, retry ff-only pull
-    # (which only needs a fast-forward — usually a no-op when already in sync),
-    # then pop. Even if the retry is a no-op it leaves the working tree clean
-    # relative to HEAD, which is what matters for the projector reading cards.
-    if [ "$ahead" -eq 0 ] && [ "$behind" -eq 0 ]; then
+    # Issue #28/#95: ahead==0 means the checkout has NO local-only commits, so it
+    # is NEVER diverged. Two honest sub-cases, both healed the same way:
+    #   • behind==0 (issue #28): refs are identical — HEAD IS origin/main. The
+    #     pull failed only because the working tree was dirty (untracked or
+    #     modified bookkeeping files), a false positive that logged "SYNC FAILED:
+    #     diverged (0 ahead / 0 behind)" 89×.
+    #   • behind>0 (issue #95): purely BEHIND — safe to fast-forward. Labelling
+    #     this "diverged" (0 ahead / N behind) wedged the daemon on stale state
+    #     for 7 ticks. "diverged" is reserved strictly for ahead>0 && behind>0.
+    # Fix: autostash any genuine dirt, ff-only pull (fast-forwards when behind, a
+    # no-op when already in sync), then pop — leaving the working tree clean
+    # relative to the new HEAD, which is what the projector reading cards needs.
+    if [ "$ahead" -eq 0 ]; then
         local stashed=false
         if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-            git stash push -q --include-untracked -m "loop: sync dirty-tree stash (issue #28)" 2>/dev/null && stashed=true
+            git stash push -q --include-untracked -m "loop: sync dirty-tree stash (issue #28/#95)" >/dev/null 2>&1 && stashed=true
         fi
-        git pull --ff-only "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
-        if [ "$stashed" = true ]; then git stash pop -q 2>/dev/null || true; fi
+        git pull --ff-only "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q >/dev/null 2>&1 || true
+        if [ "$stashed" = true ]; then git stash pop -q >/dev/null 2>&1 || true; fi
         SYNC_FAIL_COUNT=0
-        daemon_log "GIT SYNC: dirty working tree with refs in sync — stashed, re-pulled, restored (issue #28)"
+        if [ "$behind" -eq 0 ]; then
+            daemon_log "GIT SYNC: dirty working tree with refs in sync — stashed, re-pulled, restored (issue #28)"
+        else
+            daemon_log "GIT SYNC: behind-only ($behind behind) — refreshed stat cache, stashed, fast-forwarded (issue #95)"
+        fi
         return 0
     fi
 
