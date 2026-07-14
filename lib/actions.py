@@ -1308,6 +1308,23 @@ def remove_worktree(paths, brief):
     git(paths["project_dir"], "worktree", "prune", check=False)
 
 
+def _abort_unclaimed_dispatch(paths, project_dir, brief, branch):
+    """brief-160: tear down the local-only worktree + branch built before the
+    claim was pushed, when the claim was lost (another box won) or errored.
+
+    Nothing was pushed to the remote at this point — the worktree and its branch
+    are purely local — so removing them leaves no residue and lets a later
+    re-dispatch cut fresh (no #83 stale-branch resurrection). Best-effort."""
+    try:
+        remove_worktree(paths, brief)
+        # Delete the local branch only after its worktree is gone (git refuses to
+        # delete a branch checked out in a worktree).
+        git(project_dir, "branch", "-D", branch, check=False)
+    except Exception as e:
+        print(f"dispatch: cleanup after lost claim for {brief} failed: {e} (non-fatal)",
+              file=sys.stderr)
+
+
 def _init_commit_already_landed(wt_dir, brief):
     """True iff HEAD in wt_dir is already the init commit for `brief`.
 
@@ -1698,26 +1715,14 @@ def dispatch(paths):
     # Fetch latest (no checkout needed — main tree untouched)
     git(project_dir, "fetch", remote, check=False)
 
-    # brief-151: atomic cross-box claim BEFORE any worktree exists. Two daemons
-    # sharing this repo+lane race to push refs/claims/<brief>; exactly one wins.
-    # On contention (another daemon holds it) skip cleanly; on a real push error
-    # (auth/network) fail loud and create NO branch/worktree (engineering rule
-    # 10 — claim-first is the whole point, anti-pattern: never push after).
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from claim import claim_brief
-    try:
-        claimed = claim_brief(project_dir, brief, remote)
-    except Exception as e:
-        log_action(paths, "claim_error", {"brief": brief, "error": str(e)})
-        print(f"dispatch: claim push for {brief} failed (fail-loud, no worktree): {e}",
-              file=sys.stderr)
-        os.remove(paths["pending_dispatch"])
-        return False
-    if not claimed:
-        log_action(paths, "claim_skip", {"brief": brief})
-        print(f"loop: brief {brief} already claimed — skipping", file=sys.stderr)
-        os.remove(paths["pending_dispatch"])
-        return False
+    # brief-160: the atomic cross-box claim is pushed LAST — after the worktree
+    # and init-commit have landed locally and immediately BEFORE the branch push
+    # (see the claim block below). Everything between here and there is LOCAL
+    # only (worktree create, progress.json init commit); nothing touches the
+    # shared remote until the claim wins, so a losing/aborted attempt leaves no
+    # remote residue to reap. This kills the starved-window wedge (reviewer-64):
+    # a claim pushed before a failed init-commit used to strand a brief behind a
+    # ref that only manual surgery could clear.
 
     # Never reuse a STALE branch ref (issues #83/#84). The fetch above does not
     # --prune, so a branch deleted on origin leaves refs/remotes/<remote>/<branch>
@@ -1770,6 +1775,65 @@ def dispatch(paths):
         # it; merge() strips it back off main below. Worker-branch only.
         git(wt_dir, "add", "-f", ".loop/state/progress.json")
         git(wt_dir, "commit", "-m", f"Initialize brief {brief}")
+
+    # ── brief-160: CLAIM LAST — the atomic mutex, pushed after the init-commit
+    # landed locally and immediately before the branch push. ──────────────────
+    #
+    # This is the exactly-one-winner compare-and-swap (git push --force-with-
+    # lease over an empty expected value; see lib/claim.py). Placing it here —
+    # not before the worktree — is the brief-160 reorder. Race analysis, honest:
+    #
+    #   * Two boxes dispatching the same brief can now BOTH build a worktree and
+    #     a local init-commit before either claims — wasted local work for the
+    #     loser, but NO remote effect (both are local-only). The claim CAS is
+    #     still the mutex: exactly one wins (proven by test_lane_and_claim golden
+    #     ii). Moving it later only widens the window of duplicated LOCAL work,
+    #     never the window of double EXECUTION.
+    #   * The claim push IS the "re-check immediately before the atomic push":
+    #     there is no separate check→push gap to race, because the check and the
+    #     push are the same atomic operation.
+    #   * The loser aborts WITHOUT pushing the branch — so no remote branch
+    #     collision, and the worker only ever spawns off a completed dispatch
+    #     (active[] projection), which only the winner reaches. The loser's
+    #     local worktree + branch are torn down.
+    #   * Starved-window wedge is gone: if the worktree/init-commit step failed
+    #     above, we never reach this push, so no ref is ever left behind.
+    #   * Mid-dispatch crash idempotency: a crash after this push but before
+    #     pending-dispatch is consumed leaves OUR ref standing. On retry the CAS
+    #     returns False, but claim_owner shows this box — so we resume (finish
+    #     the dispatch) rather than abort. Only a foreign/unknown owner aborts.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from claim import claim_brief, claim_owner, claim_box
+    try:
+        claimed = claim_brief(project_dir, brief, remote)
+    except Exception as e:
+        # Fail loud (auth/network) — abort with NO branch push (rule 10). Tear
+        # down the local-only worktree/branch we built above.
+        log_action(paths, "claim_error", {"brief": brief, "error": str(e)})
+        print(f"dispatch: claim push for {brief} failed (fail-loud, no branch pushed): {e}",
+              file=sys.stderr)
+        _abort_unclaimed_dispatch(paths, project_dir, brief, branch)
+        os.remove(paths["pending_dispatch"])
+        return False
+    if not claimed:
+        owner = claim_owner(project_dir, brief, remote)
+        if owner == claim_box():
+            # We already hold it — this is a crash-retry of our own dispatch.
+            # Resume: the init-commit idempotency above already handled the
+            # worktree, and the branch push below is a no-op if up-to-date.
+            log_action(paths, "claim_retry_own", {"brief": brief})
+            print(f"dispatch: {brief} claim already held by this box — resuming "
+                  f"dispatch (retry)", file=sys.stderr)
+        else:
+            # A different box won the race. Abort WITHOUT the branch push and
+            # tear down the local-only worktree/branch.
+            log_action(paths, "claim_skip", {"brief": brief, "owner": owner or "unknown"})
+            print(f"loop: brief {brief} already claimed"
+                  f"{f' by {owner}' if owner else ''} — skipping (no branch pushed)",
+                  file=sys.stderr)
+            _abort_unclaimed_dispatch(paths, project_dir, brief, branch)
+            os.remove(paths["pending_dispatch"])
+            return False
 
     # Push is idempotent — up-to-date branches push as no-op.
     git(wt_dir, "push", "-u", remote, branch)
