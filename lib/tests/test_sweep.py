@@ -377,6 +377,42 @@ class TestAutoRoute(unittest.TestCase):
             entry = state["awaiting_review"][0]
             self.assertIn("sweep: orphaned subprocess", entry.get("conflict_note", ""))
 
+    def test_auto_route_releases_claim(self):
+        """brief-160: the auto-route move must release the brief's claim ref in
+        the same operation (the serve-009 leak) — loudly, never silently."""
+        import subprocess
+        from claim import claim_brief, _ref_for
+
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+
+            def _g(cwd, *a):
+                return subprocess.run(["git", "-C", str(cwd), *a],
+                                      check=True, capture_output=True, text=True)
+
+            remote = tmp / "remote.git"
+            _g(tmp, "init", "--quiet", "--bare", "remote.git")
+            project = tmp / "project"
+            project.mkdir()
+            _g(project, "init", "--quiet", "-b", "main")
+            _g(project, "remote", "add", "origin", str(remote))
+            # Minimal .loop/ config so read_config resolves the remote name.
+            state = project / ".loop" / "state"
+            state.mkdir(parents=True)
+            (project / ".loop" / "config.sh").write_text('GIT_REMOTE="origin"\n')
+
+            bid = "brief-700-route"
+            self.assertTrue(claim_brief(str(project), bid, str(remote)))
+            self.assertEqual(
+                _g(remote, "for-each-ref", "--format=%(refname)", "refs/claims/").stdout.strip(),
+                _ref_for(bid))
+
+            sweep.release_claim_on_route(str(project), bid)
+
+            self.assertEqual(
+                _g(remote, "for-each-ref", "--format=%(refname)", "refs/claims/").stdout.strip(),
+                "", "auto-route must delete the claim ref")
+
 
 # ── Snapshot I/O ────────────────────────────────────────────────────────────
 

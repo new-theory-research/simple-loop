@@ -332,6 +332,34 @@ def auto_route_brief(brief_id: str, branch: str, running_path: str, reason: str)
         f.write("\n")
 
 
+def release_claim_on_route(project_dir: str, brief_id: str) -> None:
+    """brief-160: releasing the claim is PART of the auto-route move.
+
+    A brief pulled out of active[] must not leave its claim ref standing — that
+    is the serve-009 leak (the queen saw 'already claimed', skipped it, and the
+    stranded brief never re-entered the queue). Loud, never silent: a structured
+    action on stdout AND a log.jsonl entry (never a bare `git update-ref -d`).
+    Best-effort — a release failure is logged, never raised (it must not break
+    the sweep)."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from claim import release_claim
+        from actions import read_config, init_paths, log_action
+        remote = read_config(os.path.join(project_dir, ".loop")).get("GIT_REMOTE", "origin")
+        released = release_claim(project_dir, brief_id, remote)
+        print(json.dumps({
+            "action": "claim-released" if released else "claim-release-failed",
+            "brief": brief_id,
+            "context": "sweep-auto-route",
+        }))
+        if released:
+            log_action(init_paths(project_dir), "claim_released",
+                       {"brief": brief_id, "context": "sweep_auto_route"})
+    except Exception as e:
+        print(json.dumps({"action": "claim-release-error",
+                          "brief": brief_id, "error": str(e)}))
+
+
 # ── Snapshot I/O ──────────────────────────────────────────────────────────
 
 def load_snapshot(snapshot_dir: str) -> dict:
@@ -497,6 +525,8 @@ def run_sweep(project_dir: str, quick: bool = False, auto_route: bool = False,
                     "reason": reason,
                     "moved_to": "awaiting_review",
                 }))
+                # brief-160: release the claim in the SAME operation as the move.
+                release_claim_on_route(project_dir, brief_id)
 
     # If no active briefs, report clean
     if not active:

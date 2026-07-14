@@ -894,6 +894,11 @@ def move_to_eval(paths, brief_id):
     runtime_event(paths, "completed", brief_id, kind="complete", auto_merge=False)
     project_running(paths)
 
+    signal_dedup_clear(paths, brief_id)
+    # brief-160: this legacy path also removes the brief from active[] (routes it
+    # to awaiting_review via the completed event) — release the claim in the SAME
+    # operation, exactly as move_to_awaiting_review does, so it is not a leak path.
+    _release_claim_quiet(paths, brief_id)
     log_action(paths, "move-to-eval", {"brief": brief_id})
     print(f"Moved {brief_id} to awaiting_review (kind=complete via move-to-eval)")
     return True
@@ -925,6 +930,11 @@ def move_to_pending_merges(paths, brief_id):
     runtime_event(paths, "approved", brief_id)
     project_running(paths)
 
+    # brief-160: the claim is intentionally NOT released here. pending_merges is
+    # still THIS box's work (the merge runs next), so by the invariant the claim
+    # ref must persist — it TRANSFERS from active[] to the merge, and merge()
+    # releases it on completion. Releasing here would let another box grab the
+    # brief mid-merge. (Do not "fix" this by adding a release.)
     log_action(paths, "move-to-pending-merges", {"brief": brief_id})
     print(f"Moved {brief_id} to pending_merges")
     return True
