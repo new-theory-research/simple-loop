@@ -1,7 +1,7 @@
 ---
 ID: brief-160-blocked-brief-lifecycle
 Branch: brief-160-blocked-brief-lifecycle
-Status: queued
+Status: parked
 Model: opus
 Auto-merge: false
 Validator: core/agents/reviewer.md
@@ -12,6 +12,10 @@ Program: harness-improvements
 Issues: ["#27", "#39", "#58", "#59", "#71", "#62", "#83", "#84", "#92", "#93", "#96", "#97"]
 Depends-on: none
 Tags: [harness, blocked, parked, claims, lifecycle, invariant]
+Parked-blocker: goals.md line 14 pins brief-160 to the director-iterator track: daemon self-dev remains off, so the queen is structurally forbidden to dispatch it (brief-147 precedent). Remaining scope is piece 3 (#71) + piece 4 (#58/#59); pieces 1+2 are merged (160a cfc977c, 160b 5cf798a).
+Parked-owner: director
+Parked-retrigger: Director/scav picks up piece 3 (#71) or piece 4 (#58/#59) on the director-iterator track, or Mattie flips daemon self-dev on for this brief.
+Parked-at: 2026-07-16T18:09:41Z
 ---
 
 # Brief: the blocked/parked brief lifecycle — claims that leak, parks that hide, boards that lie
